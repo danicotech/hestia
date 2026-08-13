@@ -1,0 +1,22 @@
+# 建置產物
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# 環境
+.env
+.env.*
+!.env.example
+
+# 工具
+/vendor/
+.DS_Store
+*.log
+
+# 本機資料
+/data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
