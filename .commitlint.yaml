@@ -1,0 +1,111 @@
+min-version: v0.12.0
+formatter: default
+
+# 訊息一律英文,見 docs/commit-規範.md。
+#
+# 注意這裡沒有開 description-case。Go 版的語意是「整句不得出現任何大寫」,
+# 會連 Discord、OpenAPI、HTTP 一起擋掉;TS 那側的 subject-case 只擋首字大寫,
+# 語意正確所以有開。規則兩邊一樣,這裡靠人守。
+
+rules:
+  - type-empty
+  - type-case
+  - type-enum
+  - scope-case
+  - scope-enum
+  - description-empty
+  - description-full-stop
+  - header-min-length
+  - header-max-length
+  - body-leading-blank
+  - body-max-line-length
+  - footer-leading-blank
+  - footer-max-line-length
+  - breaking-change-exclamation-mark
+
+severity:
+  default: error
+  rules: {}
+
+settings:
+  type-empty:
+    argument: null
+    flags: {}
+  description-empty:
+    argument: null
+    flags: {}
+  body-leading-blank:
+    argument: null
+    flags: {}
+  footer-leading-blank:
+    argument: null
+    flags: {}
+  breaking-change-exclamation-mark:
+    argument: null
+    flags: {}
+  type-case:
+    argument: lower-case
+    flags: {}
+  # 沒有 style —— 格式一律交給 formatter,不該有專門的 commit
+  type-enum:
+    argument:
+      - feat
+      - fix
+      - refactor
+      - perf
+      - docs
+      - test
+      - build
+      - ci
+      - chore
+      - revert
+    flags: {}
+  scope-case:
+    argument: lower-case
+    flags: {}
+  # 跨多層的改動不要硬塞 scope,直接省略
+  scope-enum:
+    argument:
+      - structure
+      - identity
+      - ledger
+      - outbox
+      - notify
+      - redeem
+      - activity
+      - domain
+      - core
+      - http
+      - ws
+      - grpc
+      - cron
+      - storage
+      - contracts
+      - migrations
+      - config
+      - e2e
+      - docs
+      - lint
+      - deps
+      - ci
+    flags:
+      allow-empty: true
+  description-full-stop:
+    argument: .
+    flags: {}
+  # 72 才能在 git log --oneline 一行看完
+  header-max-length:
+    argument: 72
+    flags: {}
+  header-min-length:
+    argument: 10
+    flags: {}
+  body-max-line-length:
+    argument: 100
+    flags: {}
+  footer-max-line-length:
+    argument: 100
+    flags: {}
+
+disable-default-ignores: false
+ignores: []

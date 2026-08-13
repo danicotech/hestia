@@ -1,0 +1,108 @@
+version: "2"
+
+run:
+  timeout: 3m
+
+linters:
+  default: standard
+  enable:
+    - bodyclose        # HTTP response body 沒關
+    - errorlint        # error 比較沒用 errors.Is / As
+    - noctx            # 沒帶 context 的請求
+    - rowserrcheck     # sql.Rows.Err() 沒檢查
+    - sqlclosecheck    # rows / stmt 沒關
+    - nilerr           # err != nil 卻回 nil
+    - misspell
+    - unconvert
+    - wastedassign
+    - gocritic
+    - revive
+    - gosec
+    - depguard         # 分層邊界,見下面
+
+  settings:
+    # 這一段是把 docs/專案結構.md 的分層規則變成編譯期以外的硬檢查。
+    # 靠自律撐不過三個月,靠這個可以。
+    depguard:
+      rules:
+        # 一、domain 不 import 任何其他層,也不認識任何基礎設施
+        domain:
+          files:
+            - "**/internal/domain/**"
+          deny:
+            - pkg: github.com/danicotech/hestia/internal/core
+              desc: domain 不能 import core
+            - pkg: github.com/danicotech/hestia/internal/infrastructure
+              desc: domain 不能 import infrastructure,port 介面宣告在 domain 這一側
+            - pkg: github.com/danicotech/hestia/internal/interface
+              desc: domain 不能 import interface
+            - pkg: github.com/gin-gonic/gin
+              desc: domain 只認 context 和標準庫
+            - pkg: github.com/danielgtaylor/huma
+              desc: domain 只認 context 和標準庫
+            - pkg: github.com/jackc/pgx
+              desc: domain 只認 context 和標準庫
+            - pkg: github.com/redis/go-redis
+              desc: domain 只認 context 和標準庫
+
+        # 二、core 只認 domain 定義的 port
+        core:
+          files:
+            - "**/internal/core/**"
+          deny:
+            - pkg: github.com/danicotech/hestia/internal/infrastructure
+              desc: core 只能透過 domain 的 port 用基礎設施,接線是 wire 的工作
+            - pkg: github.com/danicotech/hestia/internal/interface
+              desc: core 不能反過來依賴入口層
+
+        # 三、interface 拿到的是 core 的用例,不是 *pgxpool.Pool
+        interface:
+          files:
+            - "**/internal/interface/**"
+          deny:
+            - pkg: github.com/danicotech/hestia/internal/infrastructure
+              desc: handler 不能直接碰 infrastructure
+
+        # 四、platform 不得 import activity。整個專案唯一真正回不去的線
+        platform:
+          files:
+            - "**/platform/**"
+          deny:
+            - pkg: github.com/danicotech/hestia/internal/domain/activity
+              desc: platform 不能 import activity。反向可以,但只能透過 domain/platform 的 port
+            - pkg: github.com/danicotech/hestia/internal/core/activity
+              desc: platform 不能 import activity。反向可以,但只能透過 domain/platform 的 port
+
+        # 五、e2e 是黑箱。它一旦 import internal,重構就要連帶改測試
+        e2e:
+          files:
+            - "**/e2e/**"
+          deny:
+            - pkg: github.com/danicotech/hestia/internal
+              desc: e2e 只能透過 HTTP 與資料庫斷言
+
+    revive:
+      rules:
+        - name: exported
+          disabled: true   # 骨架階段先關,有 public API 之後再打開
+
+    gosec:
+      excludes:
+        - G115   # 整數轉換溢位,誤報多
+
+  exclusions:
+    rules:
+      # 測試裡的 assert 慣例與魔術數字不值得吵
+      - path: _test\.go
+        linters:
+          - gosec
+          - noctx
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/danicotech/hestia

@@ -1,0 +1,40 @@
+
+# <type>(<scope>): <subject>
+#
+# - why this change
+# - side effects or prerequisites
+#
+# ----------------------------------------------------------------------
+# ENGLISH ONLY. type, scope, subject, body and footer.
+# Docs and code comments stay in Chinese; commit messages do not.
+#
+# subject   imperative, present tense, lower case, no trailing period,
+#           72 chars max. No space before the colon.
+#           Proper nouns keep their case: "add Discord account binding".
+#           Say what you did, not which files you touched -- git has those.
+#
+# body      bullet points. Each one answers WHY, not WHAT.
+#           If future-you would ask "why was it done this way", write it.
+#
+# footer    BREAKING CHANGE: <what broke>   also add ! after the type
+#           Refs: #42
+#
+# type      feat      a capability users can see
+#           fix       wrong behaviour corrected
+#           refactor  internal change, behaviour unchanged
+#           perf      performance
+#           docs      documentation only
+#           test      tests only
+#           build     build, dependencies, Dockerfile
+#           ci        workflows and CI config
+#           chore     none of the above. Reaching for it often means
+#                     the change was not classified properly
+#           revert    revert
+#
+# scope     identity ledger outbox notify redeem activity
+#           domain core http ws grpc cron storage
+#           contracts migrations config e2e docs lint deps ci structure
+#           Leave it out when the change spans several layers.
+#
+# One commit, one thing. If the subject needs "and", split it.
+# ----------------------------------------------------------------------

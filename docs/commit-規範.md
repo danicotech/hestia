@@ -14,12 +14,14 @@ Conventional Commits。四個 repo 用同一套,這份是完整版,另外三個 
 ```
 
 ```text
-feat(ledger): 帳本寫入改用 append-only
+feat(ledger): make ledger writes append-only
 
-- 餘額改成同交易內更新的快取,真實來源是 token_entries
-- 併發下注時靠 SELECT ... FOR UPDATE 擋住重複扣款
-- 對帳 job 另外一個 PR
+- balance becomes a cache updated in the same transaction; token_entries is the truth
+- concurrent bets rely on SELECT ... FOR UPDATE to block double debits
+- the reconciliation job lands in a separate PR
 ```
+
+**訊息一律用英文。** type、scope、subject、body、footer 全部。這份規範本身、README、程式碼註解仍然是中文 —— 只有 commit message 是英文,因為它是給工具和 `git log --oneline` 看的介面。
 
 **冒號前面沒有空格。** `feat(ledger) : xxx` 會被 commitlint 擋下來 —— 它不認得這個 header,整行會被當成沒有 type。
 
@@ -67,19 +69,24 @@ feat(ledger): 帳本寫入改用 append-only
 
 ## subject
 
-- **祈使句、現在式。** 「加上冪等鍵檢查」,不是「加上了」或「將會加上」
+- **祈使句、現在式。** `add idempotency key check`,不是 `added` 或 `will add`
+- **小寫開頭。** `add ...` 不是 `Add ...`。句中的專有名詞照常大寫:`add Discord account binding` 可以
 - **不加句號**
 - **72 字元以內**(commitlint 預設放到 100,但 72 才能在 `git log --oneline` 一行看完)
-- 中文英文都可以,但同一個 repo 裡保持一致
 - 講**做了什麼**,不是**改了哪個檔案** —— 檔案清單 git 自己有
+
+> **小寫開頭這條在 Go 這側沒有被機器擋。** Go 版 commitlint 只有 `description-case: lower-case`,
+> 而它的語意是「整句不得出現任何大寫」—— 那會連 `Discord`、`OpenAPI`、`HTTP` 一起擋掉,
+> 在這個專案等於每天都要繞過它,所以刻意沒開。TS 那兩個 repo 的 `subject-case` 語意正確
+> (只擋首字大寫),有開。這條規則兩邊一樣,只是這裡靠人守。
 
 ## body
 
 用條列。每一條回答的是**為什麼**,不是**改了什麼**:
 
 ```text
-- 原本的實作在多實例下會重複派送同一筆事件
-- 改用 FOR UPDATE SKIP LOCKED,多個 dispatcher 同時跑也安全
+- the previous implementation dispatched the same event twice across instances
+- FOR UPDATE SKIP LOCKED makes concurrent dispatchers safe
 ```
 
 body 可以省略。**但如果這個改動半年後的你會想問「當初為什麼這樣做」,就一定要寫。**
@@ -87,7 +94,7 @@ body 可以省略。**但如果這個改動半年後的你會想問「當初為�
 ## footer
 
 ```text
-BREAKING CHANGE: /v1/bets 的 stake 欄位改成必填
+BREAKING CHANGE: stake is now required on /v1/bets
 Refs: #42
 ```
 
@@ -103,13 +110,41 @@ Refs: #42
 
 規範靠自律撐不過三個月,做成檢查才有用。
 
-**CI**(四個 repo 都適用,Go 專案也一樣 —— 這是跑在 CI 容器裡的一次性指令,不會變成專案的相依):
+這個 repo 用的是 Go 生態的工具,**不需要 Node**:
+
+| 工具 | 做什麼 | 設定檔 |
+|---|---|---|
+| [lefthook](https://github.com/evilmartians/lefthook) | 管 git hook。單一執行檔、跨平台 | `lefthook.yml` |
+| [commitizen/commitlint](https://github.com/conventionalcommit/commitlint) | 檢查訊息格式 | `.commitlint.yaml` |
+| [golangci-lint](https://golangci-lint.run/) | 靜態檢查,含分層邊界 | `.golangci.yml` |
 
 ```bash
-npx --yes @commitlint/cli --extends @commitlint/config-conventional \
-  --from origin/main --to HEAD
+go install github.com/evilmartians/lefthook@latest
+go install github.com/conventionalcommit/commitlint@latest
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+
+lefthook install                        # 掛上 hook
+git config commit.template .gitmessage  # 編輯器裡就看得到格式與 scope 清單
 ```
 
-**本機**:用 `commit-msg` hook 擋在推之前。Go 專案不想碰 Node 的話,`conventional-commit-linter` 這類單一執行檔的工具也可以。
+掛上之後:
+
+| 時機 | 跑什麼 |
+|---|---|
+| `pre-commit` | `go vet ./...`、`golangci-lint run` |
+| `commit-msg` | `commitlint lint` |
+| `pre-push` | `go test ./...` |
+
+三個都只在有 `.go` 檔案進 staging 時才跑,所以純文件的 commit 不會被拖慢。
+
+**先自己試一次:**
+
+```bash
+echo "feat(banana): add some stuff" | commitlint lint
+```
+
+**TS 那兩個 repo 用的是 Node 生態**(husky + `@commitlint/cli` + cz-git),規則刻意寫成一樣。工具不同不是不一致 —— 是各自用生態裡最順的那個,省掉「Go 專案為了 lint commit 而裝 Node」這種事。
+
+**臨時要跳過**:`git commit --no-verify`。但 CI 會再跑一次,跳過只是延後,不是繞過。
 
 **PR 標題也要照這個格式。** squash merge 之後 PR 標題就是主線上的 commit message —— 這是最常見的破口:每個 commit 都很乾淨,合進去卻變成 `Update README (#12)`。

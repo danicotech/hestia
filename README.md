@@ -133,6 +133,29 @@ type Ledger interface {
 | `PLATFORM_SMS_PROVIDER` | 通知,尚未實作 |
 | `PLATFORM_META_APP_ID` / `PLATFORM_META_ACCESS_TOKEN` | IG / FB 發文,尚未實作 |
 
+## 開發環境
+
+工具全部是 Go 的單一執行檔,不需要 Node:
+
+```bash
+go install github.com/evilmartians/lefthook@latest
+go install github.com/conventionalcommit/commitlint@latest
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+
+lefthook install                        # 掛上 git hook
+git config commit.template .gitmessage  # 編輯器裡看得到格式與 scope 清單
+```
+
+| 時機 | 跑什麼 |
+|---|---|
+| `pre-commit` | `go vet ./...`、`golangci-lint run` |
+| `commit-msg` | `commitlint lint` |
+| `pre-push` | `go test ./...` |
+
+前後兩個只在有 `.go` 進 staging 時才跑,純文件的 commit 不會被拖慢。
+
+`.golangci.yml` 裡的 `depguard` 才是重點:上面那三條線是 lint 錯誤,不是 code review 時才發現。詳見 [docs/commit-規範.md](docs/commit-規範.md)。
+
 ## 本機環境
 
 `deploy/` 之後放 compose,M0 階段只需要兩個容器:Postgres 與 Redis,都掛 volume 與 healthcheck。應用程式先在容器外跑,省掉每次改動都要重建映像。
