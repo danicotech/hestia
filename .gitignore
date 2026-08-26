@@ -20,3 +20,6 @@
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+
+# 本機 AI 工作流工具(spec-kit),不入版控
+/.specify/
