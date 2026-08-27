@@ -42,24 +42,64 @@ func (s *Service) Apply(ctx context.Context, p ledger.ApplyParams) (*ledger.Appl
 		return nil, fmt.Errorf("開 transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	qtx := s.q.WithTx(tx)
 
-	// ── 冪等:tx 一開始就佔 key(response 先 NULL)──
-	// 併發同 key 的第二個 tx 會在這裡阻塞,等第一個 commit 後撞 PK;
-	// tx rollback 時 key 同步消失,合法重試不會被擋。
-	err = qtx.InsertIdempotencyKey(ctx, db.InsertIdempotencyKeyParams{
-		Key:         p.IdempotencyKey,
-		RequestHash: p.RequestHash,
-	})
+	result, err := s.run(ctx, s.q.WithTx(tx), p)
 	if err != nil {
 		if isUniqueViolation(err) {
 			// key 已存在:先 rollback 釋放本 tx 的連線,再走重放路徑。
 			// 不先釋放的話,goroutine 佔著廢棄連線又向池要第二條(hold-and-wait),
-			// 併發重複請求 ≥ MaxConns 時整個連線池死鎖(QA 實測復現)。
+			// 併發重複請求 >= MaxConns 時整個連線池死鎖(QA 實測復現)。
 			_ = tx.Rollback(ctx)
-			return s.replay(ctx, p)
+			return s.replay(ctx, s.q, p)
 		}
-		return nil, fmt.Errorf("佔冪等鍵: %w", err)
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit: %w", err)
+	}
+	return result, nil
+}
+
+// ApplyInTx 在呼叫端持有的 tx 內執行(schemas/21 已確認 ③:下注 = 扣款 + 建注單同 tx)。
+// 冪等衝突用 savepoint 隔離:撞鍵只回滾 savepoint,不毒化呼叫端的整個 tx,
+// 重放讀取走同一條連線(caller tx),不會發生 Apply 曾經的連線池 hold-and-wait。
+// 注意:整體原子性由呼叫端的 Commit 決定 —— 呼叫端 rollback 時本次動錢一併消失。
+// 注意:savepoint rollback 不釋放已取得的 row lock —— 本函式失敗(如餘額不足)後,
+// caller tx 仍持有餘額列的鎖,請盡快結束 tx,不要拿著它長時間做別的事(QA 提醒)。
+// 刻意放在具體 *Service 而非 Ledger interface:interface 保持可攜(未來 HTTP 版沒有 tx 可傳),
+// 同 repo 的活動層需要 tx 組合時依賴具體型別。
+func (s *Service) ApplyInTx(ctx context.Context, tx pgx.Tx, p ledger.ApplyParams) (*ledger.ApplyResult, error) {
+	if err := validate(p); err != nil {
+		return nil, err
+	}
+
+	sp, err := tx.Begin(ctx) // pgx:巢狀 Begin = SAVEPOINT
+	if err != nil {
+		return nil, fmt.Errorf("開 savepoint: %w", err)
+	}
+	result, err := s.run(ctx, s.q.WithTx(sp), p)
+	if err != nil {
+		_ = sp.Rollback(ctx)
+		if isUniqueViolation(err) {
+			return s.replay(ctx, s.q.WithTx(tx), p)
+		}
+		return nil, err
+	}
+	if err := sp.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("release savepoint: %w", err)
+	}
+	return result, nil
+}
+
+// run 是動錢核心,在給定的 query 執行環境(tx 或 savepoint)內完成:
+// 佔冪等鍵 → 依 user_id 升冪鎖餘額 → 檢查充足 → 寫分錄+更新餘額 → 寫 outbox → 存冪等 response。
+func (s *Service) run(ctx context.Context, qtx *db.Queries, p ledger.ApplyParams) (*ledger.ApplyResult, error) {
+	err := qtx.InsertIdempotencyKey(ctx, db.InsertIdempotencyKeyParams{
+		Key:         p.IdempotencyKey,
+		RequestHash: p.RequestHash,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("佔冪等鍵: %w", err) // unique violation 由呼叫端判斷處理
 	}
 
 	// ── 鎖餘額:收集 distinct (user, currency),依 user_id 升冪、再 currency 升冪 ──
@@ -156,15 +196,12 @@ func (s *Service) Apply(ctx context.Context, p ledger.ApplyParams) (*ledger.Appl
 		return nil, fmt.Errorf("存冪等結果: %w", err)
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("commit: %w", err)
-	}
 	return result, nil
 }
 
 // replay 處理冪等鍵已存在的情況:內容相同 → 回上次結果;不同 → 衝突。
-func (s *Service) replay(ctx context.Context, p ledger.ApplyParams) (*ledger.ApplyResult, error) {
-	rec, err := s.q.GetIdempotencyKey(ctx, p.IdempotencyKey)
+func (s *Service) replay(ctx context.Context, q *db.Queries, p ledger.ApplyParams) (*ledger.ApplyResult, error) {
+	rec, err := q.GetIdempotencyKey(ctx, p.IdempotencyKey)
 	if err != nil {
 		return nil, fmt.Errorf("讀冪等鍵: %w", err)
 	}
@@ -244,7 +281,9 @@ func validate(p ledger.ApplyParams) error {
 
 func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+	// 只認冪等鍵的 PK:未來 run() 路徑若新增其他 UNIQUE 約束,撞到不會被誤導向 replay(QA 建議)
+	return errors.As(err, &pgErr) && pgErr.Code == "23505" &&
+		pgErr.ConstraintName == "idempotency_keys_pkey"
 }
 
 func isCheckViolation(err error) bool {
