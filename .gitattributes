@@ -1,0 +1,3 @@
+# Go 檔一律 LF,終結 gofmt/autocrlf 互踩
+*.go text eol=lf
+*.sql text eol=lf
