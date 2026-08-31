@@ -242,3 +242,81 @@ func TestConcurrentConsumersNoDoubleProcessing(t *testing.T) {
 		}
 	}
 }
+
+// Run:ctx 取消要乾淨退出(QA 補的覆蓋——條件 6)
+func TestRunExitsOnCancel(t *testing.T) {
+	setup(t)
+	c := outbox.NewConsumer(pool)
+	c.PollInterval = 10 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- c.Run(ctx) }()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run 回傳 %v,要 context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run 沒有在時限內退出")
+	}
+}
+
+// Run:積壓時不等 tick 連續清空(QA 補的覆蓋——條件 7)
+func TestRunDrainsBacklogBeforeTick(t *testing.T) {
+	setup(t)
+	c := outbox.NewConsumer(pool)
+	c.BatchSize = 5
+	c.PollInterval = time.Minute // 故意設很長:清空必須不靠 tick
+	var mu sync.Mutex
+	handled := 0
+	c.Handle("t7.drain", func(context.Context, string, []byte) error {
+		mu.Lock()
+		handled++
+		mu.Unlock()
+		return nil
+	})
+	const total = 15
+	for i := 0; i < total; i++ {
+		insertEvent(t, "t7.drain", fmt.Sprintf(`{"i":%d}`, i))
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = c.Run(ctx) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mu.Lock()
+		n := handled
+		mu.Unlock()
+		if n == total {
+			return // 遠短於一個 tick(1 分鐘)即清空
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("5 秒內只處理 %d/%d(tick 是 1 分鐘,代表沒有連續抓)", n, total)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// 掛住的 handler:逾時視同失敗走退避,不佔死持鎖 tx(QA 發現的風險 2)
+func TestHandlerTimeout(t *testing.T) {
+	setup(t)
+	c := outbox.NewConsumer(pool)
+	c.HandlerTimeout = 50 * time.Millisecond
+	c.Handle("t8.stuck", func(ctx context.Context, _ string, _ []byte) error {
+		<-ctx.Done() // 模擬尊重 ctx 的慢 handler
+		return ctx.Err()
+	})
+	id := insertEvent(t, "t8.stuck", `{}`)
+	start := time.Now()
+	if n, err := c.ProcessOnce(context.Background()); err != nil || n != 1 {
+		t.Fatalf("ProcessOnce = (%d, %v)", n, err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("逾時防護沒生效,耗時 %v", elapsed)
+	}
+	if s, attempts, _ := eventState(t, id); s != "pending" || attempts != 1 {
+		t.Fatalf("要 pending/1(走退避),得到 %s/%d", s, attempts)
+	}
+}

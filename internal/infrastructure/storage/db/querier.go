@@ -46,6 +46,7 @@ type Querier interface {
 	MarkOutboxDone(ctx context.Context, id int64) error
 	// 毒訊息終態:超過重試上限,不能卡住整條佇列
 	MarkOutboxFailed(ctx context.Context, id int64) error
+	// 退避時間由 DB 時鐘計算(單一時鐘來源,QA:app/DB 時鐘偏移會讓事件被提前取走)
 	MarkOutboxRetry(ctx context.Context, arg MarkOutboxRetryParams) error
 	// 對帳:找出 SUM(entries) 與 balance 不一致的每一組(含只有分錄沒有餘額列、或反之)
 	ReconcileBalances(ctx context.Context) ([]ReconcileBalancesRow, error)

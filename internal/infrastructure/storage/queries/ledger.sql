@@ -85,9 +85,11 @@ LIMIT $1;
 UPDATE platform.outbox_events SET status = 'done' WHERE id = $1;
 
 -- name: MarkOutboxRetry :exec
+-- 退避時間由 DB 時鐘計算(單一時鐘來源,QA:app/DB 時鐘偏移會讓事件被提前取走)
 UPDATE platform.outbox_events
-SET attempts = attempts + 1, next_retry_at = $2
-WHERE id = $1;
+SET attempts = attempts + 1,
+    next_retry_at = now() + make_interval(secs => sqlc.arg(delay_seconds)::int)
+WHERE id = sqlc.arg(id);
 
 -- name: MarkOutboxFailed :exec
 -- 毒訊息終態:超過重試上限,不能卡住整條佇列

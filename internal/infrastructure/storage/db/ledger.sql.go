@@ -278,17 +278,19 @@ func (q *Queries) MarkOutboxFailed(ctx context.Context, id int64) error {
 
 const markOutboxRetry = `-- name: MarkOutboxRetry :exec
 UPDATE platform.outbox_events
-SET attempts = attempts + 1, next_retry_at = $2
-WHERE id = $1
+SET attempts = attempts + 1,
+    next_retry_at = now() + make_interval(secs => $1::int)
+WHERE id = $2
 `
 
 type MarkOutboxRetryParams struct {
-	ID          int64
-	NextRetryAt *time.Time
+	DelaySeconds int32
+	ID           int64
 }
 
+// 退避時間由 DB 時鐘計算(單一時鐘來源,QA:app/DB 時鐘偏移會讓事件被提前取走)
 func (q *Queries) MarkOutboxRetry(ctx context.Context, arg MarkOutboxRetryParams) error {
-	_, err := q.db.Exec(ctx, markOutboxRetry, arg.ID, arg.NextRetryAt)
+	_, err := q.db.Exec(ctx, markOutboxRetry, arg.DelaySeconds, arg.ID)
 	return err
 }
 

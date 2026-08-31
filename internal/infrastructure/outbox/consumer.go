@@ -14,6 +14,7 @@ package outbox
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -29,23 +30,24 @@ type Consumer struct {
 	handlers map[string]Handler
 
 	// 以下皆有預設值,測試可覆寫。
-	BatchSize    int32         // 每輪最多取幾筆(handler 在持鎖的 tx 內執行,批次要小)
-	PollInterval time.Duration // Run 的輪詢間隔
-	MaxAttempts  int32         // 含首次;達到即標 failed
-	BackoffBase  time.Duration // 第 n 次失敗後等 BackoffBase × 2^n(封頂 1 小時)
-
-	now func() time.Time // 測試注入
+	BatchSize      int32         // 每輪最多取幾筆(handler 在持鎖的 tx 內執行,批次要小)
+	PollInterval   time.Duration // Run 的輪詢間隔
+	MaxAttempts    int32         // 含首次;達到即標 failed
+	BackoffBase    time.Duration // 第 n 次失敗後等 BackoffBase × 2^(n−1),首次失敗即等 BackoffBase(封頂 1 小時)
+	HandlerTimeout time.Duration // 單筆 handler 逾時,視同失敗走退避(handler 需尊重 ctx 才有效)
+	Logger         *slog.Logger
 }
 
 func NewConsumer(pool *pgxpool.Pool) *Consumer {
 	return &Consumer{
-		pool:         pool,
-		handlers:     map[string]Handler{},
-		BatchSize:    10,
-		PollInterval: time.Second,
-		MaxAttempts:  8,
-		BackoffBase:  30 * time.Second,
-		now:          time.Now,
+		pool:           pool,
+		handlers:       map[string]Handler{},
+		BatchSize:      10,
+		PollInterval:   time.Second,
+		MaxAttempts:    8,
+		BackoffBase:    30 * time.Second,
+		HandlerTimeout: 30 * time.Second,
+		Logger:         slog.Default(),
 	}
 }
 
@@ -62,7 +64,8 @@ func (c *Consumer) Run(ctx context.Context) error {
 	for {
 		n, err := c.ProcessOnce(ctx)
 		if err != nil && ctx.Err() == nil {
-			// 整批層級的錯誤(連線斷等):記入下一輪重試,不讓消費者死掉
+			// 整批層級的錯誤(連線斷等):記 log 後等下一輪,不讓消費者死掉
+			c.Logger.Error("outbox: 批次處理失敗,等待下一輪", "err", err)
 			n = 0
 		}
 		if n > 0 {
@@ -98,8 +101,10 @@ func (c *Consumer) ProcessOnce(ctx context.Context) (int, error) {
 		case ev.Attempts+1 >= c.MaxAttempts:
 			err = q.MarkOutboxFailed(ctx, ev.ID)
 		default:
-			retryAt := c.now().Add(c.backoff(ev.Attempts))
-			err = q.MarkOutboxRetry(ctx, db.MarkOutboxRetryParams{ID: ev.ID, NextRetryAt: &retryAt})
+			// 退避以秒送進 SQL,由 DB 時鐘計 now()+interval(單一時鐘來源)
+			err = q.MarkOutboxRetry(ctx, db.MarkOutboxRetryParams{
+				ID: ev.ID, DelaySeconds: int32(c.backoff(ev.Attempts) / time.Second),
+			})
 		}
 		if err != nil {
 			return 0, fmt.Errorf("mark event %d: %w", ev.ID, err)
@@ -117,6 +122,13 @@ func (c *Consumer) dispatch(ctx context.Context, ev db.PlatformOutboxEvent) (err
 	h, ok := c.handlers[ev.Topic]
 	if !ok {
 		return fmt.Errorf("no handler for topic %q", ev.Topic)
+	}
+	// 掛住(不返回)的 handler 也是毒訊息:逾時視同失敗走退避,
+	// 不讓持鎖 tx 與連線被無限期佔用(QA 發現;handler 需尊重 ctx)
+	if c.HandlerTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.HandlerTimeout)
+		defer cancel()
 	}
 	defer func() {
 		if r := recover(); r != nil {
