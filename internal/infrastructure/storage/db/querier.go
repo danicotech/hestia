@@ -24,6 +24,8 @@ type Querier interface {
 	GetUserByID(ctx context.Context, id int64) (PlatformUser, error)
 	GetUserByIdentity(ctx context.Context, arg GetUserByIdentityParams) (PlatformUser, error)
 	GetUserByPublicID(ctx context.Context, publicID string) (PlatformUser, error)
+	// reason NOT NULL 是刻意的:強迫動作當下寫理由(schemas/03)
+	InsertAdminAudit(ctx context.Context, arg InsertAdminAuditParams) (int64, error)
 	// 調整 = 插新列(必帶 created_by;seed 列 created_by 為 NULL)
 	InsertConfig(ctx context.Context, arg InsertConfigParams) (PlatformEconomyConfig, error)
 	// 簽到:防連點靠 daily_claims 的 PK(user_id, claim_date),不用冪等鍵(ledger-invariants 第三條)
@@ -34,6 +36,7 @@ type Querier interface {
 	InsertIdempotencyKey(ctx context.Context, arg InsertIdempotencyKeyParams) error
 	InsertOutboxEvent(ctx context.Context, arg InsertOutboxEventParams) (int64, error)
 	InsertTokenEntry(ctx context.Context, arg InsertTokenEntryParams) (InsertTokenEntryRow, error)
+	ListAdminAuditByActor(ctx context.Context, arg ListAdminAuditByActorParams) ([]PlatformAdminAuditLog, error)
 	ListCurrentConfigs(ctx context.Context) ([]ListCurrentConfigsRow, error)
 	ListEntriesByUser(ctx context.Context, arg ListEntriesByUserParams) ([]PlatformTokenEntry, error)
 	// 帳本 query。使用規則見 .claude/skills/ledger-invariants:
@@ -41,6 +44,8 @@ type Querier interface {
 	// 這裡刻意「沒有」UPDATE/DELETE token_entries 的 query —— 不要新增。
 	LockBalanceForUpdate(ctx context.Context, arg LockBalanceForUpdateParams) (int64, error)
 	MarkOutboxDone(ctx context.Context, id int64) error
+	// 毒訊息終態:超過重試上限,不能卡住整條佇列
+	MarkOutboxFailed(ctx context.Context, id int64) error
 	MarkOutboxRetry(ctx context.Context, arg MarkOutboxRetryParams) error
 	// 對帳:找出 SUM(entries) 與 balance 不一致的每一組(含只有分錄沒有餘額列、或反之)
 	ReconcileBalances(ctx context.Context) ([]ReconcileBalancesRow, error)

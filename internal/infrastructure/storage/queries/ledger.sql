@@ -88,3 +88,9 @@ UPDATE platform.outbox_events SET status = 'done' WHERE id = $1;
 UPDATE platform.outbox_events
 SET attempts = attempts + 1, next_retry_at = $2
 WHERE id = $1;
+
+-- name: MarkOutboxFailed :exec
+-- 毒訊息終態:超過重試上限,不能卡住整條佇列
+UPDATE platform.outbox_events
+SET status = 'failed', attempts = attempts + 1
+WHERE id = $1;

@@ -52,6 +52,7 @@ type PlatformCommunitySpace struct {
 	ExternalID  string
 	Name        *string
 	CreatedAt   time.Time
+	Config      []byte
 }
 
 type PlatformConversationChunk struct {
@@ -103,6 +104,38 @@ type PlatformEntitlement struct {
 	ExpiresAt       *time.Time
 	RefundableUntil *time.Time
 	RevokedAt       *time.Time
+}
+
+type PlatformEventLog struct {
+	ID        int64
+	RequestID *string
+	Channel   string
+	Kind      string
+	Action    string
+	UserID    *int64
+	SpaceID   *int64
+	Status    *string
+	ErrorCode *string
+	LatencyMs *int32
+	Request   []byte
+	CreatedAt time.Time
+	Response  []byte
+	TraceID   *string
+}
+
+type PlatformEventLogsDefault struct {
+	ID        int64
+	RequestID *string
+	Channel   string
+	Kind      string
+	Action    string
+	UserID    *int64
+	SpaceID   *int64
+	Status    *string
+	ErrorCode *string
+	LatencyMs *int32
+	Request   []byte
+	CreatedAt time.Time
 }
 
 type PlatformHighlight struct {
@@ -334,6 +367,27 @@ type PlatformShopItem struct {
 	CreatedAt              time.Time
 }
 
+type PlatformSpaceChannel struct {
+	ID          int64
+	SpaceID     int64
+	ExternalID  string
+	Name        *string
+	Kind        string
+	LogMessages bool
+	GrantXp     bool
+	CreatedAt   time.Time
+	ArchivedAt  *time.Time
+}
+
+type PlatformSpaceMember struct {
+	ID        int64
+	SpaceID   int64
+	UserID    int64
+	JoinedAt  time.Time
+	LeftAt    *time.Time
+	LeaveKind *string
+}
+
 type PlatformTokenEntriesDefault struct {
 	ID        int64
 	UserID    int64
@@ -465,6 +519,14 @@ type PlatformXpEvent struct {
 	Source      string
 	Amount      int64
 	RefID       *string
+	CreatedAt   time.Time
+}
+
+type PlatformXpEventType struct {
+	Key         string
+	Name        string
+	Description *string
+	Enabled     bool
 	CreatedAt   time.Time
 }
 

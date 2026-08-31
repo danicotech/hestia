@@ -264,6 +264,18 @@ func (q *Queries) MarkOutboxDone(ctx context.Context, id int64) error {
 	return err
 }
 
+const markOutboxFailed = `-- name: MarkOutboxFailed :exec
+UPDATE platform.outbox_events
+SET status = 'failed', attempts = attempts + 1
+WHERE id = $1
+`
+
+// 毒訊息終態:超過重試上限,不能卡住整條佇列
+func (q *Queries) MarkOutboxFailed(ctx context.Context, id int64) error {
+	_, err := q.db.Exec(ctx, markOutboxFailed, id)
+	return err
+}
+
 const markOutboxRetry = `-- name: MarkOutboxRetry :exec
 UPDATE platform.outbox_events
 SET attempts = attempts + 1, next_retry_at = $2
