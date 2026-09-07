@@ -2,6 +2,20 @@
 
 平台核心:身分、代幣帳本、通知管線、兌換。灶火永不熄 —— 這個 repo 跨活動長壽。
 
+## 目錄分層(2026-09-07 收斂,新程式碼照這個放)
+
+```
+internal/core/platform/<feature>/     契約層:型別、錯誤、介面。只認標準庫;可被 activity/transport 依賴
+internal/core/activity/               活動層暫住地(M1),第二個活動時抽去 themis
+internal/infrastructure/storage/<feature>pg/   實作 + testcontainers 測試(範式:ledgerpg)
+internal/infrastructure/storage/queries/       sqlc 查詢,一個 feature 一個 .sql 檔
+internal/infrastructure/outbox/       outbox 消費者
+internal/transport/                   (M1 1-2 起)HTTP/gRPC handler,經 core 介面注入,不碰 pool
+cmd/server, cmd/migrate               組裝與部署入口
+```
+
+早期規劃的 domain/ 四層腳手架已於 2026-09-07 刪除(從未有實碼,與 core/ 重複)。depguard 依上表把關。
+
 ## 邊界
 
 - `internal/core/platform` **不能** import `internal/core/activity`。反向只能透過 interface(如 `Ledger`)。

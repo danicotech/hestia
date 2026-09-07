@@ -25,45 +25,28 @@ linters:
     # 靠自律撐不過三個月,靠這個可以。
     depguard:
       rules:
-        # 一、domain 不 import 任何其他層,也不認識任何基礎設施
-        domain:
-          files:
-            - "**/internal/domain/**"
-          deny:
-            - pkg: github.com/danicotech/hestia/internal/core
-              desc: domain 不能 import core
-            - pkg: github.com/danicotech/hestia/internal/infrastructure
-              desc: domain 不能 import infrastructure,port 介面宣告在 domain 這一側
-            - pkg: github.com/danicotech/hestia/internal/interface
-              desc: domain 不能 import interface
-            - pkg: github.com/gin-gonic/gin
-              desc: domain 只認 context 和標準庫
-            - pkg: github.com/danielgtaylor/huma
-              desc: domain 只認 context 和標準庫
-            - pkg: github.com/jackc/pgx
-              desc: domain 只認 context 和標準庫
-            - pkg: github.com/redis/go-redis
-              desc: domain 只認 context 和標準庫
-
-        # 二、core 只認 domain 定義的 port
+        # 一、core 是契約層:型別/錯誤/介面,只認標準庫與 context
+        # (可被 activity 與未來的 transport 依賴;實作在 infrastructure)
         core:
           files:
             - "**/internal/core/**"
           deny:
             - pkg: github.com/danicotech/hestia/internal/infrastructure
-              desc: core 只能透過 domain 的 port 用基礎設施,接線是 wire 的工作
-            - pkg: github.com/danicotech/hestia/internal/interface
+              desc: core 是契約層,不能 import infrastructure;實作放 storage/*pg
+            - pkg: github.com/danicotech/hestia/internal/transport
               desc: core 不能反過來依賴入口層
+            - pkg: github.com/jackc/pgx
+              desc: core 只認 context 和標準庫
 
-        # 三、interface 拿到的是 core 的用例,不是 *pgxpool.Pool
-        interface:
+        # 二、transport(M1 1-2 起用):handler 拿 core 的介面,不碰 pool
+        transport:
           files:
-            - "**/internal/interface/**"
+            - "**/internal/transport/**"
           deny:
-            - pkg: github.com/danicotech/hestia/internal/infrastructure
-              desc: handler 不能直接碰 infrastructure
+            - pkg: github.com/danicotech/hestia/internal/infrastructure/storage
+              desc: handler 不能直接碰儲存層,經 core 介面注入
 
-        # 四、platform 不得 import activity。整個專案唯一真正回不去的線
+        # 三、platform 不得 import activity。整個專案唯一真正回不去的線
         platform:
           files:
             - "**/platform/**"
