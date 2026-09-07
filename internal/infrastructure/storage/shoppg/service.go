@@ -165,8 +165,13 @@ func (s *Service) Purchase(ctx context.Context, p shop.PurchaseParams) (*shop.Pu
 	}
 	switch f := shop.Fulfillment(item.Fulfillment); {
 	case f.Auto():
+		entPublicID, err := newULID()
+		if err != nil {
+			return nil, fmt.Errorf("產生權益 public_id: %w", err)
+		}
 		ent, err := qtx.InsertEntitlement(ctx, db.InsertEntitlementParams{
-			UserID: p.UserID, ItemID: item.ID,
+			PublicID: entPublicID,
+			UserID:   p.UserID, ItemID: item.ID,
 			DurationDays:        item.DurationDays,
 			RefundWindowSeconds: item.RefundWindowSeconds,
 		})
@@ -174,6 +179,7 @@ func (s *Service) Purchase(ctx context.Context, p shop.PurchaseParams) (*shop.Pu
 			return nil, fmt.Errorf("寫入權益: %w", err)
 		}
 		result.EntitlementID = ent.ID
+		result.EntitlementPublicID = entPublicID
 		result.ExpiresAt = ent.ExpiresAt
 		result.RefundableUntil = ent.RefundableUntil
 

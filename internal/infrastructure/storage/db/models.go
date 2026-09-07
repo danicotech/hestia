@@ -104,6 +104,7 @@ type PlatformEntitlement struct {
 	ExpiresAt       *time.Time
 	RefundableUntil *time.Time
 	RevokedAt       *time.Time
+	PublicID        string
 }
 
 type PlatformEventLog struct {

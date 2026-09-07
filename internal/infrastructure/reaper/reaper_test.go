@@ -90,8 +90,8 @@ func newItem(t *testing.T, externalRoleID *string) int64 {
 func newEntitlement(t *testing.T, userID, itemID int64, expiresExpr, revokedExpr string) int64 {
 	t.Helper()
 	var id int64
-	q := fmt.Sprintf(`INSERT INTO platform.entitlements (user_id, item_id, expires_at, revoked_at)
-		VALUES ($1, $2, %s, %s) RETURNING id`, expiresExpr, revokedExpr)
+	q := fmt.Sprintf(`INSERT INTO platform.entitlements (public_id, user_id, item_id, expires_at, revoked_at)
+		VALUES (gen_random_uuid()::text, $1, $2, %s, %s) RETURNING id`, expiresExpr, revokedExpr)
 	if err := pool.QueryRow(context.Background(), q, userID, itemID).Scan(&id); err != nil {
 		t.Fatalf("建測試權益: %v", err)
 	}
@@ -237,8 +237,8 @@ func TestReapBatchBoundary(t *testing.T) {
 	user := newUser(t)
 	item := newItem(t, nil)
 	const total = 250
-	_, err := pool.Exec(ctx, `INSERT INTO platform.entitlements (user_id, item_id, expires_at)
-		SELECT $1, $2, now() - interval '1 minute' FROM generate_series(1, $3::int)`,
+	_, err := pool.Exec(ctx, `INSERT INTO platform.entitlements (public_id, user_id, item_id, expires_at)
+		SELECT gen_random_uuid()::text, $1, $2, now() - interval '1 minute' FROM generate_series(1, $3::int)`,
 		user, item, total)
 	if err != nil {
 		t.Fatalf("建 %d 筆權益: %v", total, err)
@@ -280,8 +280,8 @@ func TestReapConcurrent(t *testing.T) {
 	user := newUser(t)
 	item := newItem(t, nil)
 	const total = 60
-	_, err := pool.Exec(ctx, `INSERT INTO platform.entitlements (user_id, item_id, expires_at)
-		SELECT $1, $2, now() - interval '1 minute' FROM generate_series(1, $3::int)`,
+	_, err := pool.Exec(ctx, `INSERT INTO platform.entitlements (public_id, user_id, item_id, expires_at)
+		SELECT gen_random_uuid()::text, $1, $2, now() - interval '1 minute' FROM generate_series(1, $3::int)`,
 		user, item, total)
 	if err != nil {
 		t.Fatalf("建 %d 筆權益: %v", total, err)

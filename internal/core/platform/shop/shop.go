@@ -66,9 +66,10 @@ type PurchaseResult struct {
 	LedgerEntryID int64 `json:"ledger_entry_id"`
 
 	// auto_* 履約:
-	EntitlementID   int64      `json:"entitlement_id"`             // 0 = manual 購買
-	ExpiresAt       *time.Time `json:"expires_at,omitempty"`       // nil = 永久
-	RefundableUntil *time.Time `json:"refundable_until,omitempty"` // nil = 不可退
+	EntitlementID       int64      `json:"entitlement_id"`                  // 內部 id;冪等 response 序列化需要,對外遮蔽是 transport DTO 的責任
+	EntitlementPublicID string     `json:"entitlement_public_id,omitempty"` // 對外定址用;manual 購買為空
+	ExpiresAt           *time.Time `json:"expires_at,omitempty"`            // nil = 永久
+	RefundableUntil     *time.Time `json:"refundable_until,omitempty"`      // nil = 不可退
 
 	// manual 履約:
 	RedemptionID       int64  `json:"redemption_id"` // 0 = auto 購買

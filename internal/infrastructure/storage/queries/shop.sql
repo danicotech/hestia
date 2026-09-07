@@ -33,9 +33,9 @@ SELECT (
 -- expires_at / refundable_until 在購買當下用 DB 時鐘算好「存欄位」
 -- (schemas/08:窗口逐商品調,存值不現算)。
 -- duration_days NULL → expires_at NULL = 永久;refund_window_seconds <= 0 → NULL = 不可退。
-INSERT INTO platform.entitlements (user_id, item_id, expires_at, refundable_until)
+INSERT INTO platform.entitlements (public_id, user_id, item_id, expires_at, refundable_until)
 VALUES (
-  $1, $2,
+  sqlc.arg(public_id), $1, $2,
   CASE WHEN sqlc.narg(duration_days)::int IS NULL THEN NULL
        ELSE now() + make_interval(days => sqlc.narg(duration_days)::int) END,
   CASE WHEN sqlc.arg(refund_window_seconds)::int <= 0 THEN NULL

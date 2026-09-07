@@ -134,20 +134,21 @@ func (q *Queries) GetShopItemForPurchase(ctx context.Context, publicID string) (
 }
 
 const insertEntitlement = `-- name: InsertEntitlement :one
-INSERT INTO platform.entitlements (user_id, item_id, expires_at, refundable_until)
+INSERT INTO platform.entitlements (public_id, user_id, item_id, expires_at, refundable_until)
 VALUES (
-  $1, $2,
-  CASE WHEN $3::int IS NULL THEN NULL
-       ELSE now() + make_interval(days => $3::int) END,
-  CASE WHEN $4::int <= 0 THEN NULL
-       ELSE now() + make_interval(secs => $4::int) END
+  $3, $1, $2,
+  CASE WHEN $4::int IS NULL THEN NULL
+       ELSE now() + make_interval(days => $4::int) END,
+  CASE WHEN $5::int <= 0 THEN NULL
+       ELSE now() + make_interval(secs => $5::int) END
 )
-RETURNING id, user_id, item_id, granted_at, expires_at, refundable_until, revoked_at
+RETURNING id, user_id, item_id, granted_at, expires_at, refundable_until, revoked_at, public_id
 `
 
 type InsertEntitlementParams struct {
 	UserID              int64
 	ItemID              int64
+	PublicID            string
 	DurationDays        *int32
 	RefundWindowSeconds int32
 }
@@ -159,6 +160,7 @@ func (q *Queries) InsertEntitlement(ctx context.Context, arg InsertEntitlementPa
 	row := q.db.QueryRow(ctx, insertEntitlement,
 		arg.UserID,
 		arg.ItemID,
+		arg.PublicID,
 		arg.DurationDays,
 		arg.RefundWindowSeconds,
 	)
@@ -171,6 +173,7 @@ func (q *Queries) InsertEntitlement(ctx context.Context, arg InsertEntitlementPa
 		&i.ExpiresAt,
 		&i.RefundableUntil,
 		&i.RevokedAt,
+		&i.PublicID,
 	)
 	return i, err
 }
