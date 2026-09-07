@@ -14,7 +14,9 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/danicotech/hestia/internal/infrastructure/maintenance"
 	"github.com/danicotech/hestia/internal/infrastructure/outbox"
+	"github.com/danicotech/hestia/internal/infrastructure/reaper"
 )
 
 func main() {
@@ -49,6 +51,11 @@ func run() error {
 	consumer := outbox.NewConsumer(pool)
 	// topic handler 隨功能上線註冊(M2 起:daily.claimed → Discord 推播等)
 
+	// 資料膨脹治理(schemas/14):分區維護、outbox/冪等鍵清理、權益到期回收
+	runner := maintenance.New(pool)
+	maintenance.RegisterDefaults(runner, pool)
+	runner.Register("entitlement_reaper", time.Minute, reaper.New(pool).Reap)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		if err := pool.Ping(r.Context()); err != nil {
@@ -59,10 +66,18 @@ func run() error {
 	})
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 	go func() {
 		slog.Info("outbox 消費者啟動")
 		if err := consumer.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			errCh <- err
+			return
+		}
+		errCh <- nil
+	}()
+	go func() {
+		slog.Info("maintenance 排程器啟動")
+		if err := runner.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			errCh <- err
 			return
 		}
@@ -77,20 +92,32 @@ func run() error {
 		errCh <- nil
 	}()
 
+	// 三個元件(consumer / runner / http)各送一次 errCh。
+	// 任何一個結束——不論 error 或 nil(元件提前消失也是異常)——都走完整關機,
+	// 並 join 全部 goroutine 再返回(QA:錯誤路徑不遺漏收尾,不留半死進程)。
+	consumed := 0
+	var runErr error
 	select {
 	case <-ctx.Done():
 		slog.Info("收到關機訊號")
 	case err := <-errCh:
+		consumed++
+		runErr = err
 		if err != nil {
-			stop()
-			shutdown(srv)
-			return err
+			slog.Error("元件致命錯誤,進入關機", "err", err)
+		} else {
+			slog.Warn("元件在無關機訊號下自行結束,進入關機")
+			runErr = errors.New("元件提前結束")
 		}
 	}
+	stop()
 	shutdown(srv)
-	// 等 consumer goroutine 收尾(ctx 已取消)
-	<-errCh
-	return nil
+	for ; consumed < 3; consumed++ {
+		if err := <-errCh; err != nil && runErr == nil {
+			runErr = err
+		}
+	}
+	return runErr
 }
 
 func shutdown(srv *http.Server) {

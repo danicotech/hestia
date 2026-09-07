@@ -17,12 +17,18 @@ type Querier interface {
 	ApplyBalanceDelta(ctx context.Context, arg ApplyBalanceDeltaParams) (int64, error)
 	// 多實例安全消費:SKIP LOCKED
 	ClaimPendingOutbox(ctx context.Context, limit int32) ([]PlatformOutboxEvent, error)
+	// 語意代價(接受):超過窗口的重送不再被識別為重放——30 天遠大於任何合法重試窗口
+	CleanupIdempotencyKeys(ctx context.Context, retentionDays int32) (int64, error)
+	// 終態事件(done/failed)逾保留期即刪;pending 永不動(schemas/14)
+	CleanupOutboxEvents(ctx context.Context, retentionDays int32) (int64, error)
 	// per_user_limit 的計數口徑(schemas/08):未撤銷的 entitlements + 非 cancelled/rejected
 	// 的 redemptions。退款(撤銷)與被拒/取消的工單釋放額度。
 	CountUserItemAcquisitions(ctx context.Context, arg CountUserItemAcquisitionsParams) (int64, error)
 	CreateIdentity(ctx context.Context, arg CreateIdentityParams) (PlatformIdentity, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (PlatformUser, error)
 	EnsureBalanceRow(ctx context.Context, arg EnsureBalanceRowParams) error
+	// 為 platform schema 所有分區表補齊本月與下月分區(migration 00001 的函式)
+	EnsureMonthPartitions(ctx context.Context) error
 	// 與 EnsureBalanceRow 同模式:先保證投影列存在,才能 FOR UPDATE 串行化同 user 的併發入帳
 	EnsureUserXpRow(ctx context.Context, arg EnsureUserXpRowParams) error
 	GetBalance(ctx context.Context, arg GetBalanceParams) (int64, error)
@@ -70,6 +76,11 @@ type Querier interface {
 	// 在 tx 開頭先插(response 先 NULL),讓併發同 key 的第二個 tx 直接撞 PK;
 	// tx 若 rollback,key 同步消失,合法重試不會被擋。
 	InsertIdempotencyKey(ctx context.Context, arg InsertIdempotencyKeyParams) error
+	// maintenance 排程器(schemas/14):job 執行紀錄、advisory lock、分區與列級清理。
+	// 分區到期偵測(pg_inherits catalog,sqlc 解析不了系統目錄)與 DROP TABLE(動態 DDL)
+	// 無法走 sqlc,實作在 maintenance 套件內(partition.go)。
+	// 每次 job 執行寫一列 event_logs(schemas/13 的 job.run 在此兌現;失敗也要記)
+	InsertJobRunLog(ctx context.Context, arg InsertJobRunLogParams) error
 	InsertOutboxEvent(ctx context.Context, arg InsertOutboxEventParams) (int64, error)
 	InsertRedemption(ctx context.Context, arg InsertRedemptionParams) (PlatformRedemption, error)
 	InsertTokenEntry(ctx context.Context, arg InsertTokenEntryParams) (InsertTokenEntryRow, error)
@@ -89,6 +100,16 @@ type Querier interface {
 	// FOR UPDATE OF e:只鎖權益列(同一權益的退款串行化),不鎖共享讀的商品列。
 	// db_now 一併回傳:退款窗口比對用 DB 時鐘,避免 app/DB 時鐘偏移誤判(同 outbox 的教訓)。
 	LockEntitlementForRefund(ctx context.Context, id int64) (LockEntitlementForRefundRow, error)
+	// 限時權益到期回收(schemas/14 entitlement_reaper、schemas/08 部分索引)。
+	// 本檔只有到期掃描與撤銷;outbox 寫入沿用 ledger.sql 的 InsertOutboxEvent
+	// (一個概念一個權威,不重複)。entitlements 之外的表僅共享讀。
+	// FOR UPDATE OF e SKIP LOCKED:多實例回收互不重複,也不與退款互擋——
+	// shoppg 退款持有的 entitlement 列鎖讓本輪直接跳過,下一輪再看
+	// (屆時要嘛已 revoked 不再匹配,要嘛退款窗口已過照常回收,兩者皆正確)。
+	// OF e:只鎖權益列,不鎖共享讀的 shop_items。
+	// WHERE 條件正中既有部分索引 (expires_at) WHERE revoked_at IS NULL AND expires_at IS NOT NULL。
+	// external_role_id:auto_role 商品的 Discord 身分組,消費端收回身分組要用。
+	LockExpiredEntitlements(ctx context.Context, limit int32) ([]LockExpiredEntitlementsRow, error)
 	// FOR UPDATE OF r:同一工單的 approve / reject / cancel 串行化,
 	// 後到者看到非 pending 即拒絕(狀態機單向)。
 	LockRedemptionForHandle(ctx context.Context, id int64) (LockRedemptionForHandleRow, error)
@@ -105,6 +126,7 @@ type Querier interface {
 	// 一併回 DB 時鐘:冷卻比較的兩端(事件時間與 now)都用 DB 時鐘,
 	// 單一時鐘來源,app/DB 時鐘偏移不影響判斷
 	LockUserXp(ctx context.Context, arg LockUserXpParams) (LockUserXpRow, error)
+	MaintenanceUnlock(ctx context.Context, jobName string) error
 	MarkOutboxDone(ctx context.Context, id int64) error
 	// 毒訊息終態:超過重試上限,不能卡住整條佇列
 	MarkOutboxFailed(ctx context.Context, id int64) error
@@ -117,6 +139,9 @@ type Querier interface {
 	ReconcileBalances(ctx context.Context) ([]ReconcileBalancesRow, error)
 	// 呼叫前必須已 LockEntitlementForRefund 且確認 revoked_at IS NULL。
 	RevokeEntitlement(ctx context.Context, id int64) (*time.Time, error)
+	// 呼叫前必須已 LockExpiredEntitlements 持鎖;revoked_at IS NULL 再守一層,
+	// 影響列數 ≠ 輸入數即狀態矛盾,呼叫端失敗出聲。時間用 DB 時鐘(單一時鐘來源)。
+	RevokeExpiredEntitlements(ctx context.Context, ids []int64) (int64, error)
 	SetIdempotencyResponse(ctx context.Context, arg SetIdempotencyResponseParams) error
 	// 對帳 job 用:驗證 SUM(entries) = balance
 	SumEntriesForUser(ctx context.Context, arg SumEntriesForUserParams) (int64, error)
@@ -124,6 +149,9 @@ type Querier interface {
 	// 呼叫前必須已 LockUserXp,同 user 的併發入帳已串行化,SUM 不會低估
 	SumXpTodayBySource(ctx context.Context, arg SumXpTodayBySourceParams) (int64, error)
 	TouchUserLastSeen(ctx context.Context, id int64) error
+	// session-level advisory lock:同名 job 多實例只有一個能跑,拿不到就跳過本輪。
+	// 必須在同一條連線上執行 TryMaintenanceLock / MaintenanceUnlock(排程器用 pool.Acquire 釘住連線)。
+	TryMaintenanceLock(ctx context.Context, jobName string) (bool, error)
 	UpdateIdentityTokens(ctx context.Context, arg UpdateIdentityTokensParams) error
 	// 呼叫前必須已 LockRedemptionForHandle 且確認 status='pending'。
 	UpdateRedemptionStatus(ctx context.Context, arg UpdateRedemptionStatusParams) (PlatformRedemption, error)
