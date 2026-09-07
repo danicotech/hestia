@@ -7,6 +7,7 @@ package db
 
 import (
 	"context"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 )
@@ -24,6 +25,29 @@ func (q *Queries) GetDailyState(ctx context.Context, userID int64) (PlatformUser
 		&i.BestStreak,
 		&i.LastClaimDate,
 		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getLastDailyClaim = `-- name: GetLastDailyClaim :one
+SELECT user_id, claim_date, claimed_at, timezone, streak, amount, source FROM platform.daily_claims
+WHERE user_id = $1
+ORDER BY claimed_at DESC
+LIMIT 1
+`
+
+// 最近一次簽到(依絕對時間),供改時區冷卻檢查(timezone_change_min_gap_hours)比對 claimed_at
+func (q *Queries) GetLastDailyClaim(ctx context.Context, userID int64) (PlatformDailyClaim, error) {
+	row := q.db.QueryRow(ctx, getLastDailyClaim, userID)
+	var i PlatformDailyClaim
+	err := row.Scan(
+		&i.UserID,
+		&i.ClaimDate,
+		&i.ClaimedAt,
+		&i.Timezone,
+		&i.Streak,
+		&i.Amount,
+		&i.Source,
 	)
 	return i, err
 }
@@ -64,6 +88,27 @@ func (q *Queries) InsertDailyClaim(ctx context.Context, arg InsertDailyClaimPara
 		&i.Amount,
 		&i.Source,
 	)
+	return i, err
+}
+
+const lockUserForDaily = `-- name: LockUserForDaily :one
+SELECT timezone, timezone_changed_at FROM platform.users
+WHERE id = $1 AND deleted_at IS NULL
+FOR UPDATE
+`
+
+type LockUserForDailyRow struct {
+	Timezone          string
+	TimezoneChangedAt *time.Time
+}
+
+// 串行化同一使用者的併發 Claim:跨當地午夜(或併發改時區)時兩個 tx 可能算出
+// 不同 claim_date,單靠 PK 擋不住(streak 誤算、20h 閘門可繞過)。
+// 先鎖 users 列,之後的冷卻/streak 讀取全在鎖後;PK 仍是防連點的最終防線。
+func (q *Queries) LockUserForDaily(ctx context.Context, id int64) (LockUserForDailyRow, error) {
+	row := q.db.QueryRow(ctx, lockUserForDaily, id)
+	var i LockUserForDailyRow
+	err := row.Scan(&i.Timezone, &i.TimezoneChangedAt)
 	return i, err
 }
 
