@@ -6,9 +6,13 @@ package db
 
 import (
 	"context"
+	"time"
 )
 
 type Querier interface {
+	// 與 InsertXpEvent 同 tx;now() 為 tx 時間,與事件的 created_at 同值。
+	// level 不動:M1 曲線未上線,恆 0(schemas/06)
+	AddUserXp(ctx context.Context, arg AddUserXpParams) (int64, error)
 	// 呼叫前必須已 LockBalanceForUpdate;CHECK(balance >= 0) 是最後防線,不是主要檢查
 	ApplyBalanceDelta(ctx context.Context, arg ApplyBalanceDeltaParams) (int64, error)
 	// 多實例安全消費:SKIP LOCKED
@@ -16,14 +20,27 @@ type Querier interface {
 	CreateIdentity(ctx context.Context, arg CreateIdentityParams) (PlatformIdentity, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (PlatformUser, error)
 	EnsureBalanceRow(ctx context.Context, arg EnsureBalanceRowParams) error
+	// 與 EnsureBalanceRow 同模式:先保證投影列存在,才能 FOR UPDATE 串行化同 user 的併發入帳
+	EnsureUserXpRow(ctx context.Context, arg EnsureUserXpRowParams) error
 	GetBalance(ctx context.Context, arg GetBalanceParams) (int64, error)
+	// LEFT JOIN:community 存在但 xp_ruleset_id 為 NULL(M1 可能還沒建 ruleset)時
+	// 回 NULL config,呼叫端採安全預設(無冷卻、無 cap);community 不存在 → 無列(ErrNoRows)
+	GetCommunityXpConfig(ctx context.Context, id int64) ([]byte, error)
 	// 經濟設定:不覆寫舊值,讀取取「生效時間最新」的一筆
 	GetCurrentConfig(ctx context.Context, key string) ([]byte, error)
 	GetDailyState(ctx context.Context, userID int64) (PlatformUserDailyState, error)
 	GetIdempotencyKey(ctx context.Context, key string) (PlatformIdempotencyKey, error)
+	// 最近一次簽到(依絕對時間),供改時區冷卻檢查(timezone_change_min_gap_hours)比對 claimed_at
+	GetLastDailyClaim(ctx context.Context, userID int64) (PlatformDailyClaim, error)
 	GetUserByID(ctx context.Context, id int64) (PlatformUser, error)
 	GetUserByIdentity(ctx context.Context, arg GetUserByIdentityParams) (PlatformUser, error)
 	GetUserByPublicID(ctx context.Context, publicID string) (PlatformUser, error)
+	// XP query。設計依 schemas/06(含增補 E)與 schemas/01 增補 A:
+	// xp_events 是事實、user_xp 是投影(必可重算)、XP 不進帳本不經 Ledger(刻意設計,
+	// XP 錯了重算即可,沒有對帳需求;混進帳本會淹沒金流稽核)。
+	// 冷卻用 user_xp.last_xp_at 直接查 DB(schemas/06:不上 Redis)。
+	// source 檢查:registry 管「存在與開關」(全域);數值/冷卻/上限在 xp_rulesets.config
+	GetXpEventType(ctx context.Context, key string) (GetXpEventTypeRow, error)
 	// reason NOT NULL 是刻意的:強迫動作當下寫理由(schemas/03)
 	InsertAdminAudit(ctx context.Context, arg InsertAdminAuditParams) (int64, error)
 	// 調整 = 插新列(必帶 created_by;seed 列 created_by 為 NULL)
@@ -36,6 +53,12 @@ type Querier interface {
 	InsertIdempotencyKey(ctx context.Context, arg InsertIdempotencyKeyParams) error
 	InsertOutboxEvent(ctx context.Context, arg InsertOutboxEventParams) (int64, error)
 	InsertTokenEntry(ctx context.Context, arg InsertTokenEntryParams) (InsertTokenEntryRow, error)
+	InsertXpEvent(ctx context.Context, arg InsertXpEventParams) (InsertXpEventRow, error)
+	// 冷卻計時器:該 (user, community, source) 最近一筆事件的時間。
+	// 不用 user_xp.last_xp_at 當計時器 —— 它是「最後任何入帳」的跨 source 資訊欄位,
+	// 拿來計時會讓 voice 高頻入帳餓死 message 的冷卻、admin 修正也會重置計時(QA 中1)。
+	// 無列(ErrNoRows)= 該 source 從未入帳 = 無冷卻。呼叫前必須已 LockUserXp(串行化)
+	LastXpEventAtBySource(ctx context.Context, arg LastXpEventAtBySourceParams) (time.Time, error)
 	ListAdminAuditByActor(ctx context.Context, arg ListAdminAuditByActorParams) ([]PlatformAdminAuditLog, error)
 	ListCurrentConfigs(ctx context.Context) ([]ListCurrentConfigsRow, error)
 	ListEntriesByUser(ctx context.Context, arg ListEntriesByUserParams) ([]PlatformTokenEntry, error)
@@ -43,16 +66,29 @@ type Querier interface {
 	// append-only、同 transaction 更新餘額、鎖依 user_id 升冪、動錢一律冪等。
 	// 這裡刻意「沒有」UPDATE/DELETE token_entries 的 query —— 不要新增。
 	LockBalanceForUpdate(ctx context.Context, arg LockBalanceForUpdateParams) (int64, error)
+	// 串行化同一使用者的併發 Claim:跨當地午夜(或併發改時區)時兩個 tx 可能算出
+	// 不同 claim_date,單靠 PK 擋不住(streak 誤算、20h 閘門可繞過)。
+	// 先鎖 users 列,之後的冷卻/streak 讀取全在鎖後;PK 仍是防連點的最終防線。
+	LockUserForDaily(ctx context.Context, id int64) (LockUserForDailyRow, error)
+	// 一併回 DB 時鐘:冷卻比較的兩端(事件時間與 now)都用 DB 時鐘,
+	// 單一時鐘來源,app/DB 時鐘偏移不影響判斷
+	LockUserXp(ctx context.Context, arg LockUserXpParams) (LockUserXpRow, error)
 	MarkOutboxDone(ctx context.Context, id int64) error
 	// 毒訊息終態:超過重試上限,不能卡住整條佇列
 	MarkOutboxFailed(ctx context.Context, id int64) error
 	// 退避時間由 DB 時鐘計算(單一時鐘來源,QA:app/DB 時鐘偏移會讓事件被提前取走)
 	MarkOutboxRetry(ctx context.Context, arg MarkOutboxRetryParams) error
+	// 投影重算:xp ← SUM(events)、last_xp_at ← MAX(created_at),整個投影可從事實重建。
+	// 呼叫前必須已 LockUserXp,否則與並行 Award 有覆寫競態(先算 SUM、後拿鎖會蓋掉新事件)
+	RebuildUserXp(ctx context.Context, arg RebuildUserXpParams) (int64, error)
 	// 對帳:找出 SUM(entries) 與 balance 不一致的每一組(含只有分錄沒有餘額列、或反之)
 	ReconcileBalances(ctx context.Context) ([]ReconcileBalancesRow, error)
 	SetIdempotencyResponse(ctx context.Context, arg SetIdempotencyResponseParams) error
 	// 對帳 job 用:驗證 SUM(entries) = balance
 	SumEntriesForUser(ctx context.Context, arg SumEntriesForUserParams) (int64, error)
+	// daily_cap 判斷:UTC 當日該 user 該 community 該 source 的總和(schemas/01 A)。
+	// 呼叫前必須已 LockUserXp,同 user 的併發入帳已串行化,SUM 不會低估
+	SumXpTodayBySource(ctx context.Context, arg SumXpTodayBySourceParams) (int64, error)
 	TouchUserLastSeen(ctx context.Context, id int64) error
 	UpdateIdentityTokens(ctx context.Context, arg UpdateIdentityTokensParams) error
 	UpdateUserTimezone(ctx context.Context, arg UpdateUserTimezoneParams) (UpdateUserTimezoneRow, error)
