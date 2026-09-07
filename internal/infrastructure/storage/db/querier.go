@@ -17,6 +17,9 @@ type Querier interface {
 	ApplyBalanceDelta(ctx context.Context, arg ApplyBalanceDeltaParams) (int64, error)
 	// 多實例安全消費:SKIP LOCKED
 	ClaimPendingOutbox(ctx context.Context, limit int32) ([]PlatformOutboxEvent, error)
+	// per_user_limit 的計數口徑(schemas/08):未撤銷的 entitlements + 非 cancelled/rejected
+	// 的 redemptions。退款(撤銷)與被拒/取消的工單釋放額度。
+	CountUserItemAcquisitions(ctx context.Context, arg CountUserItemAcquisitionsParams) (int64, error)
 	CreateIdentity(ctx context.Context, arg CreateIdentityParams) (PlatformIdentity, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (PlatformUser, error)
 	EnsureBalanceRow(ctx context.Context, arg EnsureBalanceRowParams) error
@@ -29,9 +32,21 @@ type Querier interface {
 	// 經濟設定:不覆寫舊值,讀取取「生效時間最新」的一筆
 	GetCurrentConfig(ctx context.Context, key string) ([]byte, error)
 	GetDailyState(ctx context.Context, userID int64) (PlatformUserDailyState, error)
+	// manual 購買的押款分錄 ref 指向 redemption;免費 manual 商品沒有分錄 → no rows。
+	GetHoldEntryForRedemption(ctx context.Context, refID *int64) (GetHoldEntryForRedemptionRow, error)
 	GetIdempotencyKey(ctx context.Context, key string) (PlatformIdempotencyKey, error)
 	// 最近一次簽到(依絕對時間),供改時區冷卻檢查(timezone_change_min_gap_hours)比對 claimed_at
 	GetLastDailyClaim(ctx context.Context, userID int64) (PlatformDailyClaim, error)
+	// Purchase 把扣款分錄的 ref 指向 entitlement(ref_type='entitlement', ref_id=權益 id),
+	// 退款由此精確找回原分錄——不靠「該 user 該 item 最近一筆」猜測,也不改 schema。
+	// 免費商品(price=0)購買時沒有分錄 → no rows,呼叫端視為無錢可退、僅撤銷權益。
+	GetPurchaseEntryForEntitlement(ctx context.Context, refID *int64) (GetPurchaseEntryForEntitlementRow, error)
+	// is_listed 用 DB 時鐘計算(單一時鐘來源):listed_at 非空且已到、delisted_at 空或未到。
+	GetShopItemForPurchase(ctx context.Context, publicID string) (GetShopItemForPurchaseRow, error)
+	// 管理員經濟操作 query。動錢一律走 ledger 的 ApplyInTx,這裡只有讀取;
+	// audit 寫入用 audit.sql 的 InsertAdminAudit,不重複定義。
+	// 退款前讀原分錄(分區表,依 id 掃全分區;管理操作低頻,可接受)
+	GetTokenEntryByID(ctx context.Context, id int64) (PlatformTokenEntry, error)
 	GetUserByID(ctx context.Context, id int64) (PlatformUser, error)
 	GetUserByIdentity(ctx context.Context, arg GetUserByIdentityParams) (PlatformUser, error)
 	GetUserByPublicID(ctx context.Context, publicID string) (PlatformUser, error)
@@ -47,11 +62,16 @@ type Querier interface {
 	InsertConfig(ctx context.Context, arg InsertConfigParams) (PlatformEconomyConfig, error)
 	// 簽到:防連點靠 daily_claims 的 PK(user_id, claim_date),不用冪等鍵(ledger-invariants 第三條)
 	InsertDailyClaim(ctx context.Context, arg InsertDailyClaimParams) (PlatformDailyClaim, error)
+	// expires_at / refundable_until 在購買當下用 DB 時鐘算好「存欄位」
+	// (schemas/08:窗口逐商品調,存值不現算)。
+	// duration_days NULL → expires_at NULL = 永久;refund_window_seconds <= 0 → NULL = 不可退。
+	InsertEntitlement(ctx context.Context, arg InsertEntitlementParams) (PlatformEntitlement, error)
 	// 與動錢同一個 transaction 寫入(見 ledger-invariants 第三條)。
 	// 在 tx 開頭先插(response 先 NULL),讓併發同 key 的第二個 tx 直接撞 PK;
 	// tx 若 rollback,key 同步消失,合法重試不會被擋。
 	InsertIdempotencyKey(ctx context.Context, arg InsertIdempotencyKeyParams) error
 	InsertOutboxEvent(ctx context.Context, arg InsertOutboxEventParams) (int64, error)
+	InsertRedemption(ctx context.Context, arg InsertRedemptionParams) (PlatformRedemption, error)
 	InsertTokenEntry(ctx context.Context, arg InsertTokenEntryParams) (InsertTokenEntryRow, error)
 	InsertXpEvent(ctx context.Context, arg InsertXpEventParams) (InsertXpEventRow, error)
 	// 冷卻計時器:該 (user, community, source) 最近一筆事件的時間。
@@ -66,10 +86,22 @@ type Querier interface {
 	// append-only、同 transaction 更新餘額、鎖依 user_id 升冪、動錢一律冪等。
 	// 這裡刻意「沒有」UPDATE/DELETE token_entries 的 query —— 不要新增。
 	LockBalanceForUpdate(ctx context.Context, arg LockBalanceForUpdateParams) (int64, error)
+	// FOR UPDATE OF e:只鎖權益列(同一權益的退款串行化),不鎖共享讀的商品列。
+	// db_now 一併回傳:退款窗口比對用 DB 時鐘,避免 app/DB 時鐘偏移誤判(同 outbox 的教訓)。
+	LockEntitlementForRefund(ctx context.Context, id int64) (LockEntitlementForRefundRow, error)
+	// FOR UPDATE OF r:同一工單的 approve / reject / cancel 串行化,
+	// 後到者看到非 pending 即拒絕(狀態機單向)。
+	LockRedemptionForHandle(ctx context.Context, id int64) (LockRedemptionForHandleRow, error)
 	// 串行化同一使用者的併發 Claim:跨當地午夜(或併發改時區)時兩個 tx 可能算出
 	// 不同 claim_date,單靠 PK 擋不住(streak 誤算、20h 閘門可繞過)。
 	// 先鎖 users 列,之後的冷卻/streak 讀取全在鎖後;PK 仍是防連點的最終防線。
 	LockUserForDaily(ctx context.Context, id int64) (LockUserForDailyRow, error)
+	// 商店 query(schemas/08-shop.md)。動錢一律經 ledger(shoppg 用 ApplyInTx 同 tx 綁定),
+	// 這裡只有商品 / 權益 / 工單側的讀寫;token_entries 僅有 SELECT(append-only 鐵則)。
+	// 同一使用者的購買以 users 列鎖串行化:per_user_limit 計數與 API 冪等鍵的重放判定,
+	// 都必須在「前一筆購買 commit 之後」才有意義(READ COMMITTED 下先讀後寫會踩到舊快照)。
+	// 鎖序:users → user_balances(與 dailypg 同向,不會與帳本互鎖)。
+	LockUserForShop(ctx context.Context, id int64) (int64, error)
 	// 一併回 DB 時鐘:冷卻比較的兩端(事件時間與 now)都用 DB 時鐘,
 	// 單一時鐘來源,app/DB 時鐘偏移不影響判斷
 	LockUserXp(ctx context.Context, arg LockUserXpParams) (LockUserXpRow, error)
@@ -83,6 +115,8 @@ type Querier interface {
 	RebuildUserXp(ctx context.Context, arg RebuildUserXpParams) (int64, error)
 	// 對帳:找出 SUM(entries) 與 balance 不一致的每一組(含只有分錄沒有餘額列、或反之)
 	ReconcileBalances(ctx context.Context) ([]ReconcileBalancesRow, error)
+	// 呼叫前必須已 LockEntitlementForRefund 且確認 revoked_at IS NULL。
+	RevokeEntitlement(ctx context.Context, id int64) (*time.Time, error)
 	SetIdempotencyResponse(ctx context.Context, arg SetIdempotencyResponseParams) error
 	// 對帳 job 用:驗證 SUM(entries) = balance
 	SumEntriesForUser(ctx context.Context, arg SumEntriesForUserParams) (int64, error)
@@ -91,6 +125,8 @@ type Querier interface {
 	SumXpTodayBySource(ctx context.Context, arg SumXpTodayBySourceParams) (int64, error)
 	TouchUserLastSeen(ctx context.Context, id int64) error
 	UpdateIdentityTokens(ctx context.Context, arg UpdateIdentityTokensParams) error
+	// 呼叫前必須已 LockRedemptionForHandle 且確認 status='pending'。
+	UpdateRedemptionStatus(ctx context.Context, arg UpdateRedemptionStatusParams) (PlatformRedemption, error)
 	UpdateUserTimezone(ctx context.Context, arg UpdateUserTimezoneParams) (UpdateUserTimezoneRow, error)
 	UpsertDailyState(ctx context.Context, arg UpsertDailyStateParams) error
 }
