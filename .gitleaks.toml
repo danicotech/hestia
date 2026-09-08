@@ -22,3 +22,19 @@ paths = [
   '''_test\.go$''',
 ]
 regexTarget = "match"
+
+# Discord snowflake 的假值。規則會把任何 17–20 位數字當成 client id,
+# 而測試需要形狀正確的 snowflake 才測得到解析邏輯。
+# 一樣只放行測試檔裡的明顯合成值(遞增數列 / 全 9 / 邊界值),不放寬規則本身。
+[[rules]]
+id = "discord-client-id"
+[rules.allowlist]
+regexes = [
+  '''123456789012345678''',
+  '''100000000000000001''',
+  '''999999999999999999''',
+]
+paths = [
+  '''_test\.go$''',
+]
+regexTarget = "match"
