@@ -5,6 +5,7 @@
 package db
 
 import (
+	"net/netip"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -347,6 +348,21 @@ type PlatformRoleProviderBinding struct {
 	Provider       string
 	ExternalRoleID string
 	SyncMode       string
+}
+
+type PlatformSession struct {
+	ID               int64
+	PublicID         string
+	UserID           int64
+	RefreshTokenHash []byte
+	IssuedAt         time.Time
+	ExpiresAt        time.Time
+	LastUsedAt       *time.Time
+	RevokedAt        *time.Time
+	RevokedReason    *string
+	UserAgent        *string
+	Ip               *netip.Addr
+	RotatedFrom      *int64
 }
 
 type PlatformShopItem struct {

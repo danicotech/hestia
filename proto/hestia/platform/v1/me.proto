@@ -1,0 +1,69 @@
+syntax = "proto3";
+
+// 「我」的資料。主體一律是 Authorization: Bearer 認出來的使用者,
+// 所以請求裡沒有 user_public_id——不接受「代查別人」,那是管理端的事。
+package hestia.platform.v1;
+
+import "hestia/platform/v1/common.proto";
+
+option go_package = "github.com/danicotech/hestia/gen/hestia/platform/v1;platformv1";
+
+message GetProfileRequest {}
+
+message GetProfileResponse {
+  UserProfile profile = 1;
+}
+
+message GetBalanceRequest {
+  // 幣別代碼(currencies.code);必填,不給預設值——多幣別下猜錯就是給錯數字。
+  string currency = 1;
+}
+
+message GetBalanceResponse {
+  Balance balance = 1;
+}
+
+// ListBalances 一次拿全部幣別。多幣別下前端要一次顯示,
+// 逐幣別打 GetBalance 是 N 次往返。
+message ListBalancesRequest {}
+
+message ListBalancesResponse {
+  repeated Balance balances = 1;
+}
+
+message ListEntitlementsRequest {
+  // true = 連已撤銷(含已退款)的一起回。
+  bool include_revoked = 1;
+}
+
+message ListEntitlementsResponse {
+  repeated Entitlement entitlements = 1;
+}
+
+message ListRedemptionsRequest {
+  // 只回指定狀態;UNSPECIFIED = 全部。
+  RedemptionStatus status = 1;
+}
+
+message ListRedemptionsResponse {
+  repeated Redemption redemptions = 1;
+}
+
+message UpdateTimezoneRequest {
+  // IANA 時區名(如 Asia/Taipei)。改時區後簽到需距上次 ≥ 冷卻時數,
+  // 這是防「改時區一天簽兩次」的設計(schemas/07-daily.md)。
+  string timezone = 1;
+}
+
+message UpdateTimezoneResponse {
+  UserProfile profile = 1;
+}
+
+service MeService {
+  rpc GetProfile(GetProfileRequest) returns (GetProfileResponse);
+  rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse);
+  rpc ListBalances(ListBalancesRequest) returns (ListBalancesResponse);
+  rpc ListEntitlements(ListEntitlementsRequest) returns (ListEntitlementsResponse);
+  rpc ListRedemptions(ListRedemptionsRequest) returns (ListRedemptionsResponse);
+  rpc UpdateTimezone(UpdateTimezoneRequest) returns (UpdateTimezoneResponse);
+}

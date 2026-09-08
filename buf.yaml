@@ -1,0 +1,12 @@
+# buf 模組設定(v2)。proto 是對外契約的唯一來源:
+# 一套 proto 同時提供 gRPC 與 HTTP/JSON(ConnectRPC),Go server 與 TS client 都從這裡生成。
+# 手寫共用型別是禁止的(專案鐵則 6)。
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+breaking:
+  use:
+    - FILE

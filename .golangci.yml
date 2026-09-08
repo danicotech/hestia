@@ -43,8 +43,8 @@ linters:
           files:
             - "**/internal/transport/**"
           deny:
-            - pkg: github.com/danicotech/hestia/internal/infrastructure/storage
-              desc: handler 不能直接碰儲存層,經 core 介面注入
+            - pkg: github.com/danicotech/hestia/internal/infrastructure
+              desc: handler 不能碰任何 infrastructure(含 storage / maintenance / outbox),經 core 介面注入
 
         # 三、platform 不得 import activity。整個專案唯一真正回不去的線
         platform:

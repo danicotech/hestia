@@ -1,0 +1,18 @@
+# 生成:Go 訊息型別(protocolbuffers/go)+ ConnectRPC handler/client(connectrpc/go)。
+# 兩個插件都走 go.mod 的 tool 指示詞(Go 1.24+),不需要另外安裝 protoc 或 plugin binary,
+# 也不會因為開發機上的版本漂移產生不同輸出。
+#
+# 重跑方式見 proto/README.md。
+version: v2
+clean: true
+managed:
+  enabled: false
+plugins:
+  - local: ["go", "tool", "protoc-gen-go"]
+    out: gen
+    opt: paths=source_relative
+  - local: ["go", "tool", "protoc-gen-connect-go"]
+    out: gen
+    opt: paths=source_relative
+inputs:
+  - directory: proto

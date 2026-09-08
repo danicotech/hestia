@@ -1,0 +1,81 @@
+syntax = "proto3";
+
+// 登入:OAuth2(第一個 provider 是 Discord),無密碼(schemas/02-identity.md)。
+// 本檔只是契約——handler 目前一律回 unimplemented,實作由 identity 層補上。
+package hestia.platform.v1;
+
+import "google/protobuf/timestamp.proto";
+import "hestia/platform/v1/common.proto";
+
+option go_package = "github.com/danicotech/hestia/gen/hestia/platform/v1;platformv1";
+
+// Session 是一次登入產生的憑證。
+// 注意:這是整份契約唯一出現 token 的地方,event_logs 的白名單摘要
+// 對 AuthService 一律不記任何欄位值(schemas/13:絕不存 token / 密碼)。
+message Session {
+  string access_token = 1;
+  google.protobuf.Timestamp access_token_expires_at = 2;
+  string refresh_token = 3;
+  google.protobuf.Timestamp refresh_token_expires_at = 4;
+  // 登入者的 public_id;內部 user id 永不外露。
+  string user_public_id = 5;
+}
+
+message StartDiscordLoginRequest {
+  // 登入完成後要導回的前端位址;必須在伺服器端白名單內,空 = 用預設。
+  string redirect_uri = 1;
+}
+
+message StartDiscordLoginResponse {
+  // 要把使用者導去的 Discord authorize 位址。
+  string authorize_url = 1;
+  // CSRF state,回呼時原樣帶回。
+  //
+  // 同一個值也會由伺服器寫成 HttpOnly cookie(hestia_oauth_state),
+  // 回呼時兩邊必須相符——光有簽章擋不住 login CSRF / session fixation:
+  // 簽章只證明「這是我們發的」,不證明「它屬於發起登入的那個瀏覽器」。
+  string state = 2;
+}
+
+message CompleteDiscordLoginRequest {
+  // Discord 回呼帶回的授權碼。
+  string code = 1;
+  // StartDiscordLogin 發出的 state。
+  //
+  // 伺服器會同時比對 HttpOnly cookie 裡的同名值,不符(或 cookie 缺失)
+  // 一律拒絕(PermissionDenied)。**前端契約**:瀏覽器端的 Connect client
+  // 必須設 `credentials: "include"`,否則 cookie 不會被送出,登入永遠失敗。
+  string state = 2;
+}
+
+message CompleteDiscordLoginResponse {
+  Session session = 1;
+  UserProfile profile = 2;
+}
+
+message RefreshSessionRequest {
+  string refresh_token = 1;
+}
+
+message RefreshSessionResponse {
+  Session session = 1;
+}
+
+message LogoutRequest {
+  // 要撤銷的 refresh token;空 = 只撤銷當前 Authorization 帶的 session。
+  string refresh_token = 1;
+}
+
+message LogoutResponse {}
+
+// AuthService 全部方法都不需要 Authorization header(RefreshSession 用
+// refresh_token 自證,Logout 兩者皆可)——認證攔截器對本服務整體豁免。
+//
+// **前端契約**:登入流程依賴 HttpOnly cookie(OAuth state 綁瀏覽器),
+// 瀏覽器端的 Connect client 一律要設 `credentials: "include"`。
+service AuthService {
+  rpc StartDiscordLogin(StartDiscordLoginRequest) returns (StartDiscordLoginResponse);
+  rpc CompleteDiscordLogin(CompleteDiscordLoginRequest) returns (CompleteDiscordLoginResponse);
+  rpc RefreshSession(RefreshSessionRequest) returns (RefreshSessionResponse);
+  rpc Logout(LogoutRequest) returns (LogoutResponse);
+}

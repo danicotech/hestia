@@ -1,0 +1,82 @@
+syntax = "proto3";
+
+// 商店:上架瀏覽、購買、短窗口自助退款、取消自己的工單(schemas/08-shop.md)。
+package hestia.platform.v1;
+
+import "google/protobuf/timestamp.proto";
+import "hestia/platform/v1/common.proto";
+
+option go_package = "github.com/danicotech/hestia/gen/hestia/platform/v1;platformv1";
+
+message ListItemsRequest {
+  // true = 連已下架的一起回(絕版商品的展示用途)。
+  bool include_delisted = 1;
+}
+
+message ListItemsResponse {
+  repeated ShopItem items = 1;
+}
+
+message PurchaseRequest {
+  string item_public_id = 1;
+  // 必填:購買沒有天然 UNIQUE 可擋(同人可重複買到 per_user_limit),
+  // 冪等鍵是防連點的權威。同 key 重送錢只動一次。
+  string idempotency_key = 2;
+}
+
+message PurchaseResponse {
+  string item_public_id = 1;
+  Fulfillment fulfillment = 2;
+  string currency = 3;
+  // 實際扣款金額(0 = 免費商品,未動帳本)。
+  int64 price = 4;
+  // auto_* 履約產生的權益;manual 購買為空。
+  string entitlement_public_id = 5;
+  // manual 履約產生的工單;auto_* 購買為空。
+  string redemption_public_id = 6;
+  // 權益到期時間;空 = 永久或非 auto 履約。
+  optional google.protobuf.Timestamp expires_at = 7;
+  // 自助退款截止時間;空 = 不可退。
+  optional google.protobuf.Timestamp refundable_until = 8;
+  // true = 冪等重放,本次未實際動錢。
+  bool replayed = 9;
+}
+
+message RefundPurchaseRequest {
+  // 要退的權益(必須屬於請求者、未撤銷、仍在 refundable_until 窗口內)。
+  string entitlement_public_id = 1;
+  // 必填:退款也是動錢。
+  string idempotency_key = 2;
+}
+
+message RefundPurchaseResponse {
+  string entitlement_public_id = 1;
+  // 退回金額(≥ 0;0 = 免費購買,只撤銷權益沒錢可退)。
+  // 退款一律是新的正數分錄,絕不改舊紀錄。
+  int64 amount = 2;
+  string currency = 3;
+  bool replayed = 4;
+}
+
+// CancelRedemptionRequest 刻意沒有 idempotency_key:
+// pending → 終態的單向轉移在列鎖下本身就是防重權威(shop.CancelParams 同理),
+// 重複取消回 FailedPrecondition。
+message CancelRedemptionRequest {
+  // 要取消的 pending 工單(必須是自己建立的)。
+  string redemption_public_id = 1;
+}
+
+message CancelRedemptionResponse {
+  string redemption_public_id = 1;
+  RedemptionStatus status = 2;
+  // 全額退回的金額(0 = 免費商品)。
+  int64 refund_amount = 3;
+}
+
+service ShopService {
+  // ListItems 是公開查詢,不需要登入。
+  rpc ListItems(ListItemsRequest) returns (ListItemsResponse);
+  rpc Purchase(PurchaseRequest) returns (PurchaseResponse);
+  rpc RefundPurchase(RefundPurchaseRequest) returns (RefundPurchaseResponse);
+  rpc CancelRedemption(CancelRedemptionRequest) returns (CancelRedemptionResponse);
+}

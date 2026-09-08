@@ -1,0 +1,137 @@
+syntax = "proto3";
+
+// hestia 平台層對外契約(ConnectRPC:一套 proto 同時服務 gRPC 與 HTTP/JSON)。
+//
+// 三條貫穿全檔的鐵則(專案 CLAUDE.md):
+//   1. 對外只出現 public_id(ULID),永不出現內部 BIGINT id。
+//   2. 金額一律 int64——protobuf 的 JSON 編碼把 64 位整數寫成字串以保精度,
+//      這是刻意的;絕不用 float / double / decimal string。
+//   3. 動錢的 RPC 一律帶 idempotency_key;唯二例外(簽到、工單狀態轉移)
+//      在各自的訊息上寫明「為什麼不需要」——它們有 UNIQUE / 單向狀態機當權威。
+package hestia.platform.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/danicotech/hestia/gen/hestia/platform/v1;platformv1";
+
+// Fulfillment 是商品履約型態(schemas/08-shop.md)。
+// auto_* 產生 entitlement(持續為真的狀態);manual 產生 redemption(一次性工單)。
+enum Fulfillment {
+  FULFILLMENT_UNSPECIFIED = 0;
+  // 自動發 Discord 身分組(可限時)。
+  FULFILLMENT_AUTO_ROLE = 1;
+  // 自動生效的站內權益(可限時)。
+  FULFILLMENT_AUTO_PERK = 2;
+  // 人工履約:產生工單,管理員核可後才算交付。
+  FULFILLMENT_MANUAL = 3;
+}
+
+// RedemptionStatus 是工單狀態,pending → 三個終態,單向不可逆。
+enum RedemptionStatus {
+  REDEMPTION_STATUS_UNSPECIFIED = 0;
+  REDEMPTION_STATUS_PENDING = 1;
+  REDEMPTION_STATUS_FULFILLED = 2;
+  REDEMPTION_STATUS_REJECTED = 3;
+  REDEMPTION_STATUS_CANCELLED = 4;
+}
+
+// UserProfile 是使用者的公開檔案。餘額刻意不在這裡:
+// 餘額的唯一權威查詢是 MeService.GetBalance(專案第 9 條:一個概念一個位置)。
+message UserProfile {
+  string public_id = 1;
+  string display_name = 2;
+  string avatar_url = 3;
+  // IANA 時區名(如 Asia/Taipei),簽到日界線用。
+  string timezone = 4;
+  // 上次改時區的時間;空 = 從未變更。改時區後簽到有冷卻。
+  optional google.protobuf.Timestamp timezone_changed_at = 5;
+  google.protobuf.Timestamp created_at = 6;
+}
+
+// Balance 是單一幣別的即時餘額。
+message Balance {
+  string currency = 1;
+  // 餘額;int64,JSON 編為字串。
+  int64 amount = 2;
+}
+
+// ShopItem 是上架商品的對外檢視。stock 刻意不揭露(M1 不啟用全域限量)。
+message ShopItem {
+  string public_id = 1;
+  string name = 2;
+  string description = 3;
+  Fulfillment fulfillment = 4;
+  string currency = 5;
+  // 售價;0 = 免費商品(不動帳本)。
+  int64 price = 6;
+  // 權益效期天數;空 = 永久。
+  optional int32 duration_days = 7;
+  // 每人限購上限;空 = 不限。
+  optional int32 per_user_limit = 8;
+  // 退款窗口秒數;0 = 不可退。
+  int32 refund_window_seconds = 9;
+  // 上架時間;空 = 尚未上架。
+  optional google.protobuf.Timestamp listed_at = 10;
+  // 下架時間;空 = 仍在架上(絕版制:下架後不再產出,已流通實例仍在)。
+  optional google.protobuf.Timestamp delisted_at = 11;
+}
+
+// Entitlement 是使用者持有的權益(soulbound)。
+message Entitlement {
+  string public_id = 1;
+  string item_public_id = 2;
+  string item_name = 3;
+  Fulfillment fulfillment = 4;
+  google.protobuf.Timestamp granted_at = 5;
+  // 到期時間;空 = 永久。
+  optional google.protobuf.Timestamp expires_at = 6;
+  // 自助退款截止時間;空 = 不可退(存欄位不現算,schemas/08)。
+  optional google.protobuf.Timestamp refundable_until = 7;
+  // 撤銷時間;空 = 仍有效。退款會撤銷權益。
+  optional google.protobuf.Timestamp revoked_at = 8;
+}
+
+// Redemption 是人工履約工單。
+message Redemption {
+  string public_id = 1;
+  string item_public_id = 2;
+  string item_name = 3;
+  RedemptionStatus status = 4;
+  string note = 5;
+  google.protobuf.Timestamp created_at = 6;
+  // 處理時間;空 = 仍 pending。
+  optional google.protobuf.Timestamp handled_at = 7;
+}
+
+// LedgerAdjustment 是一次管理員動錢的結果摘要。
+// 刻意不含分錄的內部 id:對外只給「誰、哪個幣別、動了多少、動完剩多少」。
+message LedgerAdjustment {
+  string user_public_id = 1;
+  string currency = 2;
+  // 本次分錄金額:發點為正、扣點為負、退款為正。
+  int64 amount = 3;
+  // 分錄寫入後的餘額。
+  int64 new_balance = 4;
+  // true = 冪等重放,本次未實際動錢(金額與餘額是原次執行當下的值)。
+  bool replayed = 5;
+}
+
+// LedgerEntry 是帳本分錄的管理端檢視。
+//
+// entry_ref 是鐵則 5 的**已裁決例外**(管理端):platform.token_entries 沒有
+// public_id,管理操作只能用它定址。用 string 承載是為了將來若補上 public_id,
+// 只換內容不換型別。一般使用者的 API 不會出現這個型別。
+message LedgerEntry {
+  string entry_ref = 1;
+  string user_public_id = 2;
+  string currency = 3;
+  // 分錄金額:正 = 入帳,負 = 扣款。
+  int64 amount = 4;
+  // 事由枚舉(daily_claim / shop_purchase / refund …),見 schemas/05-ledger.md。
+  string reason = 5;
+  google.protobuf.Timestamp created_at = 6;
+  // true = 這筆扣款已經被沖銷過(同一分錄只能退一次)。
+  bool refunded = 7;
+  // 管理員操作產生的分錄才有;空 = 系統或使用者自己觸發。
+  string actor_public_id = 8;
+}

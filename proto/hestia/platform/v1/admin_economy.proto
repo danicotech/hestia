@@ -1,0 +1,111 @@
+syntax = "proto3";
+
+// 管理員經濟操作:發點 / 扣點 / 萬能退款 / 處理兌換工單
+// (schemas/05-ledger.md、schemas/03-authz.md、schemas/08-shop.md)。
+//
+// 三個動錢操作都是「動錢 + admin_audit_logs 稽核」單一 transaction,
+// reason 空字串一律拒絕——強迫管理員在動作當下寫理由是刻意設計。
+package hestia.platform.v1;
+
+import "google/protobuf/timestamp.proto";
+import "hestia/platform/v1/common.proto";
+
+option go_package = "github.com/danicotech/hestia/gen/hestia/platform/v1;platformv1";
+
+message GrantRequest {
+  string user_public_id = 1;
+  string currency = 2;
+  // 發放金額,必須 > 0(方向由 RPC 決定,不靠正負號)。
+  int64 amount = 3;
+  // 寫進 admin_audit_logs.reason;空字串拒絕。
+  string reason = 4;
+  // 必填(動錢鐵則)。
+  string idempotency_key = 5;
+}
+
+message GrantResponse {
+  LedgerAdjustment adjustment = 1;
+}
+
+message DeductRequest {
+  string user_public_id = 1;
+  string currency = 2;
+  // 扣除金額,必須 > 0。餘額不足回 FailedPrecondition,整筆回滾(稽核也不留)。
+  int64 amount = 3;
+  string reason = 4;
+  // 必填(動錢鐵則)。
+  string idempotency_key = 5;
+}
+
+message DeductResponse {
+  LedgerAdjustment adjustment = 1;
+}
+
+// RefundRequest 刻意沒有 idempotency_key:退款的冪等權威是由分錄導出的
+// 決定性鍵(refund:entry:{id}),呼叫端再給一把 key 就是第二套權威。
+// 同一分錄第二次退款回 AlreadyExists。
+message RefundRequest {
+  // 要沖銷的原分錄參照。必須是扣款分錄(amount < 0)。
+  //
+  // ⚠ 已知 schema 缺口(2026-09-08 回報):platform.token_entries 沒有
+  // public_id 欄位,而專案鐵則 5 要求對外只出現 public_id。這裡用 string
+  // 而非 int64 承載,是為了「等 token_entries 補上 public_id 後,只換內容
+  // 不換欄位型別、不破壞既有 client」。在補上之前,值是分錄 id 的十進位字串。
+  string entry_ref = 1;
+  // 寫進 admin_audit_logs.reason;空字串拒絕。
+  string reason = 2;
+}
+
+message RefundResponse {
+  LedgerAdjustment adjustment = 1;
+}
+
+// HandleRedemptionRequest 刻意沒有 idempotency_key:pending → 終態的單向
+// 轉移在列鎖下就是防重權威。重複處理回 FailedPrecondition。
+message HandleRedemptionRequest {
+  string redemption_public_id = 1;
+  // true → fulfilled(不動錢,購買時的押款即最終扣款);
+  // false → rejected(全額退,新的正數分錄)。
+  bool approve = 2;
+  // 選填,覆寫工單備註。
+  optional string note = 3;
+}
+
+message HandleRedemptionResponse {
+  string redemption_public_id = 1;
+  RedemptionStatus status = 2;
+  // 退回金額;fulfilled 恆為 0。
+  int64 refund_amount = 3;
+}
+
+// ListEntriesRequest 查某位使用者的帳本分錄。
+//
+// 為什麼需要它:Refund 用 entry_ref 定址,但沒有任何 RPC 會產出 entry_ref,
+// 管理員就只能去翻資料庫才叫得動退款——契約自相矛盾。這條補上缺口。
+message ListEntriesRequest {
+  string user_public_id = 1;
+  // 只回這個時間(含)之後的分錄;空 = 不限。
+  optional google.protobuf.Timestamp after = 2;
+  // 只回這個時間(不含)之前的分錄;空 = 不限。
+  optional google.protobuf.Timestamp before = 3;
+  // 每頁筆數;0 = 預設 50,上限 200(超過一律夾到上限)。
+  int32 page_size = 4;
+  // 上一頁回傳的 next_page_token;空 = 第一頁。
+  string page_token = 5;
+}
+
+message ListEntriesResponse {
+  // 依 created_at 由新到舊。
+  repeated LedgerEntry entries = 1;
+  // 空 = 沒有下一頁。
+  string next_page_token = 2;
+}
+
+service AdminEconomyService {
+  rpc Grant(GrantRequest) returns (GrantResponse);
+  rpc Deduct(DeductRequest) returns (DeductResponse);
+  rpc Refund(RefundRequest) returns (RefundResponse);
+  rpc HandleRedemption(HandleRedemptionRequest) returns (HandleRedemptionResponse);
+  // ListEntries 是唯一能取得 entry_ref 的地方(Refund 的前置)。
+  rpc ListEntries(ListEntriesRequest) returns (ListEntriesResponse);
+}

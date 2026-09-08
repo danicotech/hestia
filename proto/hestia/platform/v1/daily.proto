@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+// 每日簽到(schemas/07-daily.md)。
+package hestia.platform.v1;
+
+option go_package = "github.com/danicotech/hestia/gen/hestia/platform/v1;platformv1";
+
+// ClaimRequest 刻意沒有 idempotency_key(hestia/CLAUDE.md 帳本鐵則 4):
+// 防連點的權威是 daily_claims 的 UNIQUE (user_id, claim_date),比冪等鍵更可靠。
+// 再加一把冪等鍵就是同一概念兩個權威(專案第 9 條)。
+// 日界線用使用者自己的時區,主體來自 Authorization。
+message ClaimRequest {}
+
+message ClaimResponse {
+  // 本次發放金額。
+  int64 amount = 1;
+  // 更新後的連續簽到天數。
+  int32 streak = 2;
+}
+
+service DailyService {
+  // Claim 為使用者執行「當地今日」簽到。今天已簽過回 AlreadyExists。
+  rpc Claim(ClaimRequest) returns (ClaimResponse);
+}

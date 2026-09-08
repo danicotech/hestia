@@ -21,6 +21,12 @@ type Querier interface {
 	CleanupIdempotencyKeys(ctx context.Context, retentionDays int32) (int64, error)
 	// 終態事件(done/failed)逾保留期即刪;pending 永不動(schemas/14)
 	CleanupOutboxEvents(ctx context.Context, retentionDays int32) (int64, error)
+	// 膨脹歸宿(schemas/14)。條件形態**原樣**對齊表達式索引 sessions_retention_idx,
+	// 改寫成 (revoked_at < ... OR expires_at < ...) 會退化成全表掃描。
+	// 起算點 COALESCE(revoked_at, expires_at) 保證只命中「已撤銷或已過期」的列:
+	// 截止線早於 now(),未撤銷且未過期的列不可能落在它之前。
+	// rotated_from 的子列指標由 FK 的 ON DELETE SET NULL 自動斷開,不會撞 FK。
+	CleanupSessions(ctx context.Context, retentionDays int32) (int64, error)
 	// per_user_limit 的計數口徑(schemas/08):未撤銷的 entitlements + 非 cancelled/rejected
 	// 的 redemptions。退款(撤銷)與被拒/取消的工單釋放額度。
 	CountUserItemAcquisitions(ctx context.Context, arg CountUserItemAcquisitionsParams) (int64, error)
@@ -29,6 +35,8 @@ type Querier interface {
 	EnsureBalanceRow(ctx context.Context, arg EnsureBalanceRowParams) error
 	// 為 platform schema 所有分區表補齊本月與下月分區(migration 00001 的函式)
 	EnsureMonthPartitions(ctx context.Context) error
+	// 預設列(兩級 optout 都是 false)。ON CONFLICT DO NOTHING:重跑不炸。
+	EnsurePrivacySettings(ctx context.Context, userID int64) error
 	// 與 EnsureBalanceRow 同模式:先保證投影列存在,才能 FOR UPDATE 串行化同 user 的併發入帳
 	EnsureUserXpRow(ctx context.Context, arg EnsureUserXpRowParams) error
 	GetBalance(ctx context.Context, arg GetBalanceParams) (int64, error)
@@ -43,10 +51,33 @@ type Querier interface {
 	GetIdempotencyKey(ctx context.Context, key string) (PlatformIdempotencyKey, error)
 	// 最近一次簽到(依絕對時間),供改時區冷卻檢查(timezone_change_min_gap_hours)比對 claimed_at
 	GetLastDailyClaim(ctx context.Context, userID int64) (PlatformDailyClaim, error)
+	// 身分層(schemas/02):OAuth2 登入、身分綁定、登入 session(增補 F)。
+	//
+	// 兩個 token 概念不要混:
+	//   identities.access_token_enc / refresh_token_enc = Discord 發給我們的憑證(加密存)
+	//   sessions.refresh_token_hash                     = 使用者登入我們系統的憑證(只存 SHA-256)
+	//
+	// 「有效 session」在本檔案只有一個定義,所有查詢一律照抄:
+	//   revoked_at IS NULL AND expires_at > now() AND users.deleted_at IS NULL
+	// 第三個條件 schema 表達不了(跨表),只能靠查詢契約——漏掉就是「軟刪除的帳號
+	// 仍能無限滑動續期」。
+	// 登入時查既有綁定。刻意不過濾 deleted_at:軟刪除的使用者仍佔著
+	// UNIQUE(provider, provider_user_id),必須讓應用層看見並明確拒絕,
+	// 而不是查不到就再建一個 user(那會撞唯一鍵)。
+	GetLoginIdentity(ctx context.Context, arg GetLoginIdentityParams) (GetLoginIdentityRow, error)
 	// Purchase 把扣款分錄的 ref 指向 entitlement(ref_type='entitlement', ref_id=權益 id),
 	// 退款由此精確找回原分錄——不靠「該 user 該 item 最近一筆」猜測,也不改 schema。
 	// 免費商品(price=0)購買時沒有分錄 → no rows,呼叫端視為無錢可退、僅撤銷權益。
 	GetPurchaseEntryForEntitlement(ctx context.Context, refID *int64) (GetPurchaseEntryForEntitlementRow, error)
+	// refresh 的前置讀取。這裡讀到的狀態只用來「提早回錯」與取得 user_id;
+	// 「這個 token 只能換發一次」的權威是 sessions_rotated_from_uq(見 InsertSession),
+	// 不是這次讀取——先查後寫在併發下擋不住,唯一索引擋得住。
+	GetSessionByRefreshHash(ctx context.Context, refreshTokenHash []byte) (GetSessionByRefreshHashRow, error)
+	// 「登出這台」的入口。帶 user_id 條件是越權防線(只知道 public_id 動不了別人的裝置);
+	// **刻意不帶 revoked_at IS NULL**:裝置清單上拿到的 public_id 可能在使用者按下登出
+	// 之前就被背景 refresh 輪替掉了(舊列 revoked、換了新 public_id)。
+	// 以它為起點展開輪替鏈才能撤到那台裝置目前真正在用的那一列。
+	GetSessionIDByPublicID(ctx context.Context, arg GetSessionIDByPublicIDParams) (int64, error)
 	// is_listed 用 DB 時鐘計算(單一時鐘來源):listed_at 非空且已到、delisted_at 空或未到。
 	GetShopItemForPurchase(ctx context.Context, publicID string) (GetShopItemForPurchaseRow, error)
 	// 管理員經濟操作 query。動錢一律走 ledger 的 ApplyInTx,這裡只有讀取;
@@ -56,6 +87,10 @@ type Querier interface {
 	GetUserByID(ctx context.Context, id int64) (PlatformUser, error)
 	GetUserByIdentity(ctx context.Context, arg GetUserByIdentityParams) (PlatformUser, error)
 	GetUserByPublicID(ctx context.Context, publicID string) (PlatformUser, error)
+	// access token 驗簽通過後把 public_id 解成內部 id(順帶擋掉已軟刪除的帳號)。
+	GetUserIDByPublicID(ctx context.Context, publicID string) (int64, error)
+	// 輪替時要把 public_id 放進新的 access token;順帶再擋一次軟刪除的帳號。
+	GetUserPublicID(ctx context.Context, id int64) (string, error)
 	// XP query。設計依 schemas/06(含增補 E)與 schemas/01 增補 A:
 	// xp_events 是事實、user_xp 是投影(必可重算)、XP 不進帳本不經 Ledger(刻意設計,
 	// XP 錯了重算即可,沒有對帳需求;混進帳本會淹沒金流稽核)。
@@ -72,6 +107,16 @@ type Querier interface {
 	// (schemas/08:窗口逐商品調,存值不現算)。
 	// duration_days NULL → expires_at NULL = 永久;refund_window_seconds <= 0 → NULL = 不可退。
 	InsertEntitlement(ctx context.Context, arg InsertEntitlementParams) (PlatformEntitlement, error)
+	// 入口層操作紀錄(schemas/13-event-logs.md)。所有進到系統的動作——API / gRPC /
+	// Discord bot / webhook / 排程——都在這張表留痕,由各入口的攔截器統一寫,
+	// **不在業務碼裡手刻**。內容不存這裡(訊息 = message_logs、錢 = token_entries、
+	// 管理 = admin_audit_logs);這張只記「發生過什麼操作、誰、結果、多慢」。
+	//
+	// request / response 是白名單摘要:只放路由層級資訊與業務 public_id,
+	// 絕不放 token、密碼或完整 payload。
+	// 只有 INSERT:操作紀錄寫下去就不改(同帳本的 append-only 精神),
+	// 到期整個分區 DROP,不做逐列刪除。
+	InsertEventLog(ctx context.Context, arg InsertEventLogParams) error
 	// 與動錢同一個 transaction 寫入(見 ledger-invariants 第三條)。
 	// 在 tx 開頭先插(response 先 NULL),讓併發同 key 的第二個 tx 直接撞 PK;
 	// tx 若 rollback,key 同步消失,合法重試不會被擋。
@@ -81,8 +126,15 @@ type Querier interface {
 	// 無法走 sqlc,實作在 maintenance 套件內(partition.go)。
 	// 每次 job 執行寫一列 event_logs(schemas/13 的 job.run 在此兌現;失敗也要記)
 	InsertJobRunLog(ctx context.Context, arg InsertJobRunLogParams) error
+	InsertLoginIdentity(ctx context.Context, arg InsertLoginIdentityParams) (int64, error)
+	// 首次 OAuth 登入建立內部使用者(內部 id 是唯一權威,provider 帳號只是掛在上面的憑證)。
+	InsertLoginUser(ctx context.Context, arg InsertLoginUserParams) (InsertLoginUserRow, error)
 	InsertOutboxEvent(ctx context.Context, arg InsertOutboxEventParams) (int64, error)
 	InsertRedemption(ctx context.Context, arg InsertRedemptionParams) (PlatformRedemption, error)
+	// expires_at 用 **DB 時鐘**(應用機器時鐘漂移不該影響憑證壽命)。
+	// rotated_from 撞 sessions_rotated_from_uq = 這條 session 已經被輪替過一次,
+	// 也就是同一個 refresh token 被用了第二次 —— 呼叫端據此觸發重用偵測。
+	InsertSession(ctx context.Context, arg InsertSessionParams) (InsertSessionRow, error)
 	InsertTokenEntry(ctx context.Context, arg InsertTokenEntryParams) (InsertTokenEntryRow, error)
 	InsertXpEvent(ctx context.Context, arg InsertXpEventParams) (InsertXpEventRow, error)
 	// 冷卻計時器:該 (user, community, source) 最近一筆事件的時間。
@@ -90,9 +142,63 @@ type Querier interface {
 	// 拿來計時會讓 voice 高頻入帳餓死 message 的冷卻、admin 修正也會重置計時(QA 中1)。
 	// 無列(ErrNoRows)= 該 source 從未入帳 = 無冷卻。呼叫前必須已 LockUserXp(串行化)
 	LastXpEventAtBySource(ctx context.Context, arg LastXpEventAtBySourceParams) (time.Time, error)
+	ListActiveSessionIDs(ctx context.Context, userID int64) ([]int64, error)
 	ListAdminAuditByActor(ctx context.Context, arg ListAdminAuditByActorParams) ([]PlatformAdminAuditLog, error)
 	ListCurrentConfigs(ctx context.Context) ([]ListCurrentConfigsRow, error)
 	ListEntriesByUser(ctx context.Context, arg ListEntriesByUserParams) ([]PlatformTokenEntry, error)
+	// ── 帳本分錄(LedgerReader,管理端)─────────────────────────────────────
+	//
+	// **只讀**。token_entries 是 append-only 的事實來源,這裡不可能出現 UPDATE/DELETE。
+	//
+	// 分頁用 keyset(created_at, id)降冪,不用 OFFSET:token_entries 按 created_at
+	// 月分區且會長很大,OFFSET 每翻一頁都要重掃前面所有列,愈翻愈慢。
+	// 排序鍵取 (created_at, id) 而非只有 created_at:同一個 transaction 寫出的多筆分錄
+	// created_at 完全相同(now() 在 tx 內是常數),沒有 id tie-break 就會重複或漏抓。
+	//
+	// 三段 WHERE 的分工:
+	//   user_id     —— **永遠來自參數**,游標不參與;竄改游標最多換個位置,不可能跨使用者。
+	//   after/before—— 時間範圍(after 含、before 不含),直接落在分區鍵上供裁剪。
+	//   cursor      —— keyset 位置。
+	//
+	// 最後那段 `e.created_at <= cursor_created_at` 是**刻意的冗餘條件**:
+	// 它被上面的 row 比較蘊含,存在的唯一理由是讓 planner 拿它做分區裁剪
+	// ——ROW(a,b) < ROW(c,d) 這種形式 planner 推不出分區邊界,少了它,翻到第二頁
+	// 之後每一次查詢都會掃全部歷史分區。
+	//
+	// 這裡刻意不過濾 users.deleted_at:帳本是稽核用的事實來源,
+	// 帳號軟刪除不該讓錢的歷史從管理端消失(對外的定址仍由 Directory 擋住)。
+	// 「已被沖銷」的判定沿用既有語意(adminecon.Refund / shoppg 的兩條退款路徑):
+	// 沖銷分錄 ref_type='token_entry'、ref_id 指向原分錄。
+	//
+	// 為什麼是 LATERAL + LIMIT 1 而不是 EXISTS 子查詢:EXISTS 會被 planner 轉成
+	// hashed SubPlan —— 把**全表所有** ref_type='token_entry' 的列讀進雜湊表再比對
+	// (EXPLAIN 實測:六個分區全 Seq Scan)。退款分錄只會愈來愈多,那是會隨時間
+	// 劣化的形狀。LATERAL 強制逐列探測,每列走部分索引
+	// token_entries_ref_idx (ref_type, ref_id) WHERE ref_type IS NOT NULL,
+	// 且探測次數被 CTE 的 LIMIT 綁死在一頁之內。
+	ListLedgerEntries(ctx context.Context, arg ListLedgerEntriesParams) ([]ListLedgerEntriesRow, error)
+	// ── 型錄與持有物(Catalog)──────────────────────────────────────────────
+	// 上架條件與 shop.sql 的 GetShopItemForPurchase **完全同一套**(DB 時鐘,單一時鐘來源):
+	//   listed_at IS NOT NULL AND listed_at <= now() AND (delisted_at IS NULL OR delisted_at > now())
+	// 「型錄看得到的就買得到」是靠這兩段一致來保證的,sqlc 沒有 SQL 片段複用機制,
+	// 只能照抄——改任一邊都必須同時改另一邊(readpg 的測試會抓到不一致)。
+	//
+	// include_delisted 只放寬 delisted_at 那一段:從未上架(listed_at IS NULL)與
+	// 上架時間未到的商品是草稿,任何情況都不對外露出。
+	ListListedItems(ctx context.Context, arg ListListedItemsParams) ([]ListListedItemsRow, error)
+	// 多幣別:一列一幣別。**沒有列 = 沒有那個幣別的餘額 = 0**(與 ledger.GetBalance
+	// 的「無列視為 0」同一口徑),不在這裡替不存在的幣別補零列——
+	// 餘額的權威只有 user_balances,補零就是在讀取側偽造資料。
+	// 排序用 currency:幣別是主鍵的一半,唯一且穩定。
+	ListUserBalances(ctx context.Context, arg ListUserBalancesParams) ([]ListUserBalancesRow, error)
+	// 有效 session 的定義照抄檔頭三條件(含 users.deleted_at)。
+	ListUserDevices(ctx context.Context, userID int64) ([]ListUserDevicesRow, error)
+	// 只依 revoked_at 過濾;**過期的仍然回傳**——expires_at 一併給呈現層,
+	// 由它決定顯示成「已到期」還是隱藏。在這裡把過期的濾掉會讓使用者以為權益消失了。
+	ListUserEntitlements(ctx context.Context, arg ListUserEntitlementsParams) ([]ListUserEntitlementsRow, error)
+	// status 為 NULL = 不過濾(全部狀態)。狀態值的封閉枚舉在 core/platform/shop,
+	// 這裡不重複列舉。
+	ListUserRedemptions(ctx context.Context, arg ListUserRedemptionsParams) ([]ListUserRedemptionsRow, error)
 	// 帳本 query。使用規則見 .claude/skills/ledger-invariants:
 	// append-only、同 transaction 更新餘額、鎖依 user_id 升冪、動錢一律冪等。
 	// 這裡刻意「沒有」UPDATE/DELETE token_entries 的 query —— 不要新增。
@@ -123,6 +229,11 @@ type Querier interface {
 	// 都必須在「前一筆購買 commit 之後」才有意義(READ COMMITTED 下先讀後寫會踩到舊快照)。
 	// 鎖序:users → user_balances(與 dailypg 同向,不會與帳本互鎖)。
 	LockUserForShop(ctx context.Context, id int64) (int64, error)
+	// ── session(schemas/02 增補 F)────────────────────────────────────────────
+	// 同一使用者的 session 多列操作(輪替、全撤、重用偵測)一律先拿這把 xact advisory lock。
+	// 全系統同一把鎖、同一個取得時機 ⇒ 併發的多列操作被完全串行化,死鎖在結構上不可能,
+	// 同時關掉「封鎖進行中又發出新 session」的競態窗。
+	LockUserSessions(ctx context.Context, userID int64) error
 	// 一併回 DB 時鐘:冷卻比較的兩端(事件時間與 now)都用 DB 時鐘,
 	// 單一時鐘來源,app/DB 時鐘偏移不影響判斷
 	LockUserXp(ctx context.Context, arg LockUserXpParams) (LockUserXpRow, error)
@@ -132,31 +243,99 @@ type Querier interface {
 	MarkOutboxFailed(ctx context.Context, id int64) error
 	// 退避時間由 DB 時鐘計算(單一時鐘來源,QA:app/DB 時鐘偏移會讓事件被提前取走)
 	MarkOutboxRetry(ctx context.Context, arg MarkOutboxRetryParams) error
+	// revoked_at / revoked_reason 成對寫入(CHECK sessions_revocation_paired)。
+	// 回傳列數是**必須檢查**的:0 列 = 舊列在前置讀取之後被撤銷(登出/封鎖),
+	// 此時整個 tx 必須回滾,不能讓新發的 session 從一條已死的鏈上長出來。
+	MarkSessionRotated(ctx context.Context, id int64) (int64, error)
 	// 投影重算:xp ← SUM(events)、last_xp_at ← MAX(created_at),整個投影可從事實重建。
 	// 呼叫前必須已 LockUserXp,否則與並行 Award 有覆寫競態(先算 SUM、後拿鎖會蓋掉新事件)
 	RebuildUserXp(ctx context.Context, arg RebuildUserXpParams) (int64, error)
 	// 對帳:找出 SUM(entries) 與 balance 不一致的每一組(含只有分錄沒有餘額列、或反之)
 	ReconcileBalances(ctx context.Context) ([]ReconcileBalancesRow, error)
+	// API 讀取側(readpg)。這個檔案只有 SELECT,唯一的例外是 SetUserTimezone
+	// ——它是 users.timezone 的**寫入入口**(dailypg 的註解指名的那一個),放在這裡
+	// 是因為 transport 的 ProfileStore 把「讀檔案」與「改時區」綁在同一個 port。
+	//
+	// 三條紀律:
+	//   1. 使用者相關的查詢一律 JOIN users 並排除軟刪除(deleted_at IS NULL)。
+	//      軟刪除的帳號查不到自己的餘額/權益/工單,這是刻意的。
+	//   2. 每個列表都有明確且穩定的排序(業務欄位 + id tie-break),
+	//      不靠 Postgres 的偶然順序;沒有 tie-break 的排序在分頁時會漂移。
+	//   3. 每個列表都吃 row_limit,沒有無上限查詢。
+	//
+	// 這裡刻意**不重寫**已經有權威位置的查詢:
+	//   public_id ↔ 內部 user id  → identity.sql 的 GetUserIDByPublicID / GetUserPublicID
+	//   使用者基本資料             → users.sql 的 GetUserByID
+	//   餘額的即時值               → ledger.sql 的 GetBalance(單幣別)
+	// ── 身分解析(Directory)────────────────────────────────────────────────
+	//
+	// 兩個 Resolve 一併回 user_id:呼叫端(shop.Service)要驗歸屬,解析層順手把
+	// 「這東西是誰的」交出去,免得下游為了驗歸屬再查一次同一列。
+	// port 介面只露 id,歸屬檢查的權威仍在 shop.Service 的鎖內判定
+	// ——這裡回的 user_id 只是讓入口層能提早擋掉「拿別人 public_id」的請求。
+	// 軟刪除使用者的權益一律解不出來(等同不存在),不讓已註銷帳號的資源被定址。
+	ResolveEntitlement(ctx context.Context, publicID string) (ResolveEntitlementRow, error)
+	ResolveRedemption(ctx context.Context, publicID string) (ResolveRedemptionRow, error)
 	// 呼叫前必須已 LockEntitlementForRefund 且確認 revoked_at IS NULL。
 	RevokeEntitlement(ctx context.Context, id int64) (*time.Time, error)
 	// 呼叫前必須已 LockExpiredEntitlements 持鎖;revoked_at IS NULL 再守一層,
 	// 影響列數 ≠ 輸入數即狀態矛盾,呼叫端失敗出聲。時間用 DB 時鐘(單一時鐘來源)。
 	RevokeExpiredEntitlements(ctx context.Context, ids []int64) (int64, error)
+	// 重用偵測 / 封鎖:把清單內**尚未撤銷**的列一次撤掉。
+	// 只動未撤銷的列不是保守,是必須:撤銷紀錄一旦寫下即為歷史
+	// (trigger sessions_revocation_is_final 會擋下覆寫),而已撤銷的列本來就已失效,
+	// 安全效果不變、稽核紀錄還保留了「當時是為什麼被撤的」。
+	// 呼叫端傳升冪 id;併發安全另由 LockUserSessions 保證。
+	RevokeSessionsByID(ctx context.Context, arg RevokeSessionsByIDParams) (int64, error)
+	// 輪替鏈:從任一列沿 rotated_from 往上(被取代者)與往下(取代者)展開整條。
+	// 複合 FK 保證整條鏈同屬一個使用者,不可能撤到別人的裝置。升冪回傳。
+	SessionChainIDs(ctx context.Context, sessionID int64) ([]int64, error)
 	SetIdempotencyResponse(ctx context.Context, arg SetIdempotencyResponseParams) error
+	// ── 我的檔案(ProfileStore)────────────────────────────────────────────
+	// 時區字串的合法性檢查(pg_timezone_names)**不在這個檔案**:sqlc 的內建
+	// catalog 沒有 pg_timezone_names 這個系統檢視,寫在這裡 sqlc generate 直接失敗
+	// (relation does not exist)。該查詢以 raw pgx 寫在 readpg/service.go,
+	// 是本任務唯一一段沒走 sqlc 的 SQL,原因與位置都記在那裡。
+	// 更新 + 回傳新檔案是同一個 statement:分成 UPDATE 再 SELECT 的話,
+	// 兩次併發改時區會互相回到對方的值(回應與實際狀態不符)。
+	// deleted_at IS NULL 條件讓軟刪除的帳號連 0 列都改不到 → 呼叫端回 NotFound。
+	SetUserTimezone(ctx context.Context, arg SetUserTimezoneParams) (SetUserTimezoneRow, error)
 	// 對帳 job 用:驗證 SUM(entries) = balance
 	SumEntriesForUser(ctx context.Context, arg SumEntriesForUserParams) (int64, error)
 	// daily_cap 判斷:UTC 當日該 user 該 community 該 source 的總和(schemas/01 A)。
 	// 呼叫前必須已 LockUserXp,同 user 的併發入帳已串行化,SUM 不會低估
 	SumXpTodayBySource(ctx context.Context, arg SumXpTodayBySourceParams) (int64, error)
+	TouchLoginUser(ctx context.Context, id int64) error
 	TouchUserLastSeen(ctx context.Context, id int64) error
 	// session-level advisory lock:同名 job 多實例只有一個能跑,拿不到就跳過本輪。
 	// 必須在同一條連線上執行 TryMaintenanceLock / MaintenanceUnlock(排程器用 pool.Acquire 釘住連線)。
 	TryMaintenanceLock(ctx context.Context, jobName string) (bool, error)
 	UpdateIdentityTokens(ctx context.Context, arg UpdateIdentityTokensParams) error
+	// 既有綁定重新登入:更新 provider 側的顯示名與憑證(內部 users 的資料不覆蓋——
+	// display_name 之後可由使用者自訂,provider 的名字權威在 identities.username)。
+	UpdateLoginIdentity(ctx context.Context, arg UpdateLoginIdentityParams) error
 	// 呼叫前必須已 LockRedemptionForHandle 且確認 status='pending'。
 	UpdateRedemptionStatus(ctx context.Context, arg UpdateRedemptionStatusParams) (PlatformRedemption, error)
 	UpdateUserTimezone(ctx context.Context, arg UpdateUserTimezoneParams) (UpdateUserTimezoneRow, error)
 	UpsertDailyState(ctx context.Context, arg UpsertDailyStateParams) error
+	// 管理端授權查詢(schemas/03-authz.md)。權限字串的權威在 Go
+	// (core/platform/authz),這裡只問「這個人現在有沒有這個權限」。
+	// 單一查詢完成三件事,因為它在每個管理請求的路徑上,不能 N+1:
+	//   ① 使用者仍存在且未軟刪除
+	//   ② 有一條未過期的 user_roles,其角色擁有該權限
+	//   ③ 沒有生效中的 full_ban
+	//
+	// community_id 參數:
+	//   NULL = 不限範圍(M1 只有一個社群),全域角色與任何社群的角色都算;
+	//   有值 = 只認全域角色(user_roles.community_id IS NULL)與該社群的角色。
+	//
+	// 刻意不 JOIN platform.roles:role_permissions 以 role_id 為鍵,
+	// 多接一張表只是多一次探測,判定結果完全相同。
+	//
+	// 三個條件都用 EXISTS 而不是 JOIN:一找到就短路,而且「有沒有」的語意
+	// 不會因為多列而重複。停權與軟刪除放在同一句(而不是先查再判)是為了
+	// 讓「檢查」與「授權」不可能被拆開漏掉其中一步。
+	UserHasPermission(ctx context.Context, arg UserHasPermissionParams) (*bool, error)
 }
 
 var _ Querier = (*Queries)(nil)

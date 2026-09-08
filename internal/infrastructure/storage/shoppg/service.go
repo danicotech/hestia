@@ -41,6 +41,7 @@ import (
 	"github.com/danicotech/hestia/internal/core/platform/ledger"
 	"github.com/danicotech/hestia/internal/core/platform/shop"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/db"
+	"github.com/danicotech/hestia/internal/shared/ulid"
 )
 
 // 分錄 ref_type 值:購買分錄指向履約物(退款憑此精確找回原分錄),退款分錄指向原分錄。
@@ -165,7 +166,7 @@ func (s *Service) Purchase(ctx context.Context, p shop.PurchaseParams) (*shop.Pu
 	}
 	switch f := shop.Fulfillment(item.Fulfillment); {
 	case f.Auto():
-		entPublicID, err := newULID()
+		entPublicID, err := ulid.New()
 		if err != nil {
 			return nil, fmt.Errorf("產生權益 public_id: %w", err)
 		}
@@ -206,7 +207,7 @@ func (s *Service) Purchase(ctx context.Context, p shop.PurchaseParams) (*shop.Pu
 		}
 
 	case f == shop.FulfillManual:
-		pubID, err := newULID()
+		pubID, err := ulid.New()
 		if err != nil {
 			return nil, err
 		}
