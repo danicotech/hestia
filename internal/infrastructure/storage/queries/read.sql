@@ -1,0 +1,183 @@
+-- API 讀取側(readpg)。這個檔案只有 SELECT,唯一的例外是 SetUserTimezone
+-- ——它是 users.timezone 的**寫入入口**(dailypg 的註解指名的那一個),放在這裡
+-- 是因為 transport 的 ProfileStore 把「讀檔案」與「改時區」綁在同一個 port。
+--
+-- 三條紀律:
+--   1. 使用者相關的查詢一律 JOIN users 並排除軟刪除(deleted_at IS NULL)。
+--      軟刪除的帳號查不到自己的餘額/權益/工單,這是刻意的。
+--   2. 每個列表都有明確且穩定的排序(業務欄位 + id tie-break),
+--      不靠 Postgres 的偶然順序;沒有 tie-break 的排序在分頁時會漂移。
+--   3. 每個列表都吃 row_limit,沒有無上限查詢。
+--
+-- 這裡刻意**不重寫**已經有權威位置的查詢:
+--   public_id ↔ 內部 user id  → identity.sql 的 GetUserIDByPublicID / GetUserPublicID
+--   使用者基本資料             → users.sql 的 GetUserByID
+--   餘額的即時值               → ledger.sql 的 GetBalance(單幣別)
+
+-- ── 身分解析(Directory)────────────────────────────────────────────────
+--
+-- 兩個 Resolve 一併回 user_id:呼叫端(shop.Service)要驗歸屬,解析層順手把
+-- 「這東西是誰的」交出去,免得下游為了驗歸屬再查一次同一列。
+-- port 介面只露 id,歸屬檢查的權威仍在 shop.Service 的鎖內判定
+-- ——這裡回的 user_id 只是讓入口層能提早擋掉「拿別人 public_id」的請求。
+
+-- name: ResolveEntitlement :one
+-- 軟刪除使用者的權益一律解不出來(等同不存在),不讓已註銷帳號的資源被定址。
+SELECT e.id, e.user_id
+FROM platform.entitlements e
+JOIN platform.users u ON u.id = e.user_id
+WHERE e.public_id = sqlc.arg(public_id) AND u.deleted_at IS NULL;
+
+-- name: ResolveRedemption :one
+SELECT r.id, r.user_id
+FROM platform.redemptions r
+JOIN platform.users u ON u.id = r.user_id
+WHERE r.public_id = sqlc.arg(public_id) AND u.deleted_at IS NULL;
+
+-- ── 我的檔案(ProfileStore)────────────────────────────────────────────
+
+-- 時區字串的合法性檢查(pg_timezone_names)**不在這個檔案**:sqlc 的內建
+-- catalog 沒有 pg_timezone_names 這個系統檢視,寫在這裡 sqlc generate 直接失敗
+-- (relation does not exist)。該查詢以 raw pgx 寫在 readpg/service.go,
+-- 是本任務唯一一段沒走 sqlc 的 SQL,原因與位置都記在那裡。
+
+-- name: SetUserTimezone :one
+-- 更新 + 回傳新檔案是同一個 statement:分成 UPDATE 再 SELECT 的話,
+-- 兩次併發改時區會互相回到對方的值(回應與實際狀態不符)。
+-- deleted_at IS NULL 條件讓軟刪除的帳號連 0 列都改不到 → 呼叫端回 NotFound。
+UPDATE platform.users
+SET timezone = sqlc.arg(timezone), timezone_changed_at = now()
+WHERE id = sqlc.arg(id) AND deleted_at IS NULL
+RETURNING public_id,
+          COALESCE(display_name, '')::text AS display_name,
+          COALESCE(avatar_url, '')::text   AS avatar_url,
+          timezone, timezone_changed_at, created_at;
+
+-- name: ListUserBalances :many
+-- 多幣別:一列一幣別。**沒有列 = 沒有那個幣別的餘額 = 0**(與 ledger.GetBalance
+-- 的「無列視為 0」同一口徑),不在這裡替不存在的幣別補零列——
+-- 餘額的權威只有 user_balances,補零就是在讀取側偽造資料。
+-- 排序用 currency:幣別是主鍵的一半,唯一且穩定。
+SELECT b.currency, b.balance
+FROM platform.user_balances b
+JOIN platform.users u ON u.id = b.user_id
+WHERE b.user_id = sqlc.arg(user_id) AND u.deleted_at IS NULL
+ORDER BY b.currency
+LIMIT sqlc.arg(row_limit)::int;
+
+-- ── 型錄與持有物(Catalog)──────────────────────────────────────────────
+
+-- name: ListListedItems :many
+-- 上架條件與 shop.sql 的 GetShopItemForPurchase **完全同一套**(DB 時鐘,單一時鐘來源):
+--   listed_at IS NOT NULL AND listed_at <= now() AND (delisted_at IS NULL OR delisted_at > now())
+-- 「型錄看得到的就買得到」是靠這兩段一致來保證的,sqlc 沒有 SQL 片段複用機制,
+-- 只能照抄——改任一邊都必須同時改另一邊(readpg 的測試會抓到不一致)。
+--
+-- include_delisted 只放寬 delisted_at 那一段:從未上架(listed_at IS NULL)與
+-- 上架時間未到的商品是草稿,任何情況都不對外露出。
+SELECT i.public_id, i.name,
+       COALESCE(i.description, '')::text AS description,
+       i.fulfillment, i.currency, i.price,
+       i.duration_days, i.per_user_limit, i.refund_window_seconds,
+       i.listed_at, i.delisted_at
+FROM platform.shop_items i
+WHERE i.listed_at IS NOT NULL AND i.listed_at <= now()
+  AND (sqlc.arg(include_delisted)::bool
+       OR i.delisted_at IS NULL OR i.delisted_at > now())
+ORDER BY i.listed_at DESC, i.id DESC
+LIMIT sqlc.arg(row_limit)::int;
+
+-- name: ListUserEntitlements :many
+-- 只依 revoked_at 過濾;**過期的仍然回傳**——expires_at 一併給呈現層,
+-- 由它決定顯示成「已到期」還是隱藏。在這裡把過期的濾掉會讓使用者以為權益消失了。
+SELECT e.public_id,
+       i.public_id AS item_public_id,
+       i.name      AS item_name,
+       i.fulfillment,
+       e.granted_at, e.expires_at, e.refundable_until, e.revoked_at
+FROM platform.entitlements e
+JOIN platform.shop_items i ON i.id = e.item_id
+JOIN platform.users u ON u.id = e.user_id
+WHERE e.user_id = sqlc.arg(user_id) AND u.deleted_at IS NULL
+  AND (sqlc.arg(include_revoked)::bool OR e.revoked_at IS NULL)
+ORDER BY e.granted_at DESC, e.id DESC
+LIMIT sqlc.arg(row_limit)::int;
+
+-- name: ListUserRedemptions :many
+-- status 為 NULL = 不過濾(全部狀態)。狀態值的封閉枚舉在 core/platform/shop,
+-- 這裡不重複列舉。
+SELECT r.public_id,
+       i.public_id AS item_public_id,
+       i.name      AS item_name,
+       r.status,
+       COALESCE(r.note, '')::text AS note,
+       r.created_at, r.handled_at
+FROM platform.redemptions r
+JOIN platform.shop_items i ON i.id = r.item_id
+JOIN platform.users u ON u.id = r.user_id
+WHERE r.user_id = sqlc.arg(user_id) AND u.deleted_at IS NULL
+  AND (sqlc.narg(status)::text IS NULL OR r.status = sqlc.narg(status)::text)
+ORDER BY r.created_at DESC, r.id DESC
+LIMIT sqlc.arg(row_limit)::int;
+
+-- ── 帳本分錄(LedgerReader,管理端)─────────────────────────────────────
+--
+-- **只讀**。token_entries 是 append-only 的事實來源,這裡不可能出現 UPDATE/DELETE。
+--
+-- 分頁用 keyset(created_at, id)降冪,不用 OFFSET:token_entries 按 created_at
+-- 月分區且會長很大,OFFSET 每翻一頁都要重掃前面所有列,愈翻愈慢。
+-- 排序鍵取 (created_at, id) 而非只有 created_at:同一個 transaction 寫出的多筆分錄
+-- created_at 完全相同(now() 在 tx 內是常數),沒有 id tie-break 就會重複或漏抓。
+--
+-- 三段 WHERE 的分工:
+--   user_id     —— **永遠來自參數**,游標不參與;竄改游標最多換個位置,不可能跨使用者。
+--   after/before—— 時間範圍(after 含、before 不含),直接落在分區鍵上供裁剪。
+--   cursor      —— keyset 位置。
+--
+-- 最後那段 `e.created_at <= cursor_created_at` 是**刻意的冗餘條件**:
+-- 它被上面的 row 比較蘊含,存在的唯一理由是讓 planner 拿它做分區裁剪
+-- ——ROW(a,b) < ROW(c,d) 這種形式 planner 推不出分區邊界,少了它,翻到第二頁
+-- 之後每一次查詢都會掃全部歷史分區。
+--
+-- 這裡刻意不過濾 users.deleted_at:帳本是稽核用的事實來源,
+-- 帳號軟刪除不該讓錢的歷史從管理端消失(對外的定址仍由 Directory 擋住)。
+
+-- name: ListLedgerEntries :many
+WITH page AS MATERIALIZED (
+  -- MATERIALIZED 是必要的,不是裝飾:先把 LIMIT 套完再去做 join 與退款探測。
+  -- 沒有它,planner 會把 CTE 內聯,對「範圍內全部分錄」(可能上萬筆)做完 join
+  -- 才排序取前 N 筆——EXPLAIN 實測就是這個形狀。
+  SELECT e.id, e.user_id, e.actor_id, e.currency, e.amount, e.reason, e.created_at
+  FROM platform.token_entries e
+  WHERE e.user_id = sqlc.arg(user_id)
+    AND (sqlc.narg(after)::timestamptz IS NULL OR e.created_at >= sqlc.narg(after)::timestamptz)
+    AND (sqlc.narg(before)::timestamptz IS NULL OR e.created_at < sqlc.narg(before)::timestamptz)
+    AND (sqlc.narg(cursor_created_at)::timestamptz IS NULL
+         OR (e.created_at, e.id) < (sqlc.narg(cursor_created_at)::timestamptz, sqlc.arg(cursor_id)::bigint))
+    AND (sqlc.narg(cursor_created_at)::timestamptz IS NULL
+         OR e.created_at <= sqlc.narg(cursor_created_at)::timestamptz)
+  ORDER BY e.created_at DESC, e.id DESC
+  LIMIT sqlc.arg(row_limit)::int
+)
+SELECT p.id, p.currency, p.amount, p.reason, p.created_at,
+       u.public_id                     AS user_public_id,
+       COALESCE(a.public_id, '')::text AS actor_public_id,
+       (rf.hit IS NOT NULL)::bool      AS refunded
+FROM page p
+JOIN platform.users u ON u.id = p.user_id
+LEFT JOIN platform.users a ON a.id = p.actor_id
+-- 「已被沖銷」的判定沿用既有語意(adminecon.Refund / shoppg 的兩條退款路徑):
+-- 沖銷分錄 ref_type='token_entry'、ref_id 指向原分錄。
+--
+-- 為什麼是 LATERAL + LIMIT 1 而不是 EXISTS 子查詢:EXISTS 會被 planner 轉成
+-- hashed SubPlan —— 把**全表所有** ref_type='token_entry' 的列讀進雜湊表再比對
+-- (EXPLAIN 實測:六個分區全 Seq Scan)。退款分錄只會愈來愈多,那是會隨時間
+-- 劣化的形狀。LATERAL 強制逐列探測,每列走部分索引
+-- token_entries_ref_idx (ref_type, ref_id) WHERE ref_type IS NOT NULL,
+-- 且探測次數被 CTE 的 LIMIT 綁死在一頁之內。
+LEFT JOIN LATERAL (
+  SELECT 1 AS hit FROM platform.token_entries r
+  WHERE r.ref_type = 'token_entry' AND r.ref_id = p.id
+  LIMIT 1
+) rf ON true
+ORDER BY p.created_at DESC, p.id DESC;
