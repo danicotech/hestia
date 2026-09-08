@@ -1,0 +1,24 @@
+# gitleaks 設定:沿用預設規則,只放行測試用的假憑證。
+#
+# 為什麼要有這個檔:誤報會淹沒真報。上 GitHub 前的掃描如果每次都有兩筆已知的
+# 測試固定值,人就會開始略過整份輸出——那時真的洩漏也會一起被略過。
+#
+# 放行的原則(不要放寬):
+#   - 只放行**測試檔**裡的**明顯合成值**(字面就叫 test-、或 0123456789abcdef 這類數列)
+#   - 用完整字串精準比對,不用寬鬆的路徑或規則排除
+#   - 正式程式碼一律不放行;金鑰只能從環境變數注入(見 cmd/server/main.go)
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+[rules.allowlist]
+regexes = [
+  '''0123456789abcdef0123456789abcdef''',      # identity/token_test.go 的簽章金鑰
+  '''test-jwt-secret-0123456789abcdef''',      # identitypg/main_test.go 的簽章金鑰
+  '''test-token-enc-key-0123456789abc''',      # identitypg/main_test.go 的 AES 金鑰
+]
+paths = [
+  '''_test\.go$''',
+]
+regexTarget = "match"
