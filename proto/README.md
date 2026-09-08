@@ -14,6 +14,12 @@ proto/hestia/platform/v1/
   admin_economy.proto   AdminEconomyService 發點 / 扣點 / 萬能退款 / 處理工單 / 列出分錄
   activity.proto        ActivityService    Discord 活動記錄寫入(只收服務身分)
   notification.proto    NotificationService outbox → Discord 頻道的拉取/確認(只收服務身分)
+
+hestia/render/v1/(給閘道與活動服務的呈現契約,不是平台 API):
+  render.proto          ActivityInteractionService  活動服務回傳「要顯示什麼」的描述
+                        + Announcement(公告的渲染形式)
+                        原規劃寫在 contracts/render/ 手寫 spec,改成 proto 是因為
+                        鐵則 6:手寫共用型別在 Go 與 TS 兩端遲早漂移。
 ```
 
 ## 重新生成(改完 proto 一定要跑)
