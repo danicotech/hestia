@@ -62,18 +62,44 @@ func fallbackRecord(r *http.Request, st *callState, status int, latency int32) e
 		RequestID: st.requestID,
 		Channel:   channel,
 		Kind:      kind,
-		Action:    r.URL.Path,
+		Action:    auditAction(r.URL.Path),
 		Status:    statusFromHTTP(status),
 		LatencyMS: latency,
 		Response:  marshalSummary(map[string]any{"http_status": status}),
 	}
-	if id := st.currentUserID(); id != 0 {
+	if id := st.subjectUserID(); id != 0 {
 		out.UserID = &id
 	}
 	if code != "" {
 		out.ErrorCode = code
 	}
 	return out
+}
+
+// unknownAction 是「這條路徑不是我們的 RPC」的固定值。
+const unknownAction = "(non-rpc path)"
+
+// auditAction 決定補記那一列的 action(QA 2026-09-08)。
+//
+// r.URL.Path 在這條路徑上是**未認證的任何人都能自由控制的字串**,而
+// event_logs 保留 180 天。summary.go 早就為 client 可控字串定了 256 bytes
+// 的上限,但補記走的是另一條路,不受那條規則管 —— 實測 4001 字元直接落地,
+// 同一個威脅模型只擋了一半。
+//
+// 兩段處理,順序有意義:
+//
+//   - **不是 /hestia. 開頭的一律換成固定字串。** 這一層包住的是 connect mux,
+//     真正的 RPC 路徑一定是 procedure 全名;其餘全是探測流量,把它們的路徑
+//     原樣存下來對查稽核毫無幫助,卻是最省力的寫入管道。要看實際打了什麼,
+//     用 request_id 去 log 撈 —— log 不是要保留 180 天的資料表。
+//   - **是我們的 RPC 才留,而且照樣截斷。** 合法的 procedure 遠短於上限,
+//     會撞到截斷的只有「前綴對但後面接一長串」的變形攻擊。
+func auditAction(path string) string {
+	if !strings.HasPrefix(path, "/"+string(protoPackage)+".") {
+		return unknownAction
+	}
+	action, _ := truncateUTF8(path, summaryMaxStringBytes)
+	return action
 }
 
 func statusFromHTTP(status int) string {

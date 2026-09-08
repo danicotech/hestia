@@ -33,15 +33,29 @@ func (q *Queries) ApplyBalanceDelta(ctx context.Context, arg ApplyBalanceDeltaPa
 
 const claimPendingOutbox = `-- name: ClaimPendingOutbox :many
 SELECT id, topic, payload, status, attempts, next_retry_at, created_at FROM platform.outbox_events
-WHERE status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= now())
+WHERE status = 'pending'
+  AND (next_retry_at IS NULL OR next_retry_at <= now())
+  -- COALESCE 不可省:topic <> ALL(NULL) 求值為 NULL 而非 true,
+  -- 呼叫端沒傳清單時會變成「一筆都認領不到」,消費者靜默停擺。
+  AND topic <> ALL(COALESCE($1::text[], ARRAY[]::text[]))
 ORDER BY id
 FOR UPDATE SKIP LOCKED
-LIMIT $1
+LIMIT $2
 `
 
+type ClaimPendingOutboxParams struct {
+	ExcludedTopics []string
+	RowLimit       int32
+}
+
 // 多實例安全消費:SKIP LOCKED
-func (q *Queries) ClaimPendingOutbox(ctx context.Context, limit int32) ([]PlatformOutboxEvent, error) {
-	rows, err := q.db.Query(ctx, claimPendingOutbox, limit)
+//
+// excluded_topics 是「由別人負責投遞」的 topic(目前是閘道經 NotificationService
+// 拉取的公告)。少了這段,in-process 消費者會認領它們、找不到 handler、
+// 退避重試到上限後標 failed —— 閘道離線一小時,公告就被燒光了。
+// 傳空陣列 = 全部都歸這個消費者(既有行為)。
+func (q *Queries) ClaimPendingOutbox(ctx context.Context, arg ClaimPendingOutboxParams) ([]PlatformOutboxEvent, error) {
+	rows, err := q.db.Query(ctx, claimPendingOutbox, arg.ExcludedTopics, arg.RowLimit)
 	if err != nil {
 		return nil, err
 	}

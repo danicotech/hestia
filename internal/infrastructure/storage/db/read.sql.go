@@ -10,6 +10,38 @@ import (
 	"time"
 )
 
+const getUserPrivacy = `-- name: GetUserPrivacy :one
+
+SELECT p.opt_out_logging, p.opt_out_ai_corpus, p.updated_at
+FROM platform.user_privacy_settings p
+JOIN platform.users u ON u.id = p.user_id
+WHERE p.user_id = $1 AND u.deleted_at IS NULL
+`
+
+type GetUserPrivacyRow struct {
+	OptOutLogging  bool
+	OptOutAiCorpus bool
+	UpdatedAt      time.Time
+}
+
+// ── 隱私設定(PrivacyStore)─────────────────────────────────────────────
+//
+// 兩級退出的權威是 platform.user_privacy_settings(schemas/02-identity.md)。
+// 這裡是它**唯一**的讀寫入口:在此之前整張表沒有任何路徑,`/privacy optout`
+// 因此做不出來。
+//
+// 「沒有列」是合法狀態(= 兩者皆 false),不是缺資料:讀不到時回預設值的
+// 責任在 readpg,不在 SQL —— 讓 SQL 用 LEFT JOIN 硬湊一列出來的話,
+// 呼叫端就分不出「從未設定」與「設過又改回預設」,而 updated_at 的意義
+// 正好建立在這個區別上。
+// JOIN users 排除軟刪除:註銷帳號連自己的隱私設定都不該讀得到。
+func (q *Queries) GetUserPrivacy(ctx context.Context, userID int64) (GetUserPrivacyRow, error) {
+	row := q.db.QueryRow(ctx, getUserPrivacy, userID)
+	var i GetUserPrivacyRow
+	err := row.Scan(&i.OptOutLogging, &i.OptOutAiCorpus, &i.UpdatedAt)
+	return i, err
+}
+
 const listLedgerEntries = `-- name: ListLedgerEntries :many
 
 WITH page AS MATERIALIZED (
@@ -483,5 +515,55 @@ func (q *Queries) SetUserTimezone(ctx context.Context, arg SetUserTimezoneParams
 		&i.TimezoneChangedAt,
 		&i.CreatedAt,
 	)
+	return i, err
+}
+
+const upsertUserPrivacy = `-- name: UpsertUserPrivacy :one
+INSERT INTO platform.user_privacy_settings
+  (user_id, opt_out_logging, opt_out_ai_corpus, updated_at)
+SELECT u.id,
+       COALESCE($1::bool, false),
+       COALESCE($2::bool, false),
+       now()
+FROM platform.users u
+WHERE u.id = $3 AND u.deleted_at IS NULL
+ON CONFLICT (user_id) DO UPDATE
+SET opt_out_logging   = COALESCE($1::bool,
+                                 platform.user_privacy_settings.opt_out_logging),
+    opt_out_ai_corpus = COALESCE($2::bool,
+                                 platform.user_privacy_settings.opt_out_ai_corpus),
+    updated_at        = now()
+RETURNING opt_out_logging, opt_out_ai_corpus, updated_at
+`
+
+type UpsertUserPrivacyParams struct {
+	OptOutLogging  *bool
+	OptOutAiCorpus *bool
+	UserID         int64
+}
+
+type UpsertUserPrivacyRow struct {
+	OptOutLogging  bool
+	OptOutAiCorpus bool
+	UpdatedAt      time.Time
+}
+
+// 兩個旗標**各自可設**:NULL = 這次不動這一項。
+//
+//	建列時(INSERT 那一側)沒指定的項目落到 false —— 那是預設值,
+//	不是猜測;user_privacy_settings 的 DEFAULT 就是 false。
+//	更新時(DO UPDATE 那一側)沒指定的項目 COALESCE 回**現有值**。
+//
+// 為什麼是 INSERT ... SELECT 而不是 VALUES:VALUES 版必然插得進去,
+// 軟刪除/不存在的使用者會被 FK 擋成 23503(對外變成 Internal)。
+// 從 users 選來源的話,查不到就是 0 列 → pgx.ErrNoRows → 乾淨的 NotFound。
+//
+// 併發兩個 UpdatePrivacy 由 ON CONFLICT 收斂:PK 是 user_id,
+// 後到的那個看到的是前一個已 commit 的值(read committed 下 DO UPDATE
+// 會重讀最新版本),不會兩邊各自把對方的欄位覆蓋掉。
+func (q *Queries) UpsertUserPrivacy(ctx context.Context, arg UpsertUserPrivacyParams) (UpsertUserPrivacyRow, error) {
+	row := q.db.QueryRow(ctx, upsertUserPrivacy, arg.OptOutLogging, arg.OptOutAiCorpus, arg.UserID)
+	var i UpsertUserPrivacyRow
+	err := row.Scan(&i.OptOutLogging, &i.OptOutAiCorpus, &i.UpdatedAt)
 	return i, err
 }

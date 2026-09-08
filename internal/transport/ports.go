@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/danicotech/hestia/internal/core/platform/authz"
+	"github.com/danicotech/hestia/internal/core/platform/notification"
 	"github.com/danicotech/hestia/internal/core/platform/readmodel"
 	"github.com/danicotech/hestia/internal/core/platform/shop"
 )
@@ -86,6 +87,38 @@ type ProfileWriter interface {
 	// SetTimezone 更新時區並回傳更新後的檔案。
 	// 時區字串的合法性由實作驗證(DB 是唯一真實來源),入口層只擋空字串。
 	SetTimezone(ctx context.Context, userID int64, timezone string) (*readmodel.ProfileView, error)
+}
+
+// PrivacyStore 是兩級退出設定(schemas/02 的 user_privacy_settings)的讀寫 port。
+//
+// 為什麼讀寫放在同一個 port(與 ProfileReader/ProfileWriter 的拆法不同):
+// 隱私設定只有「我的設定」這一個概念,而且 UpdatePrivacy 的回應就是
+// GetPrivacy 的內容(改完直接顯示,呼叫端不必自己合併)。
+// 拆成兩個介面只會讓同一個 handler 拿兩個欄位指向同一個實作。
+//
+// 實作契約(readpg):
+//   - **沒有設定列 = 兩者皆 false,不是 NotFound。** 第一次用 /privacy 的人
+//     必然沒有列,回錯的話這個功能對新使用者永遠是壞的。
+//   - PrivacyUpdate 的 nil 欄位 = 這次不動它,不是設成 false。
+type PrivacyStore interface {
+	Privacy(ctx context.Context, userID int64) (*readmodel.PrivacyView, error)
+	SetPrivacy(ctx context.Context, userID int64, up readmodel.PrivacyUpdate) (*readmodel.PrivacyView, error)
+}
+
+// Announcements 是 outbox → Discord 閘道的取貨口(NotificationService)。
+//
+// 為什麼是 port 而不是 core 介面:它的兩個方法都是「佇列的投遞狀態」操作,
+// 沒有領域語意可言;真正屬於 core 的部分(哪些 topic 給閘道、公告長什麼樣)
+// 已經在 notification 套件裡,這裡只是把儲存層接進來。
+//
+// 回傳的是**渲染後**的 notification.Announcement,不是 outbox 事件:
+// 入口層因此連 payload 都碰不到,想洩漏也沒得洩漏。
+type Announcements interface {
+	// Pull 認領一批公告。max <= 0 / visibility <= 0 由實作套用預設值。
+	Pull(ctx context.Context, max int32, visibility time.Duration) ([]notification.Announcement, error)
+	// Ack 確認送達,回傳真的從待送轉成完成的筆數。
+	// 不認識的 id 靜靜略過(重送 Ack 是常態,不是錯誤)。
+	Ack(ctx context.Context, eventIDs []string) (int, error)
 }
 
 // Catalog 是商店與個人持有物的讀取側 port(core 目前只有寫入側介面)。

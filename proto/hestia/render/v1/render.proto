@@ -1,0 +1,208 @@
+syntax = "proto3";
+
+// 渲染契約 —— 活動服務回傳「要顯示什麼」,stentor 把它翻成 Discord 元件。
+//
+// 為什麼住在 hestia:契約放在 stentor 的話,每加一個活動就要改 Bot 的 repo,
+// 分 repo 就沒意義了(stentor/CLAUDE.md)。原本規劃是 `hestia/contracts/render/`,
+// 但那會變成第二套手寫型別 —— 專案鐵則 6 說契約自動生成、只有一個來源,
+// 所以它落在 proto 裡,Go 與 TS 都從這裡生成。
+//
+// 這份契約刻意**不含任何活動概念**:沒有賽事、沒有階段、沒有金額語意。
+// 它只描述「一塊要顯示的東西」與「上面有哪些可以按的東西」。
+package hestia.render.v1;
+
+import "google/protobuf/struct.proto";
+
+option go_package = "github.com/danicotech/hestia/gen/hestia/render/v1;renderv1";
+
+// ActionStyle 是按鈕的視覺強度。刻意用語意詞而不是 Discord 的數字:
+// 換平台(或 Discord 改樣式常數)時只有 stentor 要改,活動服務不用動。
+enum ActionStyle {
+  ACTION_STYLE_UNSPECIFIED = 0;
+  ACTION_STYLE_PRIMARY = 1;
+  ACTION_STYLE_SECONDARY = 2;
+  ACTION_STYLE_SUCCESS = 3;
+  ACTION_STYLE_DANGER = 4;
+  // LINK 一定要給 url,而且不會回呼(Discord 的外連按鈕沒有 custom_id)。
+  ACTION_STYLE_LINK = 5;
+}
+
+// Field 是一組「標籤 / 值」。k、v 沿用既有草稿的命名(stentor/CLAUDE.md 的範例)。
+message Field {
+  string k = 1;
+  string v = 2;
+  // true = 與相鄰欄位並排。純排版,不帶語意。
+  bool inline = 3;
+}
+
+// Action 是一顆可以按的東西。
+message Action {
+  // 這個值原封不動變成 Discord 的 custom_id,**第一段就是路由鍵**
+  // (例:`summer-cup:bet:5:1` → 前綴 `summer-cup`)。
+  // Discord 的 custom_id 上限 100 bytes,超過由 stentor 拒絕並記錯誤。
+  // ACTION_STYLE_LINK 不需要 id。
+  string id = 1;
+  string label = 2;
+  ActionStyle style = 3;
+  bool disabled = 4;
+  // 只有 ACTION_STYLE_LINK 使用。
+  optional string url = 5;
+  // Unicode emoji 或 Discord 的 `<:name:id>`。
+  optional string emoji = 6;
+}
+
+message SelectOption {
+  string value = 1;
+  string label = 2;
+  optional string description = 3;
+  // 預設被選起來。
+  bool selected = 4;
+}
+
+// Select 是下拉選單。送回來的 custom_id 規則與 Action.id 完全一樣。
+message Select {
+  string id = 1;
+  string placeholder = 2;
+  repeated SelectOption options = 3;
+  // 0 = 用 Discord 預設(min 1 / max 1)。
+  int32 min_values = 4;
+  int32 max_values = 5;
+  bool disabled = 6;
+}
+
+// View 是一則要顯示的訊息。
+//
+// 注意這裡**沒有 rows**:按鈕怎麼分行是渲染端的事(Discord 一行 5 顆、
+// 最多 5 行)。活動服務只給順序,stentor 用固定規則切,所以同一份描述
+// 一定渲染成同一組元件 —— 這是可測的性質,測試就靠它。
+message View {
+  string title = 1;
+  string description = 2;
+  repeated Field fields = 3;
+  repeated Action actions = 4;
+  repeated Select selects = 5;
+  // 0xRRGGBB;空 = 用 Bot 的預設色。
+  optional uint32 color = 6;
+  optional string footer = 7;
+  optional string image_url = 8;
+  optional string thumbnail_url = 9;
+  // true = 只有觸發的人看得到。頻道推播一律忽略這個欄位。
+  bool ephemeral = 10;
+}
+
+message ModalInput {
+  string id = 1;
+  string label = 2;
+  // true = 多行輸入。
+  bool paragraph = 3;
+  bool required = 4;
+  optional string placeholder = 5;
+  optional string value = 6;
+  int32 min_length = 7;
+  // 0 = 不限(由 Discord 的上限決定)。
+  int32 max_length = 8;
+}
+
+// Modal 是彈出的表單。id 的路由規則與 Action.id 相同,
+// 使用者送出後 stentor 會依前綴把值送回同一個活動服務。
+message Modal {
+  string id = 1;
+  string title = 2;
+  repeated ModalInput inputs = 3;
+}
+
+// RenderResult 是活動服務對一次互動的完整回應。
+//
+// oneof 是刻意的:一次互動只能回一種東西(訊息或表單),
+// 兩個都給就是契約錯誤,而不是由渲染端猜。
+message RenderResult {
+  oneof kind {
+    View view = 1;
+    Modal modal = 2;
+  }
+  // true = 就地更新觸發這次互動的那則訊息,而不是回一則新的。
+  // 對 modal 無意義(送 modal 本來就不動原訊息)。
+  bool update_source = 3;
+}
+
+// Actor 是「誰在哪裡按的」。刻意只有 Discord 側的識別子:
+// stentor 不知道平台帳號是誰,對應由 hestia 的 users.discord_user_id 做。
+message Actor {
+  string discord_user_id = 1;
+  string discord_guild_id = 2;
+  string discord_channel_id = 3;
+  // Discord 回報的語系(如 zh-TW);空 = 未知。
+  string locale = 4;
+}
+
+message HandleCommandRequest {
+  // 指令的完整路徑,空白分隔(例:`summer-cup bet`)。
+  // 第一段是命名空間,也就是路由鍵。
+  string command = 1;
+  Actor actor = 2;
+  // 指令選項,已由 Discord 驗過型別,一律以字串傳遞
+  // (活動服務自己知道要怎麼解讀 —— stentor 不知道)。
+  map<string, string> options = 3;
+  // Discord 的 interaction id。活動服務要動錢的話拿它當冪等鍵的素材。
+  string interaction_id = 4;
+}
+
+message HandleCommandResponse {
+  RenderResult result = 1;
+}
+
+message HandleComponentRequest {
+  // 按鈕 / 選單 / 表單送回來的 custom_id,原封不動。
+  string custom_id = 1;
+  Actor actor = 2;
+  // 下拉選單選了什麼;按鈕為空。
+  repeated string values = 3;
+  // 表單欄位:ModalInput.id → 使用者填的值;非表單互動為空。
+  map<string, string> inputs = 4;
+  string interaction_id = 5;
+}
+
+message HandleComponentResponse {
+  RenderResult result = 1;
+}
+
+message DescribeCommandsRequest {}
+
+// DescribeCommandsResponse 讓活動服務自己宣告「我有哪些指令、我收哪些前綴」。
+//
+// 沒有這條的話,加一個活動還是得有人去 stentor 手寫一份 slash command 定義
+// —— 那就等於「加活動要改 Bot」,分 repo 的理由就沒了。
+message DescribeCommandsResponse {
+  // Discord 的 application command JSON,原封不動送去註冊。
+  // 用 Struct 而不是自訂訊息是刻意的:指令的 schema 是 Discord 的,不是我們的,
+  // 照抄一份只會在 Discord 改版時變成第二套會漂移的定義。
+  repeated google.protobuf.Struct commands = 1;
+  // 這個服務負責的 custom_id 前綴。stentor 啟動時與設定比對,
+  // 不一致就開不起來(避免「按鈕按下去沒人接」這種只在線上才發現的錯)。
+  repeated string prefixes = 2;
+}
+
+// ActivityInteractionService 是活動服務要實作的那一面。
+//
+// **加一個新活動 = 實作這三個 rpc + 在 stentor 的設定裡註冊一個前綴。**
+// stentor 一行都不用改 —— 這是整個分 repo 的理由。
+service ActivityInteractionService {
+  // DescribeCommands 在 stentor 啟動 / 註冊指令時呼叫。
+  rpc DescribeCommands(DescribeCommandsRequest) returns (DescribeCommandsResponse);
+  rpc HandleCommand(HandleCommandRequest) returns (HandleCommandResponse);
+  rpc HandleComponent(HandleComponentRequest) returns (HandleComponentResponse);
+}
+
+// Announcement 是「把這則貼到那個頻道」。
+// 它是 outbox 事件經過渲染之後的樣子,不是 outbox 事件本身:
+// stentor 不解讀事件語意,只負責貼。
+message Announcement {
+  // 事件的唯一識別子。stentor 用它去重(至少一次投遞 → 重放時不重貼)。
+  string event_id = 1;
+  // 邏輯頻道名(例:`announcements`),由 stentor 的設定對到實際 channel id。
+  // 不直接給 channel id:頻道搬家是部署設定的事,不該讓後端知道。
+  string channel_key = 2;
+  View view = 3;
+  // 嵌入卡之外的純文字(要 @ 人的時候用)。
+  optional string content = 4;
+}

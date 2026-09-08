@@ -44,6 +44,26 @@ func requestSummary(_ string, msg any) map[string]any {
 		// 比照 admin reason / 工單 note 不記:入口層紀錄不該收任何一筆
 		// 使用者可自由控制內容的欄位,那是灌爆稽核表最省力的入口。
 		return map[string]any{}
+	case *platformv1.GetPrivacyRequest:
+		return map[string]any{}
+	case *platformv1.UpdatePrivacyRequest:
+		// 記「這次動了哪幾項」,不記值:值在回應摘要裡(那是實際生效的結果),
+		// 請求側只需要看得出使用者是不是只改了其中一項。
+		return map[string]any{
+			"sets_opt_out_logging":   m.OptOutLogging != nil,
+			"sets_opt_out_ai_corpus": m.OptOutAiCorpus != nil,
+		}
+
+	// ── 通知拉取(NotificationService)────────────────────────────
+	// 事件內容一個欄位都不記:那是別人的簽到、購買與成交,
+	// 而 event_logs 記的是「這次呼叫做了什麼」,不是它搬運了什麼。
+	case *platformv1.PullAnnouncementsRequest:
+		return map[string]any{
+			"max":                m.GetMax(),
+			"visibility_seconds": m.GetVisibilitySeconds(),
+		}
+	case *platformv1.AckAnnouncementsRequest:
+		return map[string]any{"count": len(m.GetEventIds())}
 
 	// ── 商店 ──
 	case *platformv1.ListItemsRequest:
@@ -89,6 +109,44 @@ func requestSummary(_ string, msg any) map[string]any {
 			"approve":              m.GetApprove(),
 		}
 
+	// ── 活動記錄(ActivityService)──────────────────────────────
+	// 三件東西刻意缺席:訊息原文與舊版本原文(那是 message_logs /
+	// message_revisions 的權威,而且正是隱私設定要保護的東西)、
+	// X-Acting-User 的原始 header(解析後的 user_id 已經在 event_logs.user_id)、
+	// 以及服務憑證(它連進到這裡的機會都沒有 —— 摘要只看 request body)。
+	case *platformv1.RecordVoiceSessionRequest:
+		return map[string]any{
+			"guild_id":         m.GetGuildId(),
+			"channel_id":       m.GetChannelId(),
+			"duration_seconds": m.GetDurationSeconds(),
+		}
+	case *platformv1.RecordMessagesRequest:
+		// 只記筆數:批次內容是訊息本身,一則都不該進稽核表。
+		return map[string]any{
+			"guild_id": m.GetGuildId(),
+			"count":    len(m.GetMessages()),
+		}
+	case *platformv1.RecordMessageRevisionRequest:
+		return map[string]any{
+			"guild_id":   m.GetGuildId(),
+			"channel_id": m.GetChannelId(),
+			"message_id": m.GetMessageId(),
+			"kind":       m.GetKind().String(),
+		}
+	case *platformv1.RecordReactionRequest:
+		// emoji 不記:自訂表情的名稱是使用者可自由控制的字串,
+		// 比照 admin reason / 工單 note 排除。
+		return map[string]any{
+			"guild_id":   m.GetGuildId(),
+			"message_id": m.GetMessageId(),
+			"action":     m.GetAction().String(),
+		}
+	case *platformv1.RecordPresenceRequest:
+		return map[string]any{
+			"guild_id": m.GetGuildId(),
+			"status":   m.GetStatus(),
+		}
+
 	// AuthService 的請求(code / state / refresh_token)全是憑證,一律不記。
 	default:
 		return nil
@@ -120,6 +178,18 @@ func responseSummary(_ string, msg any) map[string]any {
 			"user_public_id": m.GetProfile().GetPublicId(),
 			"timezone":       m.GetProfile().GetTimezone(),
 		}
+	case *platformv1.GetPrivacyResponse:
+		return privacySummary(m.GetSettings())
+	case *platformv1.UpdatePrivacyResponse:
+		// 記生效後的值:退出設定是使用者主張過的意思表示,
+		// 「他到底有沒有退出」日後一定會被問,而且它不是自由文字。
+		return privacySummary(m.GetSettings())
+
+	// ── 通知拉取 ──
+	case *platformv1.PullAnnouncementsResponse:
+		return map[string]any{"count": len(m.GetAnnouncements())}
+	case *platformv1.AckAnnouncementsResponse:
+		return map[string]any{"acknowledged": m.GetAcknowledged()}
 
 	// ── 商店 ──
 	case *platformv1.ListItemsResponse:
@@ -163,6 +233,33 @@ func responseSummary(_ string, msg any) map[string]any {
 			"refund_amount":        m.GetRefundAmount(),
 		}
 
+	// ── 活動記錄 ──
+	case *platformv1.RecordVoiceSessionResponse:
+		return map[string]any{
+			"deduplicated":          m.GetDeduplicated(),
+			"closed":                m.GetClosed(),
+			"voice_seconds_counted": m.GetVoiceSecondsCounted(),
+			"xp_awarded":            m.GetXpAwarded(),
+		}
+	case *platformv1.RecordMessagesResponse:
+		return map[string]any{"succeeded": m.GetSucceeded(), "failed": m.GetFailed()}
+	case *platformv1.RecordMessageRevisionResponse:
+		return map[string]any{
+			"deduplicated":   m.GetDeduplicated(),
+			"excerpt_stored": m.GetExcerptStored(),
+		}
+	case *platformv1.RecordReactionResponse:
+		return map[string]any{
+			"deduplicated":  m.GetDeduplicated(),
+			"stats_updated": m.GetStatsUpdated(),
+		}
+	case *platformv1.RecordPresenceResponse:
+		return map[string]any{
+			"deduplicated":           m.GetDeduplicated(),
+			"closed":                 m.GetClosed(),
+			"online_seconds_counted": m.GetOnlineSecondsCounted(),
+		}
+
 	// AuthService 的回應含 access/refresh token,一律不記。
 	default:
 		return nil
@@ -186,6 +283,16 @@ func adjustmentSummary(a *platformv1.LedgerAdjustment) map[string]any {
 func errorSummary(err error) map[string]any {
 	code := connect.CodeOf(err)
 	out := map[string]any{"code": code.String()}
+	// reason 無條件收錄(有的話)。它是**我們自己的分類**,不是使用者資料,
+	// 也不是自由文字 —— 值域封閉在 errorCodes 裡。
+	// 而且它正是稽核最想 group by 的欄位:「這週有幾次 actor_not_linked」
+	// 用 code 問不出來(那一格全部都是 failed_precondition)。
+	//
+	// 未映射的內部錯誤沒有 reason(reasonFor 回空字串),所以這一行不可能
+	// 把內部錯誤的分類寫進表裡 —— 與下面的訊息白名單是同一個方向的防線。
+	if reason := ErrorReason(err); reason != "" {
+		out["reason"] = reason
+	}
 	var ce *connect.Error
 	if trusted(err) && code != connect.CodeInternal && errors.As(err, &ce) {
 		out["message"] = ce.Message()
@@ -238,4 +345,12 @@ func truncateUTF8(s string, max int) (string, bool) {
 		cut--
 	}
 	return s[:cut], true
+}
+
+// privacySummary 是兩級退出設定的摘要(請求與回應共用)。
+func privacySummary(p *platformv1.PrivacySettings) map[string]any {
+	return map[string]any{
+		"opt_out_logging":   p.GetOptOutLogging(),
+		"opt_out_ai_corpus": p.GetOptOutAiCorpus(),
+	}
 }

@@ -13,10 +13,12 @@ import (
 
 	platformv1 "github.com/danicotech/hestia/gen/hestia/platform/v1"
 	"github.com/danicotech/hestia/gen/hestia/platform/v1/platformv1connect"
+	"github.com/danicotech/hestia/internal/core/platform/activitylog"
 	"github.com/danicotech/hestia/internal/core/platform/adminecon"
 	"github.com/danicotech/hestia/internal/core/platform/daily"
 	"github.com/danicotech/hestia/internal/core/platform/identity"
 	"github.com/danicotech/hestia/internal/core/platform/ledger"
+	"github.com/danicotech/hestia/internal/core/platform/notification"
 	"github.com/danicotech/hestia/internal/core/platform/shop"
 )
 
@@ -56,6 +58,12 @@ func TestToConnectError(t *testing.T) {
 		{adminecon.ErrNotRefundable, connect.CodeFailedPrecondition},
 		{adminecon.ErrAlreadyRefunded, connect.CodeAlreadyExists},
 
+		// 活動記錄:兩個「系統狀態沒準備好」用 FailedPrecondition —— 重試無用,
+		// 呼叫端該做的是引導綁定 / 註冊 guild,不是退避重打。
+		{activitylog.ErrActorNotLinked, connect.CodeFailedPrecondition},
+		{activitylog.ErrSpaceNotRegistered, connect.CodeFailedPrecondition},
+		{activitylog.ErrInvalidRequest, connect.CodeInvalidArgument},
+
 		// identity:憑證類一律 unauthenticated(意思都是「重新登入」)。
 		{identity.ErrInvalidToken, connect.CodeUnauthenticated},
 		{identity.ErrTokenExpired, connect.CodeUnauthenticated},
@@ -72,6 +80,19 @@ func TestToConnectError(t *testing.T) {
 		{identity.ErrProviderExchange, connect.CodeUnavailable},
 		{identity.ErrAccountDeleted, connect.CodePermissionDenied},
 		{identity.ErrInvalidConfig, connect.CodeInternal},
+
+		// 通知拉取:參數不合法(一次 Ack 太多筆)。
+		{notification.ErrInvalidRequest, connect.CodeInvalidArgument},
+
+		// 入口層自己的憑證錯誤:它們不是 core sentinel,但同樣在表上
+		// (為了有穩定的 reason),所以同樣要驗 code。
+		{errMixedCredentials, connect.CodePermissionDenied},
+		{errServiceOnUserRPC, connect.CodePermissionDenied},
+		{errDelegationNotGranted, connect.CodePermissionDenied},
+		{errUserOnServiceRPC, connect.CodePermissionDenied},
+		{errActingUserRequired, connect.CodeInvalidArgument},
+		{errActingUserFormat, connect.CodeInvalidArgument},
+		{errActingUserProvider, connect.CodeInvalidArgument},
 
 		{ErrNotFound, connect.CodeNotFound},
 		{ErrUnauthenticated, connect.CodeUnauthenticated},

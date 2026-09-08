@@ -1,0 +1,84 @@
+syntax = "proto3";
+
+// 通知拉取 —— outbox 事件送到 Discord 閘道的唯一通道。
+//
+// **這整個服務只接受服務身分**(X-Service-Token),而且與 ActivityService 不同:
+// 它**不帶 X-Acting-User**。佇列沒有使用者主體 —— 拉一批公告不是「代表某個人」
+// 做的事,硬要填一個代表人只會讓稽核紀錄記到一個與這次操作無關的人頭上。
+//
+// ## 為什麼是拉取 + 確認,不是 streaming(2026-09-08 定案)
+//
+// outbox 已經有一套經過驗證的消費語意(`FOR UPDATE SKIP LOCKED` + 退避重試
+// + 毒訊息終止),streaming 等於再造一套:要維護訂閱者登錄、要處理斷線重連、
+// hestia 重啟時在途事件會掉。拉取模型把那些全部省掉 ——
+// 認領只是把既有的 `next_retry_at` 當成可見性逾時來用,沒有新的狀態欄位。
+//
+// 投遞語意是 **at-least-once**:沒有 Ack 的事件在可見性逾時後自動重新可見。
+// 所以呼叫端必須自己去重(stentor 用 Announcement.event_id 做,已經實作)。
+//
+// ## 為什麼回傳的是 Announcement 而不是原始事件
+//
+// outbox 的 payload 是**內部**事件格式,裡面有內部 BIGINT id。閘道拿不到、
+// 也不該拿到那些東西(專案鐵則 5),而且 stentor 的鐵則是「不解讀事件語意,
+// 只負責貼」—— 把 topic + payload 丟過去,等於要求 Bot 去理解平台的領域事件。
+//
+// 所以渲染在 hestia 做:每個 topic 有一個白名單化的渲染器,只有它明確取用的
+// 欄位會出現在 Announcement 裡(見 internal/core/platform/notification)。
+// 沒被取用的欄位不是「忘了帶」,是**不給**。
+package hestia.platform.v1;
+
+import "hestia/render/v1/render.proto";
+
+option go_package = "github.com/danicotech/hestia/gen/hestia/platform/v1;platformv1";
+
+message PullAnnouncementsRequest {
+  // 這一批最多幾則。<= 0 用伺服器預設,超過上限夾到上限
+  // (沒有「全部給我」——沒有上限的佇列拉取遲早會把記憶體吃光)。
+  int32 max = 1;
+  // 認領後多久重新可見(秒)。<= 0 用伺服器預設,超過上限夾到上限。
+  //
+  // 這是**可見性逾時**,不是處理時限:時間內沒有 Ack,事件就當作沒送到而
+  // 重新可見。設太短會重貼(去重擋得住),設太長會讓一則貼不出去的公告
+  // 卡很久才重試。取「一次推播往返的數十倍」量級即可。
+  int32 visibility_seconds = 2;
+}
+
+message PullAnnouncementsResponse {
+  // 認領到的公告,依事件順序(舊的在前)。空 = 目前沒有待送的。
+  //
+  // **event_id 是不透明的憑據**,不是任何內部識別子(專案鐵則 5)。
+  // 三個性質,呼叫端可以依賴:
+  //
+  //   1. **原封不動送回 AckAnnouncements 就對了**,不要解析、不要推導、
+  //      不要假設它的長度或字元集。
+  //   2. **同一個事件永遠是同一個值**,所以拿它當去重鍵是安全的
+  //      (at-least-once 下重送是常態)。
+  //   3. **只有 PullAnnouncements 發得出來。** 它是金鑰化的,猜不出來也造不出來
+  //      —— 因此沒有人能 Ack 一個自己從未認領過的公告(那會讓它靜默消失)。
+  repeated hestia.render.v1.Announcement announcements = 1;
+}
+
+message AckAnnouncementsRequest {
+  // 已經成功貼出去的 event_id(來自 PullAnnouncements,原封不動)。
+  //
+  // 沒貼成功的**不要** Ack:留著讓它逾時重來,那正是 at-least-once 的用法。
+  // 驗不過的憑據、清單外 topic 的事件、已經 Ack 過的,一律靜靜略過
+  // (重送 Ack 是正常的網路現象,不是錯誤)。
+  repeated string event_ids = 1;
+}
+
+message AckAnnouncementsResponse {
+  // 這次真的從待送變成已完成的筆數。
+  // 小於送出的 id 數不代表失敗:重送的 Ack 本來就只會算一次。
+  int32 acknowledged = 1;
+}
+
+// NotificationService 是 outbox → Discord 頻道的取貨口。
+//
+// 它只給**清單內**的 topic(見 core/platform/notification 的 DiscordTopics)。
+// 「全部 topic 都給」是不能做的決定:那會讓閘道收到退款、工單建立這類
+// 它不該知道的內部事件,而閘道是暴露在外部平台上的那一環。
+service NotificationService {
+  rpc PullAnnouncements(PullAnnouncementsRequest) returns (PullAnnouncementsResponse);
+  rpc AckAnnouncements(AckAnnouncementsRequest) returns (AckAnnouncementsResponse);
+}

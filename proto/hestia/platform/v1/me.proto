@@ -59,6 +59,54 @@ message UpdateTimezoneResponse {
   UserProfile profile = 1;
 }
 
+// PrivacySettings 是兩級退出(schemas/02-identity.md 的 user_privacy_settings)。
+//
+// **兩個旗標是不同的東西,不是同一件事的兩種強度。**
+// 使用者最常見的誤解是「我退出了就不算我的分數」——不是。兩者都不影響計分。
+//
+// 沒有設定過的使用者兩個旗標都是 false(表裡沒有列 = 預設值,不是錯誤)。
+message PrivacySettings {
+  // opt_out_logging = **不記錄原始活動 / 訊息內容**。
+  //
+  // 打開之後不會存訊息原文、編輯前後的內容這類「你說了什麼」的資料。
+  //
+  // **XP 與統計計數照常累積**(schemas/02:「仍計 XP,否則退出=逃避」)。
+  // 記的是「你在 X 時間發了一則訊息」這種計數事實,不是內容本身 ——
+  // 如果退出等於不計分,那它就變成一個逃避排行榜結算的按鈕,
+  // 而不是隱私設定。這條語意寫在契約裡,呈現層必須照抄,不要自己改寫。
+  bool opt_out_logging = 1;
+  // opt_out_ai_corpus = **不納入 AI 語料**(向量庫 / 檢索 / 生成素材)。
+  //
+  // 與 opt_out_logging 各自獨立:可以「留紀錄但不進語料」,
+  // 也可以「不留紀錄」(不留紀錄時自然也沒有語料可用,schemas/12
+  // 的語料範圍跟隨訊息記錄,兩者天然一致,不需要同時打開)。
+  bool opt_out_ai_corpus = 2;
+}
+
+message GetPrivacyRequest {}
+
+message GetPrivacyResponse {
+  PrivacySettings settings = 1;
+}
+
+// UpdatePrivacyRequest 的兩個欄位**各自可設**:
+// 只想改一個就只帶一個,沒帶的那個維持原值(不是重設為 false)。
+// 這是 optional 的用途——proto3 沒有 optional 的話,「沒帶」與「設成 false」
+// 在線路上完全一樣,使用者關掉一個旗標會意外把另一個也關掉。
+//
+// 兩個都沒帶 = InvalidArgument。寫入 RPC 靜靜地什麼都不做,
+// 比報錯更難查(呼叫端會以為設定成功了)。
+message UpdatePrivacyRequest {
+  optional bool opt_out_logging = 1;
+  optional bool opt_out_ai_corpus = 2;
+}
+
+message UpdatePrivacyResponse {
+  // 更新後的**完整**設定(不只是這次改的那個),
+  // 呼叫端可以直接拿去顯示,不必自己合併。
+  PrivacySettings settings = 1;
+}
+
 service MeService {
   rpc GetProfile(GetProfileRequest) returns (GetProfileResponse);
   rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse);
@@ -66,4 +114,9 @@ service MeService {
   rpc ListEntitlements(ListEntitlementsRequest) returns (ListEntitlementsResponse);
   rpc ListRedemptions(ListRedemptionsRequest) returns (ListRedemptionsResponse);
   rpc UpdateTimezone(UpdateTimezoneRequest) returns (UpdateTimezoneResponse);
+  // GetPrivacy / UpdatePrivacy 在代打白名單內(見 transport/interceptors.go):
+  // 使用者的 Discord 身分由 Discord 自己證明,從 /privacy 指令調整自己的
+  // 隱私設定是合理的 —— 而且這是唯一做得出 `/privacy optout` 的路徑。
+  rpc GetPrivacy(GetPrivacyRequest) returns (GetPrivacyResponse);
+  rpc UpdatePrivacy(UpdatePrivacyRequest) returns (UpdatePrivacyResponse);
 }

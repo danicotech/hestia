@@ -1,0 +1,225 @@
+syntax = "proto3";
+
+// 活動記錄寫入(schemas/10-activity-logs.md、schemas/11-messages.md)。
+//
+// 這整個服務**只接受服務身分**(X-Service-Token),不接受使用者 Bearer。
+// 呼叫端是 stentor:它沒有 DB 憑證(專案鐵則 2),所以語音/訊息/reaction
+// 只能經這裡寫入。行為主體由 `X-Acting-User: discord:<snowflake>` 指定,
+// hestia 查 identities 解成內部 user_id ——**查不到就是查不到**,
+// 這裡不會自動建帳號(建帳號的權威在 OAuth 登入流程)。
+//
+// 三條貫穿本檔的規則:
+//   1. 一次請求只代表**一個** Discord 使用者。批次是「同一個作者的多則訊息」,
+//      不是「多個作者」——行為主體只有 header 一個權威,絕不出現在 body。
+//   2. 識別碼用 Discord snowflake(guild_id / channel_id / message_id)。
+//      它們是外部識別碼,不是內部 BIGINT id,不違反鐵則 5。
+//   3. 冪等靠天然唯一鍵(訊息用 message_id、reaction 用
+//      (message_id, user_id, emoji)、語音用 (user, space, channel, joined_at)),
+//      不另設冪等鍵表。重送 = 回成功且 deduplicated=true,不是錯誤。
+package hestia.platform.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/danicotech/hestia/gen/hestia/platform/v1;platformv1";
+
+// ── 語音 ────────────────────────────────────────────────────────
+
+// RecordVoiceSessionRequest 是一段語音在席時間。
+//
+// 語音是**可靠**訊號(voiceStateUpdate 不需特權 intent,Bot 重啟也補得回),
+// 所以它可以發 XP/點數。防掛機由 peer_count_avg 與 economy_configs
+// .voice_xp_min_peers 把關:平均同時在席人數不足門檻就不發 XP(仍記錄事實)。
+message RecordVoiceSessionRequest {
+  // Discord guild snowflake,對應 community_spaces.external_id。
+  string guild_id = 1;
+  // 語音頻道 snowflake。
+  string channel_id = 2;
+  // 進入時間。與 (user, space, channel) 一起構成冪等鍵,
+  // 所以重送必須帶**同一個值**(用 Discord 事件的時間,不要用 now())。
+  google.protobuf.Timestamp joined_at = 3;
+  // 離開時間;空 = 這是「剛進來」的事件,之後再送一次帶 left_at 的補上。
+  optional google.protobuf.Timestamp left_at = 4;
+  // 在席秒數;空且有 left_at 時由 hestia 用 left_at - joined_at 計算。
+  optional int32 duration_seconds = 5;
+  optional bool self_muted = 6;
+  optional bool self_deafened = 7;
+  // 期間平均同時在席人數(含自己)。schemas/10 明列的唯一非金額浮點欄位。
+  float peer_count_avg = 8;
+}
+
+message RecordVoiceSessionResponse {
+  // true = 這段語音先前已記錄過,本次沒有新增任何東西。
+  bool deduplicated = 1;
+  // true = 本次補上了 left_at / duration(把一段開著的紀錄收尾)。
+  bool closed = 2;
+  // 本次計入 activity_daily.voice_seconds 的秒數。
+  int32 voice_seconds_counted = 3;
+  // 本次實際入帳的 XP;0 = 未達門檻、頻道關閉發放、冷卻或上限攔下。
+  int64 xp_awarded = 4;
+}
+
+// ── 訊息 ────────────────────────────────────────────────────────
+
+// MessageRecord 是一則訊息。作者不在這裡——作者是 X-Acting-User(規則 1)。
+message MessageRecord {
+  // 呼叫端自訂的對照鍵,逐筆結果用它對回去;可留空(改用 message_id 對)。
+  string client_ref = 1;
+  // 頻道 snowflake。是否寫 message_logs 由 space_channels.log_messages 決定。
+  string channel_id = 2;
+  // text / forum / thread / voice_text。
+  string channel_kind = 3;
+  optional string thread_id = 4;
+  // Discord message snowflake。**冪等的權威**。
+  string message_id = 5;
+  // 訊息原文。hestia 只存截斷後的 excerpt(message_excerpt_max_chars),
+  // 原文本身不落地;沒有 MESSAGE_CONTENT intent 時留空並填 content_length。
+  string content = 6;
+  // 原文長度(字元數)。0 = 由 hestia 從 content 算。
+  int32 content_length = 7;
+  bool has_attachment = 8;
+  // 被回覆的 message_id;有值且該訊息已被 hestia 見過時,
+  // 會累加對方的 message_stats.reply_count。
+  optional string reply_to = 9;
+  // 訊息時間(Discord snowflake 內含,重送時值穩定)。
+  google.protobuf.Timestamp created_at = 10;
+}
+
+message RecordMessagesRequest {
+  string guild_id = 1;
+  // 同一位作者的多則訊息。批次是為了吃下 Discord 的事件量,
+  // **單筆失敗不會讓整批失敗**——每筆各自一個 transaction,結果逐筆回報。
+  repeated MessageRecord messages = 2;
+}
+
+// MessageResult 是單筆訊息的處理結果。
+message MessageResult {
+  string client_ref = 1;
+  string message_id = 2;
+  bool ok = 3;
+  // true = 這則訊息先前已記錄過(重送)。ok 仍為 true。
+  bool deduplicated = 4;
+  // true = excerpt 有落地。false 的兩個原因:頻道沒開 log_messages,
+  // 或作者 opt_out_logging。**兩者都不影響計數與 XP**
+  // (schemas/02:退出記錄不等於退出計分)。
+  bool content_stored = 5;
+  int64 xp_awarded = 6;
+  // ok=false 時填:connect code 字串與可讀訊息。
+  string error_code = 7;
+  string error_message = 8;
+  // ok=false 時填:機器可讀的成因(與整批失敗時的 `Hestia-Error-Reason`
+  // 同一套值域,清單見 proto/README.md)。
+  //
+  // 為什麼批次結果也要有:整批失敗走 connect 錯誤,metadata 帶得了 reason;
+  // **單筆失敗是回應 body 裡的一列**,沒有 metadata 可搭。少了這個欄位,
+  // 呼叫端就只能回頭比對 error_message 的中文 —— 正是 reason 要消滅的做法。
+  //
+  // 未映射的內部錯誤這裡是空字串(與 metadata 那條同一個規則:
+  // 內部錯誤的分類不外流)。
+  string error_reason = 9;
+}
+
+message RecordMessagesResponse {
+  repeated MessageResult results = 1;
+  int32 succeeded = 2;
+  int32 failed = 3;
+}
+
+// ── 訊息舊版本(編輯 / 刪除)────────────────────────────────────
+
+// MessageRevisionKind 是舊版本的產生原因。
+enum MessageRevisionKind {
+  MESSAGE_REVISION_KIND_UNSPECIFIED = 0;
+  MESSAGE_REVISION_KIND_EDITED = 1;
+  MESSAGE_REVISION_KIND_DELETED = 2;
+}
+
+// RecordMessageRevisionRequest 記下被覆蓋/被刪掉的那一版內容。
+// 這是敏感度最高的資料(schemas/11 三道約束),同樣受頻道白名單與
+// opt_out_logging 約束:兩者任一成立就只留事件不留內容。
+message RecordMessageRevisionRequest {
+  string guild_id = 1;
+  string channel_id = 2;
+  string message_id = 3;
+  // 被覆蓋/刪除的**舊**內容。
+  string previous_content = 4;
+  MessageRevisionKind kind = 5;
+  // 擷取時間。edited 用 Discord 的 edited_timestamp(重送時穩定,可當冪等鍵);
+  // deleted 沒有可靠時間,冪等改用「一則訊息只會被刪一次」。
+  google.protobuf.Timestamp captured_at = 6;
+}
+
+message RecordMessageRevisionResponse {
+  bool deduplicated = 1;
+  // true = 舊內容有落地;false = 白名單或 opt-out 擋下,只留事件。
+  bool excerpt_stored = 2;
+}
+
+// ── Reaction ────────────────────────────────────────────────────
+
+// ReactionAction 是 reaction 的方向。
+enum ReactionAction {
+  REACTION_ACTION_UNSPECIFIED = 0;
+  REACTION_ACTION_ADDED = 1;
+  REACTION_ACTION_REMOVED = 2;
+}
+
+// RecordReactionRequest 是一次按/取消表情。
+// Reaction 量小、不涉內容隱私、比發言難刷(schemas/11),是抽獎與票選的首選訊號。
+message RecordReactionRequest {
+  string guild_id = 1;
+  // 刻意沒有 channel_id:reaction_events 沒有頻道欄位,而 reaction 不涉內容
+  // 也不受白名單約束 —— 傳一個誰都不會讀的欄位只會讓人以為它有作用。
+  string message_id = 2;
+  string emoji = 3;
+  ReactionAction action = 4;
+  google.protobuf.Timestamp occurred_at = 5;
+  // 被按的那則訊息的作者 Discord id。只有在 hestia 還沒見過那則訊息時才需要
+  // (message_stats.user_id 是 NOT NULL);已見過就忽略此欄位。
+  optional string message_author_id = 6;
+}
+
+message RecordReactionResponse {
+  bool deduplicated = 1;
+  // true = message_stats.reaction_count 有更新。false = hestia 沒見過那則訊息
+  // 且沒給(或給了但未綁定)message_author_id,只記 reaction_events。
+  bool stats_updated = 2;
+}
+
+// ── Presence(線上狀態)──────────────────────────────────────────
+
+// RecordPresenceRequest 是一段線上狀態區間。
+//
+// **不可作為任何發放的依據**(schemas/10):presence 需 GUILD_PRESENCES 特權
+// intent、Bot 重啟期間的變化會整段漏掉、隱身看不到,而且掛機就能刷。
+// 介面上請標示「Discord 線上時長」而非「參與時長」。要發點數請用語音。
+message RecordPresenceRequest {
+  string guild_id = 1;
+  // online / idle / dnd / offline。
+  string status = 2;
+  // 區間起點。與 (user, space) 一起構成冪等鍵,重送必須帶同一個值。
+  google.protobuf.Timestamp started_at = 3;
+  // 區間終點;空 = 區間還開著,之後再送一次補上。
+  optional google.protobuf.Timestamp ended_at = 4;
+}
+
+message RecordPresenceResponse {
+  bool deduplicated = 1;
+  bool closed = 2;
+  // 本次計入 activity_daily.online_seconds 的秒數(status=offline 不計)。
+  int32 online_seconds_counted = 3;
+}
+
+// ActivityService 是 Discord 閘道寫入活動記錄的唯一入口。
+// 全部 RPC 只接受服務身分;使用者 Bearer 呼叫一律 PermissionDenied。
+service ActivityService {
+  // RecordVoiceSession 記語音在席(可發 XP)。
+  rpc RecordVoiceSession(RecordVoiceSessionRequest) returns (RecordVoiceSessionResponse);
+  // RecordMessages 批次記訊息(同一位作者)。逐筆回報結果。
+  rpc RecordMessages(RecordMessagesRequest) returns (RecordMessagesResponse);
+  // RecordMessageRevision 記編輯/刪除前的舊版本。
+  rpc RecordMessageRevision(RecordMessageRevisionRequest) returns (RecordMessageRevisionResponse);
+  // RecordReaction 記按/取消表情。
+  rpc RecordReaction(RecordReactionRequest) returns (RecordReactionResponse);
+  // RecordPresence 記線上狀態區間。**不可作為發放依據**。
+  rpc RecordPresence(RecordPresenceRequest) returns (RecordPresenceResponse);
+}

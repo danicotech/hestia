@@ -50,6 +50,10 @@ const (
 	// MeServiceUpdateTimezoneProcedure is the fully-qualified name of the MeService's UpdateTimezone
 	// RPC.
 	MeServiceUpdateTimezoneProcedure = "/hestia.platform.v1.MeService/UpdateTimezone"
+	// MeServiceGetPrivacyProcedure is the fully-qualified name of the MeService's GetPrivacy RPC.
+	MeServiceGetPrivacyProcedure = "/hestia.platform.v1.MeService/GetPrivacy"
+	// MeServiceUpdatePrivacyProcedure is the fully-qualified name of the MeService's UpdatePrivacy RPC.
+	MeServiceUpdatePrivacyProcedure = "/hestia.platform.v1.MeService/UpdatePrivacy"
 )
 
 // MeServiceClient is a client for the hestia.platform.v1.MeService service.
@@ -60,6 +64,11 @@ type MeServiceClient interface {
 	ListEntitlements(context.Context, *connect.Request[v1.ListEntitlementsRequest]) (*connect.Response[v1.ListEntitlementsResponse], error)
 	ListRedemptions(context.Context, *connect.Request[v1.ListRedemptionsRequest]) (*connect.Response[v1.ListRedemptionsResponse], error)
 	UpdateTimezone(context.Context, *connect.Request[v1.UpdateTimezoneRequest]) (*connect.Response[v1.UpdateTimezoneResponse], error)
+	// GetPrivacy / UpdatePrivacy 在代打白名單內(見 transport/interceptors.go):
+	// 使用者的 Discord 身分由 Discord 自己證明,從 /privacy 指令調整自己的
+	// 隱私設定是合理的 —— 而且這是唯一做得出 `/privacy optout` 的路徑。
+	GetPrivacy(context.Context, *connect.Request[v1.GetPrivacyRequest]) (*connect.Response[v1.GetPrivacyResponse], error)
+	UpdatePrivacy(context.Context, *connect.Request[v1.UpdatePrivacyRequest]) (*connect.Response[v1.UpdatePrivacyResponse], error)
 }
 
 // NewMeServiceClient constructs a client for the hestia.platform.v1.MeService service. By default,
@@ -109,6 +118,18 @@ func NewMeServiceClient(httpClient connect.HTTPClient, baseURL string, opts ...c
 			connect.WithSchema(meServiceMethods.ByName("UpdateTimezone")),
 			connect.WithClientOptions(opts...),
 		),
+		getPrivacy: connect.NewClient[v1.GetPrivacyRequest, v1.GetPrivacyResponse](
+			httpClient,
+			baseURL+MeServiceGetPrivacyProcedure,
+			connect.WithSchema(meServiceMethods.ByName("GetPrivacy")),
+			connect.WithClientOptions(opts...),
+		),
+		updatePrivacy: connect.NewClient[v1.UpdatePrivacyRequest, v1.UpdatePrivacyResponse](
+			httpClient,
+			baseURL+MeServiceUpdatePrivacyProcedure,
+			connect.WithSchema(meServiceMethods.ByName("UpdatePrivacy")),
+			connect.WithClientOptions(opts...),
+		),
 	}
 }
 
@@ -120,6 +141,8 @@ type meServiceClient struct {
 	listEntitlements *connect.Client[v1.ListEntitlementsRequest, v1.ListEntitlementsResponse]
 	listRedemptions  *connect.Client[v1.ListRedemptionsRequest, v1.ListRedemptionsResponse]
 	updateTimezone   *connect.Client[v1.UpdateTimezoneRequest, v1.UpdateTimezoneResponse]
+	getPrivacy       *connect.Client[v1.GetPrivacyRequest, v1.GetPrivacyResponse]
+	updatePrivacy    *connect.Client[v1.UpdatePrivacyRequest, v1.UpdatePrivacyResponse]
 }
 
 // GetProfile calls hestia.platform.v1.MeService.GetProfile.
@@ -152,6 +175,16 @@ func (c *meServiceClient) UpdateTimezone(ctx context.Context, req *connect.Reque
 	return c.updateTimezone.CallUnary(ctx, req)
 }
 
+// GetPrivacy calls hestia.platform.v1.MeService.GetPrivacy.
+func (c *meServiceClient) GetPrivacy(ctx context.Context, req *connect.Request[v1.GetPrivacyRequest]) (*connect.Response[v1.GetPrivacyResponse], error) {
+	return c.getPrivacy.CallUnary(ctx, req)
+}
+
+// UpdatePrivacy calls hestia.platform.v1.MeService.UpdatePrivacy.
+func (c *meServiceClient) UpdatePrivacy(ctx context.Context, req *connect.Request[v1.UpdatePrivacyRequest]) (*connect.Response[v1.UpdatePrivacyResponse], error) {
+	return c.updatePrivacy.CallUnary(ctx, req)
+}
+
 // MeServiceHandler is an implementation of the hestia.platform.v1.MeService service.
 type MeServiceHandler interface {
 	GetProfile(context.Context, *connect.Request[v1.GetProfileRequest]) (*connect.Response[v1.GetProfileResponse], error)
@@ -160,6 +193,11 @@ type MeServiceHandler interface {
 	ListEntitlements(context.Context, *connect.Request[v1.ListEntitlementsRequest]) (*connect.Response[v1.ListEntitlementsResponse], error)
 	ListRedemptions(context.Context, *connect.Request[v1.ListRedemptionsRequest]) (*connect.Response[v1.ListRedemptionsResponse], error)
 	UpdateTimezone(context.Context, *connect.Request[v1.UpdateTimezoneRequest]) (*connect.Response[v1.UpdateTimezoneResponse], error)
+	// GetPrivacy / UpdatePrivacy 在代打白名單內(見 transport/interceptors.go):
+	// 使用者的 Discord 身分由 Discord 自己證明,從 /privacy 指令調整自己的
+	// 隱私設定是合理的 —— 而且這是唯一做得出 `/privacy optout` 的路徑。
+	GetPrivacy(context.Context, *connect.Request[v1.GetPrivacyRequest]) (*connect.Response[v1.GetPrivacyResponse], error)
+	UpdatePrivacy(context.Context, *connect.Request[v1.UpdatePrivacyRequest]) (*connect.Response[v1.UpdatePrivacyResponse], error)
 }
 
 // NewMeServiceHandler builds an HTTP handler from the service implementation. It returns the path
@@ -205,6 +243,18 @@ func NewMeServiceHandler(svc MeServiceHandler, opts ...connect.HandlerOption) (s
 		connect.WithSchema(meServiceMethods.ByName("UpdateTimezone")),
 		connect.WithHandlerOptions(opts...),
 	)
+	meServiceGetPrivacyHandler := connect.NewUnaryHandler(
+		MeServiceGetPrivacyProcedure,
+		svc.GetPrivacy,
+		connect.WithSchema(meServiceMethods.ByName("GetPrivacy")),
+		connect.WithHandlerOptions(opts...),
+	)
+	meServiceUpdatePrivacyHandler := connect.NewUnaryHandler(
+		MeServiceUpdatePrivacyProcedure,
+		svc.UpdatePrivacy,
+		connect.WithSchema(meServiceMethods.ByName("UpdatePrivacy")),
+		connect.WithHandlerOptions(opts...),
+	)
 	return "/hestia.platform.v1.MeService/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case MeServiceGetProfileProcedure:
@@ -219,6 +269,10 @@ func NewMeServiceHandler(svc MeServiceHandler, opts ...connect.HandlerOption) (s
 			meServiceListRedemptionsHandler.ServeHTTP(w, r)
 		case MeServiceUpdateTimezoneProcedure:
 			meServiceUpdateTimezoneHandler.ServeHTTP(w, r)
+		case MeServiceGetPrivacyProcedure:
+			meServiceGetPrivacyHandler.ServeHTTP(w, r)
+		case MeServiceUpdatePrivacyProcedure:
+			meServiceUpdatePrivacyHandler.ServeHTTP(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -250,4 +304,12 @@ func (UnimplementedMeServiceHandler) ListRedemptions(context.Context, *connect.R
 
 func (UnimplementedMeServiceHandler) UpdateTimezone(context.Context, *connect.Request[v1.UpdateTimezoneRequest]) (*connect.Response[v1.UpdateTimezoneResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("hestia.platform.v1.MeService.UpdateTimezone is not implemented"))
+}
+
+func (UnimplementedMeServiceHandler) GetPrivacy(context.Context, *connect.Request[v1.GetPrivacyRequest]) (*connect.Response[v1.GetPrivacyResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("hestia.platform.v1.MeService.GetPrivacy is not implemented"))
+}
+
+func (UnimplementedMeServiceHandler) UpdatePrivacy(context.Context, *connect.Request[v1.UpdatePrivacyRequest]) (*connect.Response[v1.UpdatePrivacyResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("hestia.platform.v1.MeService.UpdatePrivacy is not implemented"))
 }

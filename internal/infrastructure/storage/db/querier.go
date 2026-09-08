@@ -10,13 +10,69 @@ import (
 )
 
 type Querier interface {
+	// 確認送達 → 終態 done。
+	//
+	// topic 條件是**授權**,不是最佳化:少了它,閘道送一串猜出來的 id
+	// 就能把退款、工單建立這類內部事件標成已完成 —— 事件會靜靜消失,
+	// 而且沒有任何一層擋得住。
+	//
+	// status <> 'done' 讓重送的 Ack 變成 0 列(冪等),而不是錯誤;
+	// 也讓「已經被判毒訊息但其實貼出去了」的遲到 Ack 仍然收得回來。
+	AckAnnouncements(ctx context.Context, arg AckAnnouncementsParams) (int64, error)
+	// XP 入帳後回填當日彙總。單獨一句是因為 XP 入帳走 xp.Service(自己開 tx),
+	// 不在事實那個 tx 裡(理由見 activitylogpg 的註解)。
+	AddActivityDailyXP(ctx context.Context, arg AddActivityDailyXPParams) error
 	// 與 InsertXpEvent 同 tx;now() 為 tx 時間,與事件的 created_at 同值。
 	// level 不動:M1 曲線未上線,恆 0(schemas/06)
 	AddUserXp(ctx context.Context, arg AddUserXpParams) (int64, error)
 	// 呼叫前必須已 LockBalanceForUpdate;CHECK(balance >= 0) 是最後防線,不是主要檢查
 	ApplyBalanceDelta(ctx context.Context, arg ApplyBalanceDeltaParams) (int64, error)
+	// ══ 彙總層 ══
+	// 一句話完成「有就加、沒有就建」。date 由事件時間在 UTC 下取日,
+	// 不用使用者時區:投影必須可重算(users.timezone 會變,拿它當分桶鍵
+	// 會讓同一批事實在不同時間重算出不同結果)。
+	BumpActivityDaily(ctx context.Context, arg BumpActivityDailyParams) error
+	// delta 為 -1 時用 GREATEST 夾住 0:計數是衍生值,寧可保守也不要出現負數。
+	BumpMessageReactionCount(ctx context.Context, arg BumpMessageReactionCountParams) error
+	// 通知拉取(notificationpg):outbox_events → Discord 閘道的取貨口。
+	//
+	// 這個檔案**不新增任何狀態欄位**。認領重用既有的 next_retry_at 當可見性逾時,
+	// 重試次數重用既有的 attempts,終態重用既有的 status='failed'。
+	// 理由是專案第 9 條:outbox 的投遞狀態已經有一個權威位置,
+	// 為了「拉取」再開一組 claimed_at / claimed_by 欄位,就會有兩套會漂移的語意。
+	//
+	// 三條紀律:
+	//   1. **每個查詢都帶 topic 白名單參數。** 不是為了效能,是授權:
+	//      閘道只能碰 Discord 清單內的事件,連 Ack 都不能碰別的
+	//      (不然它猜個 id 就能把內部事件標成已完成 —— 那是靜默丟事件)。
+	//   2. **一律 FOR UPDATE SKIP LOCKED,絕不等鎖。** 兩個 Pull 併發時各拿各的,
+	//      而不是後到的那個卡住;也因此不可能與另一個 Pull 死鎖。
+	//   3. **status 只有 Ack 與毒訊息終止會改。** 認領本身不改 status ——
+	//      沒有 Ack 的事件到期自動重新可見,這就是 at-least-once。
+	// 認領一批待送的公告事件:把 next_retry_at 推到 now() + visibility_seconds,
+	// 在那之前它對任何消費者(包含另一個 Pull)都不可見。
+	//
+	// attempts 在認領時 +1,不是在 Ack 時。理由:重送一次就是重試一次,
+	// 而 attempts 是毒訊息計數器的既有語意(outbox.Consumer 也是這樣用)。
+	// 不計數的話,一則永遠貼不出去的公告會無限重來 —— 佇列裡的毒訊息
+	// 不能沒有終點。
+	//
+	// RETURNING 的順序不保證(UPDATE ... FROM 不吃 ORDER BY),
+	// 呼叫端依 id 排序後才交出去:舊事件先貼。
+	ClaimAnnouncements(ctx context.Context, arg ClaimAnnouncementsParams) ([]ClaimAnnouncementsRow, error)
+	// ══ 訊息 ══
+	// **訊息冪等的權威**:message_stats.message_id 是 PK,而且不論頻道白名單或
+	// opt-out 都會寫這一列 —— 所以它是唯一「每則訊息必定存在一次」的鍵。
+	// 回傳空列 = 這則訊息先前已處理過,整筆跳過。
+	// 併發同一則訊息時,後到的那個 tx 會卡在 PK 上等待,commit 後回 0 列。
+	ClaimMessage(ctx context.Context, arg ClaimMessageParams) (string, error)
 	// 多實例安全消費:SKIP LOCKED
-	ClaimPendingOutbox(ctx context.Context, limit int32) ([]PlatformOutboxEvent, error)
+	//
+	// excluded_topics 是「由別人負責投遞」的 topic(目前是閘道經 NotificationService
+	// 拉取的公告)。少了這段,in-process 消費者會認領它們、找不到 handler、
+	// 退避重試到上限後標 failed —— 閘道離線一小時,公告就被燒光了。
+	// 傳空陣列 = 全部都歸這個消費者(既有行為)。
+	ClaimPendingOutbox(ctx context.Context, arg ClaimPendingOutboxParams) ([]PlatformOutboxEvent, error)
 	// 語意代價(接受):超過窗口的重送不再被識別為重放——30 天遠大於任何合法重試窗口
 	CleanupIdempotencyKeys(ctx context.Context, retentionDays int32) (int64, error)
 	// 終態事件(done/failed)逾保留期即刪;pending 永不動(schemas/14)
@@ -27,18 +83,40 @@ type Querier interface {
 	// 截止線早於 now(),未撤銷且未過期的列不可能落在它之前。
 	// rotated_from 的子列指標由 FK 的 ON DELETE SET NULL 自動斷開,不會撞 FK。
 	CleanupSessions(ctx context.Context, retentionDays int32) (int64, error)
+	ClosePresenceSpan(ctx context.Context, arg ClosePresenceSpanParams) error
+	CloseReaction(ctx context.Context, arg CloseReactionParams) error
+	// 帶 joined_at 讓分區裁剪生效(voice_sessions 按 joined_at 分區)。
+	// COALESCE:補收尾的事件若沒帶靜音狀態,保留進場時記下的值。
+	CloseVoiceSession(ctx context.Context, arg CloseVoiceSessionParams) error
 	// per_user_limit 的計數口徑(schemas/08):未撤銷的 entitlements + 非 cancelled/rejected
 	// 的 redemptions。退款(撤銷)與被拒/取消的工單釋放額度。
 	CountUserItemAcquisitions(ctx context.Context, arg CountUserItemAcquisitionsParams) (int64, error)
 	CreateIdentity(ctx context.Context, arg CreateIdentityParams) (PlatformIdentity, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (PlatformUser, error)
+	// ══ 訊息舊版本 ══
+	// 刪除沒有可靠的事件時間(Discord 不給),所以冪等改用「一則訊息只會被刪一次」。
+	DeletionRevisionExists(ctx context.Context, messageID string) (bool, error)
+	// 編輯用 (message_id, captured_at):Discord 的 edited_timestamp 重送時穩定,
+	// 而同一則訊息可以被編輯很多次,不能只用 message_id。
+	EditRevisionExists(ctx context.Context, arg EditRevisionExistsParams) (bool, error)
 	EnsureBalanceRow(ctx context.Context, arg EnsureBalanceRowParams) error
+	// reaction 用:沒見過的訊息也要有 stats 列才能累加 reaction_count。
+	EnsureMessageStats(ctx context.Context, arg EnsureMessageStatsParams) error
 	// 為 platform schema 所有分區表補齊本月與下月分區(migration 00001 的函式)
 	EnsureMonthPartitions(ctx context.Context) error
 	// 預設列(兩級 optout 都是 false)。ON CONFLICT DO NOTHING:重跑不炸。
 	EnsurePrivacySettings(ctx context.Context, userID int64) error
 	// 與 EnsureBalanceRow 同模式:先保證投影列存在,才能 FOR UPDATE 串行化同 user 的併發入帳
 	EnsureUserXpRow(ctx context.Context, arg EnsureUserXpRowParams) error
+	// 毒訊息終止:重試次數用完、可見性也逾時了(= 沒有人正在處理它),
+	// 標成 failed 讓它離開待送佇列。
+	//
+	// 沒有這一段的話,貼不出去的公告會永遠停在 pending:健康檢查的積壓量
+	// 只增不減,而清理 job 只刪終態(done/failed),它會永遠留在表裡。
+	//
+	// 條件與 ClaimAnnouncements 的 attempts 門檻是同一個數字,由呼叫端傳同一個值
+	// —— 兩邊各寫一個常數就會出現「不再回傳但也不終止」的夾縫。
+	FailExhaustedAnnouncements(ctx context.Context, arg FailExhaustedAnnouncementsParams) (int64, error)
 	GetBalance(ctx context.Context, arg GetBalanceParams) (int64, error)
 	// LEFT JOIN:community 存在但 xp_ruleset_id 為 NULL(M1 可能還沒建 ruleset)時
 	// 回 NULL config,呼叫端採安全預設(無冷卻、無 cap);community 不存在 → 無列(ErrNoRows)
@@ -49,8 +127,14 @@ type Querier interface {
 	// manual 購買的押款分錄 ref 指向 redemption;免費 manual 商品沒有分錄 → no rows。
 	GetHoldEntryForRedemption(ctx context.Context, refID *int64) (GetHoldEntryForRedemptionRow, error)
 	GetIdempotencyKey(ctx context.Context, key string) (PlatformIdempotencyKey, error)
+	// ══ 物品定義與發放 ══
+	GetItemDefinitionByID(ctx context.Context, id int64) (GetItemDefinitionByIDRow, error)
+	GetItemDefinitionByPublicID(ctx context.Context, publicID string) (GetItemDefinitionByPublicIDRow, error)
 	// 最近一次簽到(依絕對時間),供改時區冷卻檢查(timezone_change_min_gap_hours)比對 claimed_at
 	GetLastDailyClaim(ctx context.Context, userID int64) (PlatformDailyClaim, error)
+	// 不加鎖:先讀出賣家是誰,才知道要鎖哪兩個 users 列(鎖序需要先知道鎖的集合)。
+	// 讀到的內容一律在取得列鎖後重新驗證,不當作判斷依據。
+	GetListingByPublicID(ctx context.Context, publicID string) (PlatformMarketListing, error)
 	// 身分層(schemas/02):OAuth2 登入、身分綁定、登入 session(增補 F)。
 	//
 	// 兩個 token 概念不要混:
@@ -65,10 +149,19 @@ type Querier interface {
 	// UNIQUE(provider, provider_user_id),必須讓應用層看見並明確拒絕,
 	// 而不是查不到就再建一個 user(那會撞唯一鍵)。
 	GetLoginIdentity(ctx context.Context, arg GetLoginIdentityParams) (GetLoginIdentityRow, error)
+	// 查無列 = 從未設定 = false(不退出)。
+	GetOptOutLogging(ctx context.Context, userID int64) (bool, error)
+	// ══ Presence ══
+	GetPresenceSpan(ctx context.Context, arg GetPresenceSpanParams) (GetPresenceSpanRow, error)
 	// Purchase 把扣款分錄的 ref 指向 entitlement(ref_type='entitlement', ref_id=權益 id),
 	// 退款由此精確找回原分錄——不靠「該 user 該 item 最近一筆」猜測,也不改 schema。
 	// 免費商品(price=0)購買時沒有分錄 → no rows,呼叫端視為無錢可退、僅撤銷權益。
 	GetPurchaseEntryForEntitlement(ctx context.Context, refID *int64) (GetPurchaseEntryForEntitlementRow, error)
+	// ══ Reaction ══
+	// 天然鍵 = (message_id, user_id, emoji)。一個人對同一則訊息的同一個表情
+	// 只有一列,按/取消是那一列的 added_at / removed_at ——
+	// 這正是 schemas/11 給這張表的形狀。
+	GetReaction(ctx context.Context, arg GetReactionParams) (GetReactionRow, error)
 	// refresh 的前置讀取。這裡讀到的狀態只用來「提早回錯」與取得 user_id;
 	// 「這個 token 只能換發一次」的權威是 sessions_rotated_from_uq(見 InsertSession),
 	// 不是這次讀取——先查後寫在併發下擋不住,唯一索引擋得住。
@@ -80,27 +173,79 @@ type Querier interface {
 	GetSessionIDByPublicID(ctx context.Context, arg GetSessionIDByPublicIDParams) (int64, error)
 	// is_listed 用 DB 時鐘計算(單一時鐘來源):listed_at 非空且已到、delisted_at 空或未到。
 	GetShopItemForPurchase(ctx context.Context, publicID string) (GetShopItemForPurchaseRow, error)
+	// guild snowflake → (space_id, community_id)。community_id 是 activity_daily 的 PK 之一。
+	GetSpaceByExternalID(ctx context.Context, arg GetSpaceByExternalIDParams) (GetSpaceByExternalIDRow, error)
+	// 頻道註冊表(schemas/01 增補 C)= 白名單權威。
+	// 查無列 = 未註冊:log_messages 視為 false(白名單制),grant_xp 視為 true
+	// (欄位預設值;白名單管的是「內容要不要落地」,不是「要不要計分」)。
+	GetSpaceChannel(ctx context.Context, arg GetSpaceChannelParams) (GetSpaceChannelRow, error)
 	// 管理員經濟操作 query。動錢一律走 ledger 的 ApplyInTx,這裡只有讀取;
 	// audit 寫入用 audit.sql 的 InsertAdminAudit,不重複定義。
 	// 退款前讀原分錄(分區表,依 id 掃全分區;管理操作低頻,可接受)
 	GetTokenEntryByID(ctx context.Context, id int64) (PlatformTokenEntry, error)
+	// ══ 防洗點:交易門檻 / 單日上限 / no_trade ══
+	// 一次算完一個人的交易資格(schemas/09「防洗點」四項的資料來源),全部用 DB 時鐘:
+	//   level            該使用者在各社群的最高等級(M1 只有一個社群;user_xp 是投影表)
+	//   member_days      入群天數 = now() − MIN(space_members.joined_at),離群不歸零(schemas/01 增補 B)
+	//   account_age_days 帳號年齡 = now() − users.created_at
+	//   no_trade         有無生效中的 no_trade 限制(未解除且未到期)
+	//   traded_today     當日已成交額(買 + 賣合計,同幣別):日界線用該使用者自己的時區,
+	//                    與每日簽到的「一天」同義,不另立第二套日曆
+	GetTradeEligibility(ctx context.Context, arg GetTradeEligibilityParams) (GetTradeEligibilityRow, error)
 	GetUserByID(ctx context.Context, id int64) (PlatformUser, error)
 	GetUserByIdentity(ctx context.Context, arg GetUserByIdentityParams) (PlatformUser, error)
 	GetUserByPublicID(ctx context.Context, publicID string) (PlatformUser, error)
 	// access token 驗簽通過後把 public_id 解成內部 id(順帶擋掉已軟刪除的帳號)。
 	GetUserIDByPublicID(ctx context.Context, publicID string) (int64, error)
+	// ── 隱私設定(PrivacyStore)─────────────────────────────────────────────
+	//
+	// 兩級退出的權威是 platform.user_privacy_settings(schemas/02-identity.md)。
+	// 這裡是它**唯一**的讀寫入口:在此之前整張表沒有任何路徑,`/privacy optout`
+	// 因此做不出來。
+	//
+	// 「沒有列」是合法狀態(= 兩者皆 false),不是缺資料:讀不到時回預設值的
+	// 責任在 readpg,不在 SQL —— 讓 SQL 用 LEFT JOIN 硬湊一列出來的話,
+	// 呼叫端就分不出「從未設定」與「設過又改回預設」,而 updated_at 的意義
+	// 正好建立在這個區別上。
+	// JOIN users 排除軟刪除:註銷帳號連自己的隱私設定都不該讀得到。
+	GetUserPrivacy(ctx context.Context, userID int64) (GetUserPrivacyRow, error)
 	// 輪替時要把 public_id 放進新的 access token;順帶再擋一次軟刪除的帳號。
 	GetUserPublicID(ctx context.Context, id int64) (string, error)
+	// ══ 語音 ══
+	// 天然鍵 = (user_id, space_id, channel_id, joined_at)。
+	GetVoiceSession(ctx context.Context, arg GetVoiceSessionParams) (GetVoiceSessionRow, error)
 	// XP query。設計依 schemas/06(含增補 E)與 schemas/01 增補 A:
 	// xp_events 是事實、user_xp 是投影(必可重算)、XP 不進帳本不經 Ledger(刻意設計,
 	// XP 錯了重算即可,沒有對帳需求;混進帳本會淹沒金流稽核)。
 	// 冷卻用 user_xp.last_xp_at 直接查 DB(schemas/06:不上 Redis)。
 	// source 檢查:registry 管「存在與開關」(全域);數值/冷卻/上限在 xp_rulesets.config
 	GetXpEventType(ctx context.Context, key string) (GetXpEventTypeRow, error)
+	// 只有 hestia 見過的被回覆訊息才累加(message_stats.user_id 是 NOT NULL,
+	// 沒見過就沒有作者可填 —— 那種情況直接略過,不猜)。
+	IncrementReplyCount(ctx context.Context, messageID string) error
 	// reason NOT NULL 是刻意的:強迫動作當下寫理由(schemas/03)
 	InsertAdminAudit(ctx context.Context, arg InsertAdminAuditParams) (int64, error)
 	// 調整 = 插新列(必帶 created_by;seed 列 created_by 為 NULL)
 	InsertConfig(ctx context.Context, arg InsertConfigParams) (PlatformEconomyConfig, error)
+	// 聚合規則:同 space + channel + thread,相鄰(合格)訊息間隔超過 chunk_gap_minutes 即斷開。
+	//
+	// 排除(schemas/12 明列)——都在 eligible 這層做掉,被排除的訊息也不參與斷句判定:
+	//   1. 未註冊/未開 log_messages 的頻道:語料範圍跟隨白名單(schemas/01 增補 C),不另設旗標;
+	//   2. opt_out_ai_corpus 使用者:只踢掉他的發言,同段對話其他人的仍保留;
+	//   3. Bot / 無第三方身分綁定的系統帳號:見 EXISTS(identities) 的註解;
+	//   4. 已刪訊息(deleted_at):使用者刪掉的內容不進長期語料;
+	//   5. 純表情 / 極短訊息:剝掉 Discord 自訂表情與 mention 標記後,
+	//      有意義字元(alnum,含 CJK)少於 min_message_chars 的一律不算發言。
+	//
+	// 只寫「已封閉」的 chunk(ended_at 已超過一個 gap):還在 gap 內的尾段可能再有人發言,
+	// 現在寫下去就會把同一段對話切成兩個 chunk——這是整個 job 最關鍵的一條。
+	//
+	// 冪等:watermark = 每個 (space, channel, thread) 已產生 chunk 的最大 ended_at,
+	// 只處理它之後的訊息。訊息本身可能因保留期被刪,水位線留在 chunks 表裡才不會漂移。
+	// embed_model / embedded_at 刻意留 NULL:嵌入模型尚未選型(schemas/12 的 N 待定)。
+	// 它們的用途是「換模型時判斷哪些 chunk 要重算」——NULL = 從未嵌入,
+	// 值不等於現行模型 = 需重算。向量隨時能從 text 重建,所以現在只累積事實層。
+	InsertConversationChunks(ctx context.Context, arg InsertConversationChunksParams) (int64, error)
 	// 簽到:防連點靠 daily_claims 的 PK(user_id, claim_date),不用冪等鍵(ledger-invariants 第三條)
 	InsertDailyClaim(ctx context.Context, arg InsertDailyClaimParams) (PlatformDailyClaim, error)
 	// expires_at / refundable_until 在購買當下用 DB 時鐘算好「存欄位」
@@ -121,6 +266,8 @@ type Querier interface {
 	// 在 tx 開頭先插(response 先 NULL),讓併發同 key 的第二個 tx 直接撞 PK;
 	// tx 若 rollback,key 同步消失,合法重試不會被擋。
 	InsertIdempotencyKey(ctx context.Context, arg InsertIdempotencyKeyParams) error
+	// quantity 固定 1:M1 不做 stackable 疊加(schemas/09 有欄位但沒有合併/拆分語意)。
+	InsertItemInstance(ctx context.Context, arg InsertItemInstanceParams) (InsertItemInstanceRow, error)
 	// maintenance 排程器(schemas/14):job 執行紀錄、advisory lock、分區與列級清理。
 	// 分區到期偵測(pg_inherits catalog,sqlc 解析不了系統目錄)與 DROP TABLE(動態 DDL)
 	// 無法走 sqlc,實作在 maintenance 套件內(partition.go)。
@@ -129,14 +276,33 @@ type Querier interface {
 	InsertLoginIdentity(ctx context.Context, arg InsertLoginIdentityParams) (int64, error)
 	// 首次 OAuth 登入建立內部使用者(內部 id 是唯一權威,provider 帳號只是掛在上面的憑證)。
 	InsertLoginUser(ctx context.Context, arg InsertLoginUserParams) (InsertLoginUserRow, error)
+	// ══ 掛單 ══
+	InsertMarketListing(ctx context.Context, arg InsertMarketListingParams) (InsertMarketListingRow, error)
+	// ══ 成交紀錄 ══
+	// 買賣雙方 + 金額 + 手續費全額記帳:任兩人的資金淨流向可查(防洗點稽核的資料來源)。
+	InsertMarketOrder(ctx context.Context, arg InsertMarketOrderParams) (InsertMarketOrderRow, error)
+	// excerpt 為 NULL 的兩種情況:頻道沒開 log_messages(那時根本不呼叫本查詢)、
+	// 作者 opt_out_logging(呼叫但 excerpt 傳 NULL)。full_length 照記 ——
+	// 它是長度不是內容,而且是「截斷長度夠不夠」的唯一檢討依據。
+	// ON CONFLICT 對應既有的 UNIQUE (message_id, created_at):ClaimMessage 已經擋過
+	// 一次,這裡是資料表自己的第二道防線,不是第二個權威。
+	InsertMessageLog(ctx context.Context, arg InsertMessageLogParams) error
+	InsertMessageRevision(ctx context.Context, arg InsertMessageRevisionParams) error
 	InsertOutboxEvent(ctx context.Context, arg InsertOutboxEventParams) (int64, error)
+	InsertPresenceSpan(ctx context.Context, arg InsertPresenceSpanParams) error
+	InsertReaction(ctx context.Context, arg InsertReactionParams) error
 	InsertRedemption(ctx context.Context, arg InsertRedemptionParams) (PlatformRedemption, error)
 	// expires_at 用 **DB 時鐘**(應用機器時鐘漂移不該影響憑證壽命)。
 	// rotated_from 撞 sessions_rotated_from_uq = 這條 session 已經被輪替過一次,
 	// 也就是同一個 refresh token 被用了第二次 —— 呼叫端據此觸發重用偵測。
 	InsertSession(ctx context.Context, arg InsertSessionParams) (InsertSessionRow, error)
 	InsertTokenEntry(ctx context.Context, arg InsertTokenEntryParams) (InsertTokenEntryRow, error)
+	InsertVoiceSession(ctx context.Context, arg InsertVoiceSessionParams) error
 	InsertXpEvent(ctx context.Context, arg InsertXpEventParams) (InsertXpEventRow, error)
+	// 排程器健康:各 job 最近一次「成功」執行的時間(schemas/13 的 job.run)。
+	// 只認 status='ok'——一直失敗的 job 有在跑但沒在做事,不能算健康。
+	// 沒跑過的 job 不會出現在結果裡,由呼叫端判定為異常(缺席才是最嚴重的那種)。
+	JobLastSuccess(ctx context.Context, jobNames []string) ([]JobLastSuccessRow, error)
 	// 冷卻計時器:該 (user, community, source) 最近一筆事件的時間。
 	// 不用 user_xp.last_xp_at 當計時器 —— 它是「最後任何入帳」的跨 source 資訊欄位,
 	// 拿來計時會讓 voice 高頻入帳餓死 message 的冷卻、admin 修正也會重置計時(QA 中1)。
@@ -146,6 +312,9 @@ type Querier interface {
 	ListAdminAuditByActor(ctx context.Context, arg ListAdminAuditByActorParams) ([]PlatformAdminAuditLog, error)
 	ListCurrentConfigs(ctx context.Context) ([]ListCurrentConfigsRow, error)
 	ListEntriesByUser(ctx context.Context, arg ListEntriesByUserParams) ([]PlatformTokenEntry, error)
+	// 已下架的商品照樣回名稱:公告講的是「當時買了什麼」,
+	// 那件事不會因為商品下架就不算數。
+	ListItemNames(ctx context.Context, publicIds []string) ([]ListItemNamesRow, error)
 	// ── 帳本分錄(LedgerReader,管理端)─────────────────────────────────────
 	//
 	// **只讀**。token_entries 是 append-only 的事實來源,這裡不可能出現 UPDATE/DELETE。
@@ -193,16 +362,44 @@ type Querier interface {
 	ListUserBalances(ctx context.Context, arg ListUserBalancesParams) ([]ListUserBalancesRow, error)
 	// 有效 session 的定義照抄檔頭三條件(含 users.deleted_at)。
 	ListUserDevices(ctx context.Context, userID int64) ([]ListUserDevicesRow, error)
+	// ── 渲染要用的名稱 ─────────────────────────────────────────────────────
+	//
+	// payload 裡只有內部 id,公告要顯示的是人名與商品名。
+	// 「哪個欄位是人、哪個是商品」的知識在 core/platform/notification,
+	// 這裡只負責照著查。查不到的鍵不補列 —— 渲染端有預設值(未知成員/未知商品)。
+	// 軟刪除的使用者查不到 → 公告顯示「未知成員」。
+	// 這是刻意的:註銷的帳號不該在**新**貼出去的訊息裡被點名。
+	ListUserDisplayNames(ctx context.Context, userIds []int64) ([]ListUserDisplayNamesRow, error)
 	// 只依 revoked_at 過濾;**過期的仍然回傳**——expires_at 一併給呈現層,
 	// 由它決定顯示成「已到期」還是隱藏。在這裡把過期的濾掉會讓使用者以為權益消失了。
 	ListUserEntitlements(ctx context.Context, arg ListUserEntitlementsParams) ([]ListUserEntitlementsRow, error)
+	// 使用者的物品清單(含定義資訊);locked 讓前端知道「正在賣,不能再掛」。
+	ListUserItemInstances(ctx context.Context, ownerID int64) ([]ListUserItemInstancesRow, error)
 	// status 為 NULL = 不過濾(全部狀態)。狀態值的封閉枚舉在 core/platform/shop,
 	// 這裡不重複列舉。
 	ListUserRedemptions(ctx context.Context, arg ListUserRedemptionsParams) ([]ListUserRedemptionsRow, error)
+	// 沒有 UNIQUE 約束可用時的併發防線:把「同一個天然鍵」的併發寫入串行化,
+	// 讓「先查再寫」不會兩個 tx 同時通過檢查。tx 結束自動釋放。
+	// hash 碰撞只會造成無關鍵之間偶爾互等,不影響正確性。
+	LockActivityKey(ctx context.Context, lockKey string) error
 	// 帳本 query。使用規則見 .claude/skills/ledger-invariants:
 	// append-only、同 transaction 更新餘額、鎖依 user_id 升冪、動錢一律冪等。
 	// 這裡刻意「沒有」UPDATE/DELETE token_entries 的 query —— 不要新增。
 	LockBalanceForUpdate(ctx context.Context, arg LockBalanceForUpdateParams) (int64, error)
+	// 對話 chunk 聚合(schemas/12-ai-corpus.md)。
+	// 設計核心:不對單則訊息做 embedding,合併成對話 chunk 才有檢索價值(grill Q16)。
+	//
+	// 一次執行 = 一句 SQL:分組、切段、過濾、寫入全在 DB 內完成。把訊息撈回應用層再切
+	// 會在「撈出來」與「寫回去」之間留下一個 race window,也會把整段對話搬過網路。
+	//
+	// 去識別化(schemas/12 的硬要求):participant_user_ids 只放內部 id,text 只放
+	// excerpt 本身——不含暱稱、不含發言者標記。chunk 是語意材料,不是逐字稿。
+	// 交易級 advisory lock:同時間只有一個 BuildChunks 在跑。
+	// conversation_chunks 目前沒有唯一約束(見 schemas/12),下面的 NOT EXISTS 在
+	// READ COMMITTED 下擋不住併發雙寫,防重的第一道權威因此是這把鎖。
+	// 用阻塞版(非 try):後到者等前者 commit 後再跑,會看見新的水位線而自然變成 no-op,
+	// 不會像 try 版那樣白白丟掉一輪工作。
+	LockChunkBuild(ctx context.Context) error
 	// FOR UPDATE OF e:只鎖權益列(同一權益的退款串行化),不鎖共享讀的商品列。
 	// db_now 一併回傳:退款窗口比對用 DB 時鐘,避免 app/DB 時鐘偏移誤判(同 outbox 的教訓)。
 	LockEntitlementForRefund(ctx context.Context, id int64) (LockEntitlementForRefundRow, error)
@@ -216,6 +413,15 @@ type Querier interface {
 	// WHERE 條件正中既有部分索引 (expires_at) WHERE revoked_at IS NULL AND expires_at IS NOT NULL。
 	// external_role_id:auto_role 商品的 Discord 身分組,消費端收回身分組要用。
 	LockExpiredEntitlements(ctx context.Context, limit int32) ([]LockExpiredEntitlementsRow, error)
+	LockItemInstanceByID(ctx context.Context, id int64) (LockItemInstanceByIDRow, error)
+	// FOR UPDATE OF i:只鎖實例列(同一件物品的掛單串行化),不鎖共享讀的定義列。
+	LockItemInstanceByPublicID(ctx context.Context, publicID string) (LockItemInstanceByPublicIDRow, error)
+	// 掛單成立時把物品鎖住;WHERE 的 IS NULL 是最後防線(呼叫端已持有列鎖並檢查過)。
+	LockItemInstanceForTrade(ctx context.Context, arg LockItemInstanceForTradeParams) (int64, error)
+	// 同一張掛單的成交/取消串行化,後到者看到非 open 即拒絕。
+	// db_now 一併回傳:過期比對用 DB 時鐘,避免 app/DB 時鐘偏移誤判。
+	LockListingByID(ctx context.Context, id int64) (LockListingByIDRow, error)
+	LockListingByPublicID(ctx context.Context, publicID string) (LockListingByPublicIDRow, error)
 	// FOR UPDATE OF r:同一工單的 approve / reject / cancel 串行化,
 	// 後到者看到非 pending 即拒絕(狀態機單向)。
 	LockRedemptionForHandle(ctx context.Context, id int64) (LockRedemptionForHandleRow, error)
@@ -229,6 +435,15 @@ type Querier interface {
 	// 都必須在「前一筆購買 commit 之後」才有意義(READ COMMITTED 下先讀後寫會踩到舊快照)。
 	// 鎖序:users → user_balances(與 dailypg 同向,不會與帳本互鎖)。
 	LockUserForShop(ctx context.Context, id int64) (int64, error)
+	// 物品與市集 query(schemas/09-items-market.md)。動錢一律經 ledger(marketpg 用 ApplyInTx
+	// 同 tx 綁定),這裡只有物品 / 掛單 / 成交紀錄側的讀寫;token_entries 一律不碰(append-only 鐵則)。
+	//
+	// 全域鎖序(與 shoppg / dailypg 同向,結構上不可能死鎖):
+	//   users → market_listings → item_instances → user_balances(user_id 升冪)
+	// 交易雙方的 users 列鎖:同一使用者的成交全序列化。
+	// 單日交易額上限與 API 冪等鍵的重放判定,都必須在「前一筆成交 commit 之後」
+	// 才有意義(READ COMMITTED 下先讀後寫會踩到舊快照)。呼叫端依 user_id 升冪呼叫。
+	LockUserForTrade(ctx context.Context, id int64) (int64, error)
 	// ── session(schemas/02 增補 F)────────────────────────────────────────────
 	// 同一使用者的 session 多列操作(輪替、全撤、重用偵測)一律先拿這把 xact advisory lock。
 	// 全系統同一把鎖、同一個取得時機 ⇒ 併發的多列操作被完全串行化,死鎖在結構上不可能,
@@ -238,6 +453,9 @@ type Querier interface {
 	// 單一時鐘來源,app/DB 時鐘偏移不影響判斷
 	LockUserXp(ctx context.Context, arg LockUserXpParams) (LockUserXpRow, error)
 	MaintenanceUnlock(ctx context.Context, jobName string) error
+	// 刪除事件同時在 message_logs 打上 deleted_at(欄位本來就是為此存在)。
+	// 沒有那一列(頻道沒開白名單)時什麼都不做。
+	MarkMessageDeleted(ctx context.Context, arg MarkMessageDeletedParams) error
 	MarkOutboxDone(ctx context.Context, id int64) error
 	// 毒訊息終態:超過重試上限,不能卡住整條佇列
 	MarkOutboxFailed(ctx context.Context, id int64) error
@@ -247,11 +465,34 @@ type Querier interface {
 	// 回傳列數是**必須檢查**的:0 列 = 舊列在前置讀取之後被撤銷(登出/封鎖),
 	// 此時整個 tx 必須回滾,不能讓新發的 session 從一條已死的鏈上長出來。
 	MarkSessionRotated(ctx context.Context, id int64) (int64, error)
+	MessageStatsExists(ctx context.Context, messageID string) (bool, error)
+	// 超發保護:檢查與遞增是**同一個敘述**,不是先查後寫。
+	// 併發時後到者在 UPDATE 取得列鎖後會依最新版本重跑 WHERE(READ COMMITTED 的
+	// EvalPlanQual),額度用完就是 0 rows —— 呼叫端據此回 ErrSupplyExhausted。
+	// max_supply IS NULL = 不限量,仍然遞增 minted_count(發行量要可查)。
+	MintDefinitionSupply(ctx context.Context, id int64) (MintDefinitionSupplyRow, error)
+	// 維運監控指標(schemas/14「監控與告警」)。每支查詢都是單一 SQL,
+	// 目的是讓 HTTP handler 或排程 job 都能便宜地叫,不做應用層彙總。
+	//
+	// 對帳(SUM(entries) = balance)不在這裡:ledger.Reconcile() 已經是全量比對的權威,
+	// healthz 直接呼叫它,不寫第二套 SQL(專案規則 9)。
+	// 分區健康走 pg_inherits / pg_partitioned_table,sqlc 解析不了系統目錄,
+	// 留在 healthz/partition.go 當 raw SQL(與 maintenance/partition.go 同一個先例)。
+	// outbox 積壓:pending 數、最舊 pending 的年齡(秒)、failed 數。
+	// 一次掃描三個數字——分三句查會在三個時點看到三份不一致的快照。
+	// 沒有 pending 時年齡回 0(NULL 會逼呼叫端處理一個沒有意義的空值)。
+	OutboxBacklog(ctx context.Context) (OutboxBacklogRow, error)
 	// 投影重算:xp ← SUM(events)、last_xp_at ← MAX(created_at),整個投影可從事實重建。
 	// 呼叫前必須已 LockUserXp,否則與並行 Award 有覆寫競態(先算 SUM、後拿鎖會蓋掉新事件)
 	RebuildUserXp(ctx context.Context, arg RebuildUserXpParams) (int64, error)
+	// session 異常:近期因重用偵測而撤銷的數量。已輪替的 token 再被使用 = token 被竊
+	// (schemas/02 增補 F),這個數字從 0 變正就是安全事件,不是效能指標。
+	RecentSessionReuse(ctx context.Context, windowHours int32) (int64, error)
 	// 對帳:找出 SUM(entries) 與 balance 不一致的每一組(含只有分錄沒有餘額列、或反之)
 	ReconcileBalances(ctx context.Context) ([]ReconcileBalancesRow, error)
+	// 取消後又按回來:復用同一列。activity_daily.reactions **不再加一次** ——
+	// 否則按了取消再按就是無限刷參與度。
+	ReopenReaction(ctx context.Context, arg ReopenReactionParams) error
 	// API 讀取側(readpg)。這個檔案只有 SELECT,唯一的例外是 SetUserTimezone
 	// ——它是 users.timezone 的**寫入入口**(dailypg 的註解指名的那一個),放在這裡
 	// 是因為 transport 的 ProfileStore 把「讀檔案」與「改時區」綁在同一個 port。
@@ -275,6 +516,18 @@ type Querier interface {
 	// ——這裡回的 user_id 只是讓入口層能提早擋掉「拿別人 public_id」的請求。
 	// 軟刪除使用者的權益一律解不出來(等同不存在),不讓已註銷帳號的資源被定址。
 	ResolveEntitlement(ctx context.Context, publicID string) (ResolveEntitlementRow, error)
+	// 活動記錄(schemas/10-activity-logs.md、schemas/11-messages.md)。
+	//
+	// 貫穿本檔的兩件事:
+	//   1. **寫入時彙總**:事實與 activity_daily / message_stats 在同一個 tx。
+	//   2. **冪等靠天然唯一鍵**,不另設冪等鍵表(專案第 9 條)。
+	//      有 UNIQUE 的用 ON CONFLICT;沒有 UNIQUE 的(voice_sessions /
+	//      presence_spans / reaction_events 這三張表沒有天然鍵的約束)
+	//      用 advisory lock 把同鍵的併發串行化,再「查了才寫」。
+	// ══ 解析:外部識別碼 → 內部 id ══
+	// X-Acting-User 的解析。查不到就是查不到 —— 呼叫端絕不可在這裡建帳號,
+	// 建帳號的權威在 OAuth 登入流程(否則會產生沒有 privacy 設定列的殘缺使用者)。
+	ResolveIdentityUser(ctx context.Context, arg ResolveIdentityUserParams) (int64, error)
 	ResolveRedemption(ctx context.Context, publicID string) (ResolveRedemptionRow, error)
 	// 呼叫前必須已 LockEntitlementForRefund 且確認 revoked_at IS NULL。
 	RevokeEntitlement(ctx context.Context, id int64) (*time.Time, error)
@@ -307,10 +560,18 @@ type Querier interface {
 	SumXpTodayBySource(ctx context.Context, arg SumXpTodayBySourceParams) (int64, error)
 	TouchLoginUser(ctx context.Context, id int64) error
 	TouchUserLastSeen(ctx context.Context, id int64) error
+	// 成交換手:owner 換人 + 清鎖 + 更新取得脈絡,單一敘述。
+	// WHERE 同時比對原持有人與鎖:鎖不指向本掛單就換不動(ledger-invariants 第五條)。
+	// bound 依定義的 bind_on_acquire 重新決定:交易後綁定的物品,新主人手上就是綁定的。
+	TransferItemInstance(ctx context.Context, arg TransferItemInstanceParams) (int64, error)
 	// session-level advisory lock:同名 job 多實例只有一個能跑,拿不到就跳過本輪。
 	// 必須在同一條連線上執行 TryMaintenanceLock / MaintenanceUnlock(排程器用 pool.Acquire 釘住連線)。
 	TryMaintenanceLock(ctx context.Context, jobName string) (bool, error)
+	// 取消掛單時解鎖;只解本掛單放的鎖,不會誤解別人的。
+	UnlockItemInstance(ctx context.Context, arg UnlockItemInstanceParams) (int64, error)
 	UpdateIdentityTokens(ctx context.Context, arg UpdateIdentityTokensParams) error
+	// 呼叫前必須已鎖住掛單列;WHERE status='open' 是狀態機單向的最後防線。
+	UpdateListingStatus(ctx context.Context, arg UpdateListingStatusParams) (int64, error)
 	// 既有綁定重新登入:更新 provider 側的顯示名與憑證(內部 users 的資料不覆蓋——
 	// display_name 之後可由使用者自訂,provider 的名字權威在 identities.username)。
 	UpdateLoginIdentity(ctx context.Context, arg UpdateLoginIdentityParams) error
@@ -318,6 +579,20 @@ type Querier interface {
 	UpdateRedemptionStatus(ctx context.Context, arg UpdateRedemptionStatusParams) (PlatformRedemption, error)
 	UpdateUserTimezone(ctx context.Context, arg UpdateUserTimezoneParams) (UpdateUserTimezoneRow, error)
 	UpsertDailyState(ctx context.Context, arg UpsertDailyStateParams) error
+	// 兩個旗標**各自可設**:NULL = 這次不動這一項。
+	//
+	//   建列時(INSERT 那一側)沒指定的項目落到 false —— 那是預設值,
+	//   不是猜測;user_privacy_settings 的 DEFAULT 就是 false。
+	//   更新時(DO UPDATE 那一側)沒指定的項目 COALESCE 回**現有值**。
+	//
+	// 為什麼是 INSERT ... SELECT 而不是 VALUES:VALUES 版必然插得進去,
+	// 軟刪除/不存在的使用者會被 FK 擋成 23503(對外變成 Internal)。
+	// 從 users 選來源的話,查不到就是 0 列 → pgx.ErrNoRows → 乾淨的 NotFound。
+	//
+	// 併發兩個 UpdatePrivacy 由 ON CONFLICT 收斂:PK 是 user_id,
+	// 後到的那個看到的是前一個已 commit 的值(read committed 下 DO UPDATE
+	// 會重讀最新版本),不會兩邊各自把對方的欄位覆蓋掉。
+	UpsertUserPrivacy(ctx context.Context, arg UpsertUserPrivacyParams) (UpsertUserPrivacyRow, error)
 	// 管理端授權查詢(schemas/03-authz.md)。權限字串的權威在 Go
 	// (core/platform/authz),這裡只問「這個人現在有沒有這個權限」。
 	// 單一查詢完成三件事,因為它在每個管理請求的路徑上,不能 N+1:

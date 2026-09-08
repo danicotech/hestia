@@ -543,6 +543,262 @@ func (x *UpdateTimezoneResponse) GetProfile() *UserProfile {
 	return nil
 }
 
+// PrivacySettings 是兩級退出(schemas/02-identity.md 的 user_privacy_settings)。
+//
+// **兩個旗標是不同的東西,不是同一件事的兩種強度。**
+// 使用者最常見的誤解是「我退出了就不算我的分數」——不是。兩者都不影響計分。
+//
+// 沒有設定過的使用者兩個旗標都是 false(表裡沒有列 = 預設值,不是錯誤)。
+type PrivacySettings struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// opt_out_logging = **不記錄原始活動 / 訊息內容**。
+	//
+	// 打開之後不會存訊息原文、編輯前後的內容這類「你說了什麼」的資料。
+	//
+	// **XP 與統計計數照常累積**(schemas/02:「仍計 XP,否則退出=逃避」)。
+	// 記的是「你在 X 時間發了一則訊息」這種計數事實,不是內容本身 ——
+	// 如果退出等於不計分,那它就變成一個逃避排行榜結算的按鈕,
+	// 而不是隱私設定。這條語意寫在契約裡,呈現層必須照抄,不要自己改寫。
+	OptOutLogging bool `protobuf:"varint,1,opt,name=opt_out_logging,json=optOutLogging,proto3" json:"opt_out_logging,omitempty"`
+	// opt_out_ai_corpus = **不納入 AI 語料**(向量庫 / 檢索 / 生成素材)。
+	//
+	// 與 opt_out_logging 各自獨立:可以「留紀錄但不進語料」,
+	// 也可以「不留紀錄」(不留紀錄時自然也沒有語料可用,schemas/12
+	// 的語料範圍跟隨訊息記錄,兩者天然一致,不需要同時打開)。
+	OptOutAiCorpus bool `protobuf:"varint,2,opt,name=opt_out_ai_corpus,json=optOutAiCorpus,proto3" json:"opt_out_ai_corpus,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *PrivacySettings) Reset() {
+	*x = PrivacySettings{}
+	mi := &file_hestia_platform_v1_me_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PrivacySettings) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PrivacySettings) ProtoMessage() {}
+
+func (x *PrivacySettings) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_platform_v1_me_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PrivacySettings.ProtoReflect.Descriptor instead.
+func (*PrivacySettings) Descriptor() ([]byte, []int) {
+	return file_hestia_platform_v1_me_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *PrivacySettings) GetOptOutLogging() bool {
+	if x != nil {
+		return x.OptOutLogging
+	}
+	return false
+}
+
+func (x *PrivacySettings) GetOptOutAiCorpus() bool {
+	if x != nil {
+		return x.OptOutAiCorpus
+	}
+	return false
+}
+
+type GetPrivacyRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetPrivacyRequest) Reset() {
+	*x = GetPrivacyRequest{}
+	mi := &file_hestia_platform_v1_me_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetPrivacyRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetPrivacyRequest) ProtoMessage() {}
+
+func (x *GetPrivacyRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_platform_v1_me_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetPrivacyRequest.ProtoReflect.Descriptor instead.
+func (*GetPrivacyRequest) Descriptor() ([]byte, []int) {
+	return file_hestia_platform_v1_me_proto_rawDescGZIP(), []int{13}
+}
+
+type GetPrivacyResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Settings      *PrivacySettings       `protobuf:"bytes,1,opt,name=settings,proto3" json:"settings,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetPrivacyResponse) Reset() {
+	*x = GetPrivacyResponse{}
+	mi := &file_hestia_platform_v1_me_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetPrivacyResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetPrivacyResponse) ProtoMessage() {}
+
+func (x *GetPrivacyResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_platform_v1_me_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetPrivacyResponse.ProtoReflect.Descriptor instead.
+func (*GetPrivacyResponse) Descriptor() ([]byte, []int) {
+	return file_hestia_platform_v1_me_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *GetPrivacyResponse) GetSettings() *PrivacySettings {
+	if x != nil {
+		return x.Settings
+	}
+	return nil
+}
+
+// UpdatePrivacyRequest 的兩個欄位**各自可設**:
+// 只想改一個就只帶一個,沒帶的那個維持原值(不是重設為 false)。
+// 這是 optional 的用途——proto3 沒有 optional 的話,「沒帶」與「設成 false」
+// 在線路上完全一樣,使用者關掉一個旗標會意外把另一個也關掉。
+//
+// 兩個都沒帶 = InvalidArgument。寫入 RPC 靜靜地什麼都不做,
+// 比報錯更難查(呼叫端會以為設定成功了)。
+type UpdatePrivacyRequest struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	OptOutLogging  *bool                  `protobuf:"varint,1,opt,name=opt_out_logging,json=optOutLogging,proto3,oneof" json:"opt_out_logging,omitempty"`
+	OptOutAiCorpus *bool                  `protobuf:"varint,2,opt,name=opt_out_ai_corpus,json=optOutAiCorpus,proto3,oneof" json:"opt_out_ai_corpus,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *UpdatePrivacyRequest) Reset() {
+	*x = UpdatePrivacyRequest{}
+	mi := &file_hestia_platform_v1_me_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UpdatePrivacyRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpdatePrivacyRequest) ProtoMessage() {}
+
+func (x *UpdatePrivacyRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_platform_v1_me_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpdatePrivacyRequest.ProtoReflect.Descriptor instead.
+func (*UpdatePrivacyRequest) Descriptor() ([]byte, []int) {
+	return file_hestia_platform_v1_me_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *UpdatePrivacyRequest) GetOptOutLogging() bool {
+	if x != nil && x.OptOutLogging != nil {
+		return *x.OptOutLogging
+	}
+	return false
+}
+
+func (x *UpdatePrivacyRequest) GetOptOutAiCorpus() bool {
+	if x != nil && x.OptOutAiCorpus != nil {
+		return *x.OptOutAiCorpus
+	}
+	return false
+}
+
+type UpdatePrivacyResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 更新後的**完整**設定(不只是這次改的那個),
+	// 呼叫端可以直接拿去顯示,不必自己合併。
+	Settings      *PrivacySettings `protobuf:"bytes,1,opt,name=settings,proto3" json:"settings,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UpdatePrivacyResponse) Reset() {
+	*x = UpdatePrivacyResponse{}
+	mi := &file_hestia_platform_v1_me_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UpdatePrivacyResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpdatePrivacyResponse) ProtoMessage() {}
+
+func (x *UpdatePrivacyResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_platform_v1_me_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpdatePrivacyResponse.ProtoReflect.Descriptor instead.
+func (*UpdatePrivacyResponse) Descriptor() ([]byte, []int) {
+	return file_hestia_platform_v1_me_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *UpdatePrivacyResponse) GetSettings() *PrivacySettings {
+	if x != nil {
+		return x.Settings
+	}
+	return nil
+}
+
 var File_hestia_platform_v1_me_proto protoreflect.FileDescriptor
 
 const file_hestia_platform_v1_me_proto_rawDesc = "" +
@@ -569,7 +825,20 @@ const file_hestia_platform_v1_me_proto_rawDesc = "" +
 	"\x15UpdateTimezoneRequest\x12\x1a\n" +
 	"\btimezone\x18\x01 \x01(\tR\btimezone\"S\n" +
 	"\x16UpdateTimezoneResponse\x129\n" +
-	"\aprofile\x18\x01 \x01(\v2\x1f.hestia.platform.v1.UserProfileR\aprofile2\xec\x04\n" +
+	"\aprofile\x18\x01 \x01(\v2\x1f.hestia.platform.v1.UserProfileR\aprofile\"d\n" +
+	"\x0fPrivacySettings\x12&\n" +
+	"\x0fopt_out_logging\x18\x01 \x01(\bR\roptOutLogging\x12)\n" +
+	"\x11opt_out_ai_corpus\x18\x02 \x01(\bR\x0eoptOutAiCorpus\"\x13\n" +
+	"\x11GetPrivacyRequest\"U\n" +
+	"\x12GetPrivacyResponse\x12?\n" +
+	"\bsettings\x18\x01 \x01(\v2#.hestia.platform.v1.PrivacySettingsR\bsettings\"\x9d\x01\n" +
+	"\x14UpdatePrivacyRequest\x12+\n" +
+	"\x0fopt_out_logging\x18\x01 \x01(\bH\x00R\roptOutLogging\x88\x01\x01\x12.\n" +
+	"\x11opt_out_ai_corpus\x18\x02 \x01(\bH\x01R\x0eoptOutAiCorpus\x88\x01\x01B\x12\n" +
+	"\x10_opt_out_loggingB\x14\n" +
+	"\x12_opt_out_ai_corpus\"X\n" +
+	"\x15UpdatePrivacyResponse\x12?\n" +
+	"\bsettings\x18\x01 \x01(\v2#.hestia.platform.v1.PrivacySettingsR\bsettings2\xaf\x06\n" +
 	"\tMeService\x12[\n" +
 	"\n" +
 	"GetProfile\x12%.hestia.platform.v1.GetProfileRequest\x1a&.hestia.platform.v1.GetProfileResponse\x12[\n" +
@@ -578,7 +847,10 @@ const file_hestia_platform_v1_me_proto_rawDesc = "" +
 	"\fListBalances\x12'.hestia.platform.v1.ListBalancesRequest\x1a(.hestia.platform.v1.ListBalancesResponse\x12m\n" +
 	"\x10ListEntitlements\x12+.hestia.platform.v1.ListEntitlementsRequest\x1a,.hestia.platform.v1.ListEntitlementsResponse\x12j\n" +
 	"\x0fListRedemptions\x12*.hestia.platform.v1.ListRedemptionsRequest\x1a+.hestia.platform.v1.ListRedemptionsResponse\x12g\n" +
-	"\x0eUpdateTimezone\x12).hestia.platform.v1.UpdateTimezoneRequest\x1a*.hestia.platform.v1.UpdateTimezoneResponseB@Z>github.com/danicotech/hestia/gen/hestia/platform/v1;platformv1b\x06proto3"
+	"\x0eUpdateTimezone\x12).hestia.platform.v1.UpdateTimezoneRequest\x1a*.hestia.platform.v1.UpdateTimezoneResponse\x12[\n" +
+	"\n" +
+	"GetPrivacy\x12%.hestia.platform.v1.GetPrivacyRequest\x1a&.hestia.platform.v1.GetPrivacyResponse\x12d\n" +
+	"\rUpdatePrivacy\x12(.hestia.platform.v1.UpdatePrivacyRequest\x1a).hestia.platform.v1.UpdatePrivacyResponseB@Z>github.com/danicotech/hestia/gen/hestia/platform/v1;platformv1b\x06proto3"
 
 var (
 	file_hestia_platform_v1_me_proto_rawDescOnce sync.Once
@@ -592,7 +864,7 @@ func file_hestia_platform_v1_me_proto_rawDescGZIP() []byte {
 	return file_hestia_platform_v1_me_proto_rawDescData
 }
 
-var file_hestia_platform_v1_me_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
+var file_hestia_platform_v1_me_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
 var file_hestia_platform_v1_me_proto_goTypes = []any{
 	(*GetProfileRequest)(nil),        // 0: hestia.platform.v1.GetProfileRequest
 	(*GetProfileResponse)(nil),       // 1: hestia.platform.v1.GetProfileResponse
@@ -606,37 +878,48 @@ var file_hestia_platform_v1_me_proto_goTypes = []any{
 	(*ListRedemptionsResponse)(nil),  // 9: hestia.platform.v1.ListRedemptionsResponse
 	(*UpdateTimezoneRequest)(nil),    // 10: hestia.platform.v1.UpdateTimezoneRequest
 	(*UpdateTimezoneResponse)(nil),   // 11: hestia.platform.v1.UpdateTimezoneResponse
-	(*UserProfile)(nil),              // 12: hestia.platform.v1.UserProfile
-	(*Balance)(nil),                  // 13: hestia.platform.v1.Balance
-	(*Entitlement)(nil),              // 14: hestia.platform.v1.Entitlement
-	(RedemptionStatus)(0),            // 15: hestia.platform.v1.RedemptionStatus
-	(*Redemption)(nil),               // 16: hestia.platform.v1.Redemption
+	(*PrivacySettings)(nil),          // 12: hestia.platform.v1.PrivacySettings
+	(*GetPrivacyRequest)(nil),        // 13: hestia.platform.v1.GetPrivacyRequest
+	(*GetPrivacyResponse)(nil),       // 14: hestia.platform.v1.GetPrivacyResponse
+	(*UpdatePrivacyRequest)(nil),     // 15: hestia.platform.v1.UpdatePrivacyRequest
+	(*UpdatePrivacyResponse)(nil),    // 16: hestia.platform.v1.UpdatePrivacyResponse
+	(*UserProfile)(nil),              // 17: hestia.platform.v1.UserProfile
+	(*Balance)(nil),                  // 18: hestia.platform.v1.Balance
+	(*Entitlement)(nil),              // 19: hestia.platform.v1.Entitlement
+	(RedemptionStatus)(0),            // 20: hestia.platform.v1.RedemptionStatus
+	(*Redemption)(nil),               // 21: hestia.platform.v1.Redemption
 }
 var file_hestia_platform_v1_me_proto_depIdxs = []int32{
-	12, // 0: hestia.platform.v1.GetProfileResponse.profile:type_name -> hestia.platform.v1.UserProfile
-	13, // 1: hestia.platform.v1.GetBalanceResponse.balance:type_name -> hestia.platform.v1.Balance
-	13, // 2: hestia.platform.v1.ListBalancesResponse.balances:type_name -> hestia.platform.v1.Balance
-	14, // 3: hestia.platform.v1.ListEntitlementsResponse.entitlements:type_name -> hestia.platform.v1.Entitlement
-	15, // 4: hestia.platform.v1.ListRedemptionsRequest.status:type_name -> hestia.platform.v1.RedemptionStatus
-	16, // 5: hestia.platform.v1.ListRedemptionsResponse.redemptions:type_name -> hestia.platform.v1.Redemption
-	12, // 6: hestia.platform.v1.UpdateTimezoneResponse.profile:type_name -> hestia.platform.v1.UserProfile
-	0,  // 7: hestia.platform.v1.MeService.GetProfile:input_type -> hestia.platform.v1.GetProfileRequest
-	2,  // 8: hestia.platform.v1.MeService.GetBalance:input_type -> hestia.platform.v1.GetBalanceRequest
-	4,  // 9: hestia.platform.v1.MeService.ListBalances:input_type -> hestia.platform.v1.ListBalancesRequest
-	6,  // 10: hestia.platform.v1.MeService.ListEntitlements:input_type -> hestia.platform.v1.ListEntitlementsRequest
-	8,  // 11: hestia.platform.v1.MeService.ListRedemptions:input_type -> hestia.platform.v1.ListRedemptionsRequest
-	10, // 12: hestia.platform.v1.MeService.UpdateTimezone:input_type -> hestia.platform.v1.UpdateTimezoneRequest
-	1,  // 13: hestia.platform.v1.MeService.GetProfile:output_type -> hestia.platform.v1.GetProfileResponse
-	3,  // 14: hestia.platform.v1.MeService.GetBalance:output_type -> hestia.platform.v1.GetBalanceResponse
-	5,  // 15: hestia.platform.v1.MeService.ListBalances:output_type -> hestia.platform.v1.ListBalancesResponse
-	7,  // 16: hestia.platform.v1.MeService.ListEntitlements:output_type -> hestia.platform.v1.ListEntitlementsResponse
-	9,  // 17: hestia.platform.v1.MeService.ListRedemptions:output_type -> hestia.platform.v1.ListRedemptionsResponse
-	11, // 18: hestia.platform.v1.MeService.UpdateTimezone:output_type -> hestia.platform.v1.UpdateTimezoneResponse
-	13, // [13:19] is the sub-list for method output_type
-	7,  // [7:13] is the sub-list for method input_type
-	7,  // [7:7] is the sub-list for extension type_name
-	7,  // [7:7] is the sub-list for extension extendee
-	0,  // [0:7] is the sub-list for field type_name
+	17, // 0: hestia.platform.v1.GetProfileResponse.profile:type_name -> hestia.platform.v1.UserProfile
+	18, // 1: hestia.platform.v1.GetBalanceResponse.balance:type_name -> hestia.platform.v1.Balance
+	18, // 2: hestia.platform.v1.ListBalancesResponse.balances:type_name -> hestia.platform.v1.Balance
+	19, // 3: hestia.platform.v1.ListEntitlementsResponse.entitlements:type_name -> hestia.platform.v1.Entitlement
+	20, // 4: hestia.platform.v1.ListRedemptionsRequest.status:type_name -> hestia.platform.v1.RedemptionStatus
+	21, // 5: hestia.platform.v1.ListRedemptionsResponse.redemptions:type_name -> hestia.platform.v1.Redemption
+	17, // 6: hestia.platform.v1.UpdateTimezoneResponse.profile:type_name -> hestia.platform.v1.UserProfile
+	12, // 7: hestia.platform.v1.GetPrivacyResponse.settings:type_name -> hestia.platform.v1.PrivacySettings
+	12, // 8: hestia.platform.v1.UpdatePrivacyResponse.settings:type_name -> hestia.platform.v1.PrivacySettings
+	0,  // 9: hestia.platform.v1.MeService.GetProfile:input_type -> hestia.platform.v1.GetProfileRequest
+	2,  // 10: hestia.platform.v1.MeService.GetBalance:input_type -> hestia.platform.v1.GetBalanceRequest
+	4,  // 11: hestia.platform.v1.MeService.ListBalances:input_type -> hestia.platform.v1.ListBalancesRequest
+	6,  // 12: hestia.platform.v1.MeService.ListEntitlements:input_type -> hestia.platform.v1.ListEntitlementsRequest
+	8,  // 13: hestia.platform.v1.MeService.ListRedemptions:input_type -> hestia.platform.v1.ListRedemptionsRequest
+	10, // 14: hestia.platform.v1.MeService.UpdateTimezone:input_type -> hestia.platform.v1.UpdateTimezoneRequest
+	13, // 15: hestia.platform.v1.MeService.GetPrivacy:input_type -> hestia.platform.v1.GetPrivacyRequest
+	15, // 16: hestia.platform.v1.MeService.UpdatePrivacy:input_type -> hestia.platform.v1.UpdatePrivacyRequest
+	1,  // 17: hestia.platform.v1.MeService.GetProfile:output_type -> hestia.platform.v1.GetProfileResponse
+	3,  // 18: hestia.platform.v1.MeService.GetBalance:output_type -> hestia.platform.v1.GetBalanceResponse
+	5,  // 19: hestia.platform.v1.MeService.ListBalances:output_type -> hestia.platform.v1.ListBalancesResponse
+	7,  // 20: hestia.platform.v1.MeService.ListEntitlements:output_type -> hestia.platform.v1.ListEntitlementsResponse
+	9,  // 21: hestia.platform.v1.MeService.ListRedemptions:output_type -> hestia.platform.v1.ListRedemptionsResponse
+	11, // 22: hestia.platform.v1.MeService.UpdateTimezone:output_type -> hestia.platform.v1.UpdateTimezoneResponse
+	14, // 23: hestia.platform.v1.MeService.GetPrivacy:output_type -> hestia.platform.v1.GetPrivacyResponse
+	16, // 24: hestia.platform.v1.MeService.UpdatePrivacy:output_type -> hestia.platform.v1.UpdatePrivacyResponse
+	17, // [17:25] is the sub-list for method output_type
+	9,  // [9:17] is the sub-list for method input_type
+	9,  // [9:9] is the sub-list for extension type_name
+	9,  // [9:9] is the sub-list for extension extendee
+	0,  // [0:9] is the sub-list for field type_name
 }
 
 func init() { file_hestia_platform_v1_me_proto_init() }
@@ -645,13 +928,14 @@ func file_hestia_platform_v1_me_proto_init() {
 		return
 	}
 	file_hestia_platform_v1_common_proto_init()
+	file_hestia_platform_v1_me_proto_msgTypes[15].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_hestia_platform_v1_me_proto_rawDesc), len(file_hestia_platform_v1_me_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   12,
+			NumMessages:   17,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

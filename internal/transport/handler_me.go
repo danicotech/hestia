@@ -8,6 +8,7 @@ import (
 
 	platformv1 "github.com/danicotech/hestia/gen/hestia/platform/v1"
 	"github.com/danicotech/hestia/internal/core/platform/ledger"
+	"github.com/danicotech/hestia/internal/core/platform/readmodel"
 )
 
 // meHandler 一律以「Authorization 認出來的使用者」為主體,
@@ -15,6 +16,7 @@ import (
 type meHandler struct {
 	profiles ProfileReader
 	writer   ProfileWriter
+	privacy  PrivacyStore
 	catalog  Catalog
 	ledger   ledger.Ledger
 }
@@ -145,4 +147,55 @@ func (h meHandler) UpdateTimezone(
 		return nil, toConnectError(err)
 	}
 	return connect.NewResponse(&platformv1.UpdateTimezoneResponse{Profile: profileToProto(p)}), nil
+}
+
+// GetPrivacy 讀兩級退出設定。
+//
+// 沒有設定過的使用者回**預設值**(兩者皆 false)而不是 NotFound:
+// 第一次執行 /privacy 的人必然沒有設定列,回錯的話這個指令對新使用者
+// 永遠是壞的。「沒有列 = 預設值」的權威在 readpg,入口層不重複判斷。
+func (h meHandler) GetPrivacy(
+	ctx context.Context, _ *connect.Request[platformv1.GetPrivacyRequest],
+) (*connect.Response[platformv1.GetPrivacyResponse], error) {
+	if h.privacy == nil {
+		return nil, unimplemented("MeService.GetPrivacy")
+	}
+	userID, err := requireUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	v, err := h.privacy.Privacy(ctx, userID)
+	if err != nil {
+		return nil, toConnectError(err)
+	}
+	return connect.NewResponse(&platformv1.GetPrivacyResponse{Settings: privacyToProto(v)}), nil
+}
+
+// UpdatePrivacy 更新兩級退出設定。兩個布林**各自可設**:
+// 沒帶的那個維持原值,不是重設為 false(proto3 的 optional 就是為此)。
+//
+// 兩個都沒帶 = InvalidArgument。寫入 RPC 靜靜地什麼都不做比報錯難查得多
+// ——呼叫端會以為設定成功了,而使用者以為自己已經退出。
+func (h meHandler) UpdatePrivacy(
+	ctx context.Context, req *connect.Request[platformv1.UpdatePrivacyRequest],
+) (*connect.Response[platformv1.UpdatePrivacyResponse], error) {
+	if h.privacy == nil {
+		return nil, unimplemented("MeService.UpdatePrivacy")
+	}
+	userID, err := requireUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	m := req.Msg
+	if m.OptOutLogging == nil && m.OptOutAiCorpus == nil {
+		return nil, invalidArgument("至少要指定 opt_out_logging 或 opt_out_ai_corpus 其中一項")
+	}
+	v, err := h.privacy.SetPrivacy(ctx, userID, readmodel.PrivacyUpdate{
+		OptOutLogging:  m.OptOutLogging,
+		OptOutAICorpus: m.OptOutAiCorpus,
+	})
+	if err != nil {
+		return nil, toConnectError(err)
+	}
+	return connect.NewResponse(&platformv1.UpdatePrivacyResponse{Settings: privacyToProto(v)}), nil
 }

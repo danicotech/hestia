@@ -6,6 +6,8 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	platformv1 "github.com/danicotech/hestia/gen/hestia/platform/v1"
+	renderv1 "github.com/danicotech/hestia/gen/hestia/render/v1"
+	"github.com/danicotech/hestia/internal/core/platform/notification"
 	"github.com/danicotech/hestia/internal/core/platform/readmodel"
 	"github.com/danicotech/hestia/internal/core/platform/shop"
 )
@@ -164,4 +166,47 @@ func optTime(ts *timestamppb.Timestamp) *time.Time {
 	}
 	t := ts.AsTime()
 	return &t
+}
+
+// privacyToProto 把隱私設定檢視轉成 proto。
+//
+// nil 也要回一個**非 nil 的 settings**:呼叫端拿到空訊息會把兩個布林讀成
+// false ——那正好是預設值,但那是巧合,不是保證。明確回一個兩者皆 false 的
+// 訊息,語意才是我們決定的,不是 protobuf 的零值決定的。
+//
+// UpdatedAt 刻意不進契約:契約上只有「現在的設定是什麼」。
+// 「上次改的時間」目前沒有任何呈現需求,加了就得永遠維護它。
+func privacyToProto(v *readmodel.PrivacyView) *platformv1.PrivacySettings {
+	if v == nil {
+		return &platformv1.PrivacySettings{}
+	}
+	return &platformv1.PrivacySettings{
+		OptOutLogging:  v.OptOutLogging,
+		OptOutAiCorpus: v.OptOutAICorpus,
+	}
+}
+
+// announcementToProto 把渲染好的公告轉成 render 契約的 Announcement。
+//
+// 這裡是**唯一**一個 hestia 的內容變成閘道訊息的地方,兩件事因此鎖死在這裡:
+//
+//   - **content 永遠不填。** Discord 只在純文字 content 解析 @everyone /
+//     @here / <@id>;公告裡的名稱是使用者自己填的暱稱,放進 content 等於
+//     「改個暱稱就能 @全體」。嵌入卡裡的同樣文字不會 ping 任何人。
+//   - **ephemeral 永遠是 false。** 頻道推播沒有「只有你看得到」這回事
+//     (stentor 也會強制覆寫,這裡不依賴它)。
+func announcementToProto(a notification.Announcement) *renderv1.Announcement {
+	fields := make([]*renderv1.Field, 0, len(a.Fields))
+	for _, f := range a.Fields {
+		fields = append(fields, &renderv1.Field{K: f.K, V: f.V, Inline: true})
+	}
+	return &renderv1.Announcement{
+		EventId:    a.EventID,
+		ChannelKey: a.ChannelKey,
+		View: &renderv1.View{
+			Title:     a.Title,
+			Fields:    fields,
+			Ephemeral: false,
+		},
+	}
 }
