@@ -18,11 +18,12 @@ const (
 	JobIdempotencyCleanup   = "idempotency_cleanup"
 )
 
-// RegisterDefaults 註冊 schemas/14 的三個內建每日 job(cmd/server 接線時呼叫)。
+// RegisterDefaults 註冊 schemas/14 的內建每日 job(cmd/server 接線時呼叫)。
 func RegisterDefaults(r *Runner, pool *pgxpool.Pool) {
 	r.Register(JobPartitionMaintenance, 24*time.Hour, PartitionMaintenance(pool))
 	r.Register(JobOutboxCleanup, 24*time.Hour, OutboxCleanup(pool))
 	r.Register(JobIdempotencyCleanup, 24*time.Hour, IdempotencyCleanup(pool))
+	r.Register(JobSessionCleanup, 24*time.Hour, SessionCleanup(pool))
 }
 
 // OutboxCleanup 刪除逾保留期的終態(done/failed)outbox 事件;pending 永不動。

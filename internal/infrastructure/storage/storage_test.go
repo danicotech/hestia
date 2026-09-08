@@ -26,7 +26,7 @@ func TestMigrationsAndConstraints(t *testing.T) {
 	if err := row.Scan(&currencies, &roles, &perms, &configs); err != nil {
 		t.Fatalf("查 seed 失敗: %v", err)
 	}
-	if currencies != 1 || roles != 4 || perms != 21 || configs != 17 {
+	if currencies != 1 || roles != 4 || perms != 21 || configs != 18 {
 		t.Fatalf("seed 數量不符: currencies=%d roles=%d perms=%d configs=%d", currencies, roles, perms, configs)
 	}
 
