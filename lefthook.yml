@@ -29,4 +29,8 @@ pre-push:
   jobs:
     - name: test
       glob: "*.go"
-      run: go test ./...
+      # -p 1 是必要的,不是保守:多個用 testcontainers 的套件同時建 Docker
+      # provider,在 Windows 的 Docker Desktop 上會偶發
+      # 「rootless Docker is not supported on Windows」而整批失敗。
+      # 沒有它,pre-push 會隨機擋下正常的推送,然後大家學會用 --no-verify。
+      run: go test -p 1 ./...
