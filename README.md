@@ -99,7 +99,7 @@ type Ledger interface {
 | 契約 | 住哪 | 誰依賴 | 誰是來源 |
 |---|---|---|---|
 | 平台 API | `contracts/platform/` | 其餘三個 | Go 的 dto 型別,由 huma 產生 |
-| 渲染契約 | `contracts/render/` | stentor、themis | 手寫的 spec |
+| 渲染契約 | `proto/hestia/render/v1/` | stentor、themis | proto,與其他契約同一個來源 |
 | 活動 API | `themis/contracts/<活動>/` | theatron | themis 的 Go 型別 |
 
 **平台 API 是 code-first。** 改 Go 的 dto 就是改契約,CI 負責匯出 spec 進 `contracts/`,並在匯出結果與版控內容不一致時擋下來。TS 那側規則不變:禁止手寫 API 型別,只能用生成的 client。

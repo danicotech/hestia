@@ -14,23 +14,28 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/danicotech/hestia/internal/core/platform/identity"
+	"github.com/danicotech/hestia/internal/core/platform/notification"
 	"github.com/danicotech/hestia/internal/infrastructure/maintenance"
 	"github.com/danicotech/hestia/internal/infrastructure/outbox"
 	"github.com/danicotech/hestia/internal/infrastructure/reaper"
+	"github.com/danicotech/hestia/internal/infrastructure/storage/activitylogpg"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/admineconpg"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/authzpg"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/dailypg"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/eventlogpg"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/identitypg"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/ledgerpg"
+	"github.com/danicotech/hestia/internal/infrastructure/storage/notificationpg"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/readpg"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/shoppg"
+	"github.com/danicotech/hestia/internal/infrastructure/storage/xppg"
 	"github.com/danicotech/hestia/internal/transport"
 )
 
@@ -69,6 +74,8 @@ func run() error {
 	// ── 領域服務(帳本是其他動錢服務的共同依賴)
 	led := ledgerpg.New(pool)
 	read := readpg.New(pool)
+	xpSvc := xppg.New(pool)
+	activity := activitylogpg.New(pool, xpSvc, slog.Default())
 	deps := transport.Deps{
 		Daily:         dailypg.New(pool, led),
 		Shop:          shoppg.New(pool, led),
@@ -81,6 +88,11 @@ func run() error {
 		Directory:     read,
 		EventLog:      eventlogpg.New(pool),
 		Authorizer:    authzpg.New(pool),
+		Privacy:       read,
+		Activity:      activity,
+		ActingUsers:   activity,
+		Announcements: notificationpg.New(pool, notifyOpts()...),
+		ServiceTokens: serviceTokens(),
 	}
 
 	// ── 身分:Discord 憑證齊全才啟用。缺了就讓 AuthService 保持 Unimplemented,
@@ -101,8 +113,16 @@ func run() error {
 		return fmt.Errorf("建立 API server: %w", err)
 	}
 
+	// 閘道經 NotificationService 拉取的 topic 由它負責投遞,in-process 消費者必須跳過:
+	// 否則會認領 → 找不到 handler → 退避重試到上限 → 標 failed,公告被燒掉。
 	consumer := outbox.NewConsumer(pool)
-	// topic handler 隨功能上線註冊(M2 起:daily.claimed → Discord 推播等)
+	consumer.ExcludedTopics = notification.DiscordTopics()
+	// 之後在這裡註冊 in-process handler(如身分組回收)。Consumer.Handle 會直接
+	// 拒絕閘道負責的 topic,所以「兩邊都處理」在結構上不可能;這道斷言讀的是
+	// 實際註冊結果(不是手寫清單),當作第二層保險。
+	if err := notification.AssertNoOverlap(consumer.RegisteredTopics()); err != nil {
+		return fmt.Errorf("outbox topic 分工衝突: %w", err)
+	}
 
 	// 資料膨脹治理(schemas/14):分區維護、outbox/冪等鍵/session 清理、權益到期回收
 	runner := maintenance.New(pool)
@@ -217,4 +237,50 @@ func shutdown(httpSrv *http.Server, srv *transport.Server) {
 	if err := srv.Shutdown(ctx); err != nil {
 		slog.Warn("稽核佇列未完全排空", "err", err)
 	}
+}
+
+// serviceTokens 從 PLATFORM_SERVICE_TOKENS 讀服務憑證,格式 `name:token,name:token`。
+// 支援多把是刻意的:輪替期間新舊並存,否則換 token 必然中斷服務。
+// 格式不合法就整把跳過並警告——寧可少一把讓呼叫方明確被拒,
+// 也不要把畸形字串當成有效憑證。完全沒設定時服務照常起,只是服務端點全部拒絕。
+func serviceTokens() []transport.ServiceToken {
+	raw := os.Getenv("PLATFORM_SERVICE_TOKENS")
+	if raw == "" {
+		return nil
+	}
+	var out []transport.ServiceToken
+	for _, pair := range strings.Split(raw, ",") {
+		name, token, ok := strings.Cut(strings.TrimSpace(pair), ":")
+		if !ok || name == "" || token == "" {
+			slog.Warn("PLATFORM_SERVICE_TOKENS 有一項格式不符 name:token,已跳過")
+			continue
+		}
+		// Delegable 決定這把憑證能代表使用者做什麼。空 = 不能代打(fail closed)。
+		// 目前只有 stentor 一個呼叫方,給全部;發第二把憑證時應逐條收窄,
+		// 因為「能代打」等於「能代表任何已綁定使用者花錢」。
+		out = append(out, transport.ServiceToken{
+			Name: name, Token: token,
+			Delegable: transport.AllDelegableProcedures(),
+		})
+	}
+	return out
+}
+
+// notifyOpts 提供公告事件 id 的簽章金鑰。
+//
+// 沒設定時 notificationpg 會用行程內隨機金鑰並警告:功能照常,
+// 但 hestia 重啟後未 Ack 的公告會拿到新的 id,閘道的去重鍵因此失效,
+// 那幾則可能被重貼一次。設一把固定金鑰就沒有這個窗口。
+func notifyOpts() []notificationpg.Option {
+	raw := os.Getenv("PLATFORM_NOTIFY_EVENT_KEY")
+	if raw == "" {
+		return nil
+	}
+	key, err := notificationpg.NewEventIDKey([]byte(raw))
+	if err != nil {
+		// 設錯不能靜靜降級成隨機金鑰——那會讓人以為窗口已經關上
+		slog.Error("PLATFORM_NOTIFY_EVENT_KEY 無效,改用行程內隨機金鑰", "err", err)
+		return nil
+	}
+	return []notificationpg.Option{notificationpg.WithEventIDKey(key)}
 }

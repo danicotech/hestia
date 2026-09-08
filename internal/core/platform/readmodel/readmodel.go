@@ -29,6 +29,31 @@ type ProfileView struct {
 	CreatedAt         time.Time
 }
 
+// PrivacyView 是兩級退出設定的對外檢視(schemas/02-identity.md)。
+//
+// **沒有設定列 = 兩者皆 false**,不是錯誤:user_privacy_settings 只在使用者
+// 真的動過設定時才有列。讀取側替沒設定過的人回預設值,是這個語意的唯一實作
+// 位置 —— 每個呼叫端各自 fallback 就會有 N 份「預設值是什麼」的定義。
+//
+// 兩個旗標的語意差異在 proto 註解裡寫死(me.proto 的 PrivacySettings):
+// OptOutLogging 是「不記錄原始內容」,**XP 與統計計數照常**。
+type PrivacyView struct {
+	OptOutLogging  bool
+	OptOutAICorpus bool
+	// UpdatedAt 是上次變更時間;nil = 從未設定過(回的是預設值)。
+	UpdatedAt *time.Time
+}
+
+// PrivacyUpdate 是一次隱私設定變更。
+//
+// 兩個欄位都是指標:nil = **這次不動這一項**,不是「設成 false」。
+// 用值型別的話,想關掉一個旗標就必須連另一個一起送,而呼叫端手上
+// 那份「另一個」可能已經過期 —— 那會變成靜靜地把別的設定覆蓋回去。
+type PrivacyUpdate struct {
+	OptOutLogging  *bool
+	OptOutAICorpus *bool
+}
+
 // BalanceView 是單一幣別的餘額。餘額的權威是 user_balances(帳本的快取),
 // 這裡只是把它讀出來顯示。
 type BalanceView struct {

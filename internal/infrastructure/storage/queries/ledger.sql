@@ -75,11 +75,20 @@ RETURNING id;
 
 -- name: ClaimPendingOutbox :many
 -- 多實例安全消費:SKIP LOCKED
+--
+-- excluded_topics 是「由別人負責投遞」的 topic(目前是閘道經 NotificationService
+-- 拉取的公告)。少了這段,in-process 消費者會認領它們、找不到 handler、
+-- 退避重試到上限後標 failed —— 閘道離線一小時,公告就被燒光了。
+-- 傳空陣列 = 全部都歸這個消費者(既有行為)。
 SELECT * FROM platform.outbox_events
-WHERE status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= now())
+WHERE status = 'pending'
+  AND (next_retry_at IS NULL OR next_retry_at <= now())
+  -- COALESCE 不可省:topic <> ALL(NULL) 求值為 NULL 而非 true,
+  -- 呼叫端沒傳清單時會變成「一筆都認領不到」,消費者靜默停擺。
+  AND topic <> ALL(COALESCE(sqlc.narg(excluded_topics)::text[], ARRAY[]::text[]))
 ORDER BY id
 FOR UPDATE SKIP LOCKED
-LIMIT $1;
+LIMIT sqlc.arg(row_limit);
 
 -- name: MarkOutboxDone :exec
 UPDATE platform.outbox_events SET status = 'done' WHERE id = $1;

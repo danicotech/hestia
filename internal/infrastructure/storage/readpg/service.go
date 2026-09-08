@@ -1,5 +1,6 @@
 // Package readpg 是 API 讀取側與身分解析的 Postgres 實作:transport/ports.go 的
-// Directory、ProfileReader、ProfileWriter、Catalog、LedgerReader 五個 port。
+// Directory、ProfileReader、ProfileWriter、PrivacyStore、Catalog、LedgerReader
+// 六個 port。
 //
 // 定位:core 目前只有寫入側介面(shop.Service、ledger.Ledger、adminecon.Service……),
 // 「列出我的權益」「public_id 換內部 id」「翻帳本」這類純讀取沒有 core 介面,
@@ -50,8 +51,9 @@ import (
 // ——「沒有上限的列表查詢」是遲早會把記憶體吃光的那種 bug。
 const DefaultRowLimit = 200
 
-// Service 同時實作 Directory、ProfileReader、ProfileWriter、Catalog、LedgerReader。
-// 它們共用同一個連線池與同一套錯誤語意,拆成五個 struct 只會多五份樣板;
+// Service 同時實作 Directory、ProfileReader、ProfileWriter、PrivacyStore、
+// Catalog、LedgerReader。
+// 它們共用同一個連線池與同一套錯誤語意,拆成六個 struct 只會多六份樣板;
 // 需要收窄能力的呼叫端在**自己那邊**宣告只含所需方法的介面(handler 已經這麼做)。
 type Service struct {
 	pool  *pgxpool.Pool
@@ -104,6 +106,10 @@ type (
 	profileWriterPort interface {
 		SetTimezone(ctx context.Context, userID int64, timezone string) (*readmodel.ProfileView, error)
 	}
+	privacyStorePort interface {
+		Privacy(ctx context.Context, userID int64) (*readmodel.PrivacyView, error)
+		SetPrivacy(ctx context.Context, userID int64, up readmodel.PrivacyUpdate) (*readmodel.PrivacyView, error)
+	}
 	catalogPort interface {
 		Items(ctx context.Context, includeDelisted bool) ([]readmodel.ItemView, error)
 		Entitlements(ctx context.Context, userID int64, includeRevoked bool) ([]readmodel.EntitlementView, error)
@@ -118,6 +124,7 @@ var (
 	_ directoryPort     = (*Service)(nil)
 	_ profileReaderPort = (*Service)(nil)
 	_ profileWriterPort = (*Service)(nil)
+	_ privacyStorePort  = (*Service)(nil)
 	_ catalogPort       = (*Service)(nil)
 	_ ledgerReaderPort  = (*Service)(nil)
 )
@@ -301,6 +308,74 @@ func (s *Service) SetTimezone(ctx context.Context, userID int64, timezone string
 		Timezone:          row.Timezone,
 		TimezoneChangedAt: row.TimezoneChangedAt,
 		CreatedAt:         row.CreatedAt,
+	}, nil
+}
+
+// ── PrivacyStore ────────────────────────────────────────────────────────
+
+// Privacy 讀兩級退出設定。
+//
+// **沒有列不是錯誤**:user_privacy_settings 只在使用者動過設定時才有列,
+// 沒有列就是「兩者皆 false」的預設狀態。這是 `/privacy` 指令能不能用的關鍵
+// ——第一次執行的人必然沒有列,回 NotFound 的話這個功能對新使用者永遠是壞的。
+//
+// UpdatedAt 為 nil 就是「從未設定過」的標記,呼叫端據此分得出
+// 「預設值」與「設過又改回預設」。
+func (s *Service) Privacy(ctx context.Context, userID int64) (*readmodel.PrivacyView, error) {
+	if userID <= 0 {
+		return nil, fmt.Errorf("user_id 不合法: %w", shop.ErrUserNotFound)
+	}
+	row, err := s.q.GetUserPrivacy(ctx, userID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// 使用者不存在 / 軟刪除也會走到這裡。刻意**不**為此多打一次
+			// users 查詢分辨兩者:隱私設定是「我的」資源,而呼叫端的
+			// user id 來自認證攔截器,不可能是別人的 —— 分辨出來也沒有
+			// 第二種處置,只是多一次往返。
+			return &readmodel.PrivacyView{}, nil
+		}
+		return nil, fmt.Errorf("讀使用者 %d 的隱私設定: %w", userID, err)
+	}
+	updated := row.UpdatedAt
+	return &readmodel.PrivacyView{
+		OptOutLogging:  row.OptOutLogging,
+		OptOutAICorpus: row.OptOutAiCorpus,
+		UpdatedAt:      &updated,
+	}, nil
+}
+
+// SetPrivacy 更新兩級退出設定並回傳更新後的**完整**設定。
+//
+// up 的兩個欄位各自可為 nil(= 這次不動這一項),語意由 SQL 的 COALESCE
+// 實作(見 queries/read.sql):沒有列就建列,有列就只改指定的那幾項。
+// 全 nil 的呼叫在入口層就被擋掉(寫入 RPC 不該靜靜地什麼都不做),
+// 這裡再擋一次是防禦性的:沒有它,全 nil 會變成一次「只更新 updated_at」的寫入。
+func (s *Service) SetPrivacy(
+	ctx context.Context, userID int64, up readmodel.PrivacyUpdate,
+) (*readmodel.PrivacyView, error) {
+	if userID <= 0 {
+		return nil, fmt.Errorf("user_id 不合法: %w", shop.ErrUserNotFound)
+	}
+	if up.OptOutLogging == nil && up.OptOutAICorpus == nil {
+		return nil, fmt.Errorf("至少要指定一項隱私設定: %w", shop.ErrInvalidRequest)
+	}
+	row, err := s.q.UpsertUserPrivacy(ctx, db.UpsertUserPrivacyParams{
+		UserID:         userID,
+		OptOutLogging:  up.OptOutLogging,
+		OptOutAiCorpus: up.OptOutAICorpus,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// INSERT ... SELECT 選不到來源列 = 使用者不存在或已軟刪除。
+			return nil, fmt.Errorf("使用者 %d 不存在或已刪除: %w", userID, shop.ErrUserNotFound)
+		}
+		return nil, fmt.Errorf("更新使用者 %d 的隱私設定: %w", userID, err)
+	}
+	updated := row.UpdatedAt
+	return &readmodel.PrivacyView{
+		OptOutLogging:  row.OptOutLogging,
+		OptOutAICorpus: row.OptOutAiCorpus,
+		UpdatedAt:      &updated,
 	}, nil
 }
 

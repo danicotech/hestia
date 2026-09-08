@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/danicotech/hestia/internal/core/platform/notification"
 	"github.com/danicotech/hestia/internal/infrastructure/outbox"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/db"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/testdb"
@@ -318,5 +319,61 @@ func TestHandlerTimeout(t *testing.T) {
 	}
 	if s, attempts, _ := eventState(t, id); s != "pending" || attempts != 1 {
 		t.Fatalf("要 pending/1(走退避),得到 %s/%d", s, attempts)
+	}
+}
+
+// 排除清單:由別人負責投遞的 topic 不得被這個消費者認領
+// (否則找不到 handler → 退避重試 → 標 failed,公告會被燒掉)
+func TestExcludedTopicsAreNotClaimed(t *testing.T) {
+	setup(t)
+	ctx := context.Background()
+	mine := insertEvent(t, "t9.mine", `{}`)
+	theirs := insertEvent(t, "t9.theirs", `{}`)
+
+	c := outbox.NewConsumer(pool)
+	c.ExcludedTopics = []string{"t9.theirs"}
+	c.Handle("t9.mine", func(context.Context, string, []byte) error { return nil })
+
+	if n, err := c.ProcessOnce(ctx); err != nil || n != 1 {
+		t.Fatalf("只該處理自己的那筆,得到 (%d, %v)", n, err)
+	}
+	if s, _, _ := eventState(t, mine); s != "done" {
+		t.Fatalf("自己的事件應 done,得到 %s", s)
+	}
+	// 被排除的事件必須「原封不動」——不是 pending 但 attempts 被加過
+	s, attempts, retry := eventState(t, theirs)
+	if s != "pending" || attempts != 0 || retry != nil {
+		t.Fatalf("被排除的事件應原封不動,得到 %s/%d/%v", s, attempts, retry)
+	}
+	// 空清單(nil)必須回到「全部都歸我」——SQL 的 NULL 陷阱迴歸測試
+	c2 := outbox.NewConsumer(pool)
+	c2.Handle("t9.theirs", func(context.Context, string, []byte) error { return nil })
+	if n, err := c2.ProcessOnce(ctx); err != nil || n != 1 {
+		t.Fatalf("nil 排除清單應照常認領,得到 (%d, %v)", n, err)
+	}
+}
+
+// 閘道負責的 topic 不得被註冊 in-process handler——重複投遞不會報錯,
+// 只會讓使用者看到同一則公告兩次,所以必須在啟動組裝期就擋下來。
+func TestHandleRejectsGatewayTopic(t *testing.T) {
+	c := outbox.NewConsumer(nil)
+	defer func() {
+		if recover() == nil {
+			t.Fatal("註冊閘道 topic 應 panic,結果沒有")
+		}
+	}()
+	c.Handle(notification.DiscordTopics()[0], func(context.Context, string, []byte) error { return nil })
+}
+
+// 一般 topic 照常註冊,且 RegisteredTopics 如實回報(供啟動斷言用)
+func TestRegisteredTopics(t *testing.T) {
+	c := outbox.NewConsumer(nil)
+	c.Handle("t10.mine", func(context.Context, string, []byte) error { return nil })
+	got := c.RegisteredTopics()
+	if len(got) != 1 || got[0] != "t10.mine" {
+		t.Fatalf("RegisteredTopics = %v", got)
+	}
+	if err := notification.AssertNoOverlap(got); err != nil {
+		t.Fatalf("一般 topic 不該衝突: %v", err)
 	}
 }

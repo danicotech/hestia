@@ -79,6 +79,11 @@ var (
 )
 
 // Service 是 XP 的對外介面。M1 為 in-process 實作。
+//
+// 同 tx 綁定的變體 AwardInTx(ctx, tx, params) **刻意不在這個 interface 上**,
+// 只掛在具體的 xppg.Service —— 與 ledger.Ledger / ledgerpg.ApplyInTx 同一個理由:
+// interface 要保持可攜(未來的 HTTP/RPC 版沒有 pgx.Tx 可傳),而同 repo 需要
+// 「事實 + XP 同生共死」的呼叫端(activitylogpg)自己宣告最小介面依賴具體型別。
 type Service interface {
 	// Award 在單一 transaction 內完成:source 檢查 → 冷卻 → daily_cap 裁量
 	// → INSERT xp_events + 更新 user_xp 投影。

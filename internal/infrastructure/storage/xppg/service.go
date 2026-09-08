@@ -45,31 +45,95 @@ func (s *Service) Award(ctx context.Context, p xp.AwardParams) (*xp.AwardResult,
 		return nil, fmt.Errorf("開 transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	qtx := s.q.WithTx(tx)
 
+	res, wrote, err := s.run(ctx, s.q.WithTx(tx), p)
+	if err != nil {
+		return nil, err
+	}
+	if !wrote {
+		// 冷卻/cap 攔下:什麼都不留(連 EnsureUserXpRow 建的空列也回滾),
+		// defer 的 Rollback 負責 —— 被攔的嘗試不該在 DB 留下任何痕跡。
+		return res, nil
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit: %w", err)
+	}
+	return res, nil
+}
+
+// AwardInTx 在呼叫端持有的 tx 內入帳,語意與 Award 完全相同,差別只在
+// 「誰決定 commit」。給活動記錄那類「事實 + 彙總 + XP 必須同生共死」的呼叫端用
+// (activitylogpg):沒有它就只能「事實 commit 後另開 tx 發 XP」,中間掛掉會留下
+// 「事實在、XP 沒發」的窗口。
+//
+// 三個必須說清楚的性質:
+//
+//   - **原子性由呼叫端決定**:呼叫端 rollback,本次的 xp_events 與 user_xp 一併消失。
+//     照 ledgerpg.ApplyInTx 的既有範式。
+//   - **失敗用 savepoint 隔離**:source 不存在、cap 攔下等路徑只回滾 savepoint,
+//     不毒化呼叫端的 tx —— 呼叫端仍可自行決定要不要繼續(例如照樣記事實)。
+//   - **併發語意不變**:一樣鎖 user_xp 列、一樣用 DB 單一時鐘(LockUserXp 回傳的
+//     db_now)判冷卻。注意 savepoint rollback **不釋放已取得的 row lock**:
+//     本函式回來之後,呼叫端的 tx 仍持有該 user_xp 列的鎖直到 tx 結束,
+//     所以請盡快收尾,別拿著它做別的長工。
+//
+// 刻意放在具體 *Service 而非 xp.Service interface:interface 要保持可攜
+// (未來的 HTTP 版沒有 tx 可傳),同 repo 需要 tx 組合的呼叫端依賴具體型別
+// 或自己宣告最小介面(同 ledger.ApplyInTx 的理由)。
+func (s *Service) AwardInTx(ctx context.Context, tx pgx.Tx, p xp.AwardParams) (*xp.AwardResult, error) {
+	if err := validate(p); err != nil {
+		return nil, err
+	}
+	sp, err := tx.Begin(ctx) // pgx:巢狀 Begin = SAVEPOINT
+	if err != nil {
+		return nil, fmt.Errorf("開 savepoint: %w", err)
+	}
+	res, wrote, err := s.run(ctx, s.q.WithTx(sp), p)
+	if err != nil || !wrote {
+		// 沒入帳(冷卻/cap)也要回滾:與 Award 一致,不留 EnsureUserXpRow 的空列。
+		_ = sp.Rollback(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return res, nil
+	}
+	if err := sp.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("release savepoint: %w", err)
+	}
+	return res, nil
+}
+
+// run 是入帳核心,在給定的 query 執行環境(tx 或 savepoint)內完成
+// source 檢查 → ruleset → 鎖投影列 → 冷卻 → daily_cap → 寫事實 + 更新投影。
+//
+// wrote 回報「這次有沒有寫東西」:冷卻與 cap 攔下時是正常結果(不是錯誤),
+// 但呼叫端必須據此回滾,否則會留下 EnsureUserXpRow 建出來的空投影列。
+func (s *Service) run(
+	ctx context.Context, qtx *db.Queries, p xp.AwardParams,
+) (res *xp.AwardResult, wrote bool, err error) {
 	// ── 1. source 檢查:FK 也擋得住,但先查 registry 才能給可讀錯誤 ──
 	et, err := qtx.GetXpEventType(ctx, p.Source)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, fmt.Errorf("source %q: %w", p.Source, xp.ErrUnknownSource)
+		return nil, false, fmt.Errorf("source %q: %w", p.Source, xp.ErrUnknownSource)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("查 xp_event_types: %w", err)
+		return nil, false, fmt.Errorf("查 xp_event_types: %w", err)
 	}
 	if !et.Enabled {
-		return nil, fmt.Errorf("source %q: %w", p.Source, xp.ErrSourceDisabled)
+		return nil, false, fmt.Errorf("source %q: %w", p.Source, xp.ErrSourceDisabled)
 	}
 
 	// ── 2. 讀該社群的 ruleset config;沒有 ruleset(M1 可能)→ 安全預設 ──
 	raw, err := qtx.GetCommunityXpConfig(ctx, p.CommunityID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, fmt.Errorf("community %d 不存在: %w", p.CommunityID, xp.ErrInvalidParams)
+		return nil, false, fmt.Errorf("community %d 不存在: %w", p.CommunityID, xp.ErrInvalidParams)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("查 xp_rulesets.config: %w", err)
+		return nil, false, fmt.Errorf("查 xp_rulesets.config: %w", err)
 	}
 	cfg, err := xp.ParseConfig(raw)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	rule := cfg.Sources[p.Source] // 缺 key = 零值:無冷卻、無 cap
 
@@ -78,13 +142,13 @@ func (s *Service) Award(ctx context.Context, p xp.AwardParams) (*xp.AwardResult,
 	if err := qtx.EnsureUserXpRow(ctx, db.EnsureUserXpRowParams{
 		UserID: p.UserID, CommunityID: p.CommunityID,
 	}); err != nil {
-		return nil, fmt.Errorf("確保 user_xp 列: %w", err)
+		return nil, false, fmt.Errorf("確保 user_xp 列: %w", err)
 	}
 	row, err := qtx.LockUserXp(ctx, db.LockUserXpParams{
 		UserID: p.UserID, CommunityID: p.CommunityID,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("鎖 user_xp: %w", err)
+		return nil, false, fmt.Errorf("鎖 user_xp: %w", err)
 	}
 
 	// ── 4. 冷卻:計時器 = 該 source 自己最近一筆 xp_events(QA 中1)。
@@ -100,9 +164,9 @@ func (s *Service) Award(ctx context.Context, p xp.AwardParams) (*xp.AwardResult,
 		case errors.Is(err, pgx.ErrNoRows):
 			// 該 source 從未入帳 → 無冷卻
 		case err != nil:
-			return nil, fmt.Errorf("查冷卻計時: %w", err)
+			return nil, false, fmt.Errorf("查冷卻計時: %w", err)
 		case row.DbNow.Sub(lastAt) < time.Duration(rule.CooldownSeconds)*time.Second:
-			return &xp.AwardResult{OnCooldown: true, XP: row.Xp}, nil
+			return &xp.AwardResult{OnCooldown: true, XP: row.Xp}, false, nil
 		}
 	}
 
@@ -117,11 +181,11 @@ func (s *Service) Award(ctx context.Context, p xp.AwardParams) (*xp.AwardResult,
 			UserID: p.UserID, CommunityID: p.CommunityID, Source: p.Source,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("算當日累計: %w", err)
+			return nil, false, fmt.Errorf("算當日累計: %w", err)
 		}
 		remaining := rule.DailyCap - today
 		if remaining <= 0 {
-			return &xp.AwardResult{Capped: true, XP: row.Xp}, nil
+			return &xp.AwardResult{Capped: true, XP: row.Xp}, false, nil
 		}
 		if award > remaining {
 			award = remaining
@@ -138,19 +202,16 @@ func (s *Service) Award(ctx context.Context, p xp.AwardParams) (*xp.AwardResult,
 		Amount:      award,
 		RefID:       p.RefID,
 	}); err != nil {
-		return nil, fmt.Errorf("寫 xp_events: %w", err)
+		return nil, false, fmt.Errorf("寫 xp_events: %w", err)
 	}
 	newXP, err := qtx.AddUserXp(ctx, db.AddUserXpParams{
 		UserID: p.UserID, CommunityID: p.CommunityID, Xp: award,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("更新 user_xp: %w", err)
+		return nil, false, fmt.Errorf("更新 user_xp: %w", err)
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("commit: %w", err)
-	}
-	return &xp.AwardResult{Awarded: award, Capped: capped, XP: newXP}, nil
+	return &xp.AwardResult{Awarded: award, Capped: capped, XP: newXP}, true, nil
 }
 
 // Rebuild 從 xp_events 重算 user_xp(xp ← SUM、last_xp_at ← MAX(created_at))並覆寫。
