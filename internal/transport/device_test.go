@@ -3,6 +3,7 @@ package transport_test
 import (
 	"context"
 	"net/http"
+	"net/netip"
 	"strings"
 	"testing"
 
@@ -15,6 +16,17 @@ import (
 
 // 裝置足跡(sessions.user_agent / ip)的入口層責任:取值、清理、不外流。
 // 這兩個欄位只給裝置清單與稽核看,不參與任何判定。
+
+// loopbackProxies 是測試用的可信網段:httptest 監聽回送位址,
+// 所以對端一定是 127.0.0.1 或 ::1。
+func loopbackProxies(t *testing.T) []netip.Prefix {
+	t.Helper()
+	p, err := transport.ParseTrustedProxies("127.0.0.1,::1")
+	if err != nil {
+		t.Fatalf("ParseTrustedProxies: %v", err)
+	}
+	return p
+}
 
 // completeLogin 走一次成功的回呼,回傳 fake 收到的裝置資訊。
 func completeLogin(t *testing.T, deps transport.Deps, auth *fakeOAuth, headers map[string]string) transport.DeviceInfo {
@@ -80,10 +92,10 @@ func TestDeviceInfo_ForwardedHeaderIgnoredByDefault(t *testing.T) {
 	}
 }
 
-// 明確開啟後才採用最左值(前提是服務只接受可信代理的連線)。
+// 對端落在可信網段內時才採用最左值。
 func TestDeviceInfo_ForwardedHeaderHonoredWhenTrusted(t *testing.T) {
 	auth := &fakeOAuth{}
-	dev := completeLogin(t, transport.Deps{TrustProxyHeaders: true}, auth, map[string]string{
+	dev := completeLogin(t, transport.Deps{TrustedProxies: loopbackProxies(t)}, auth, map[string]string{
 		"X-Forwarded-For": "203.0.113.7, 70.41.3.18, 150.172.238.178",
 	})
 	if dev.IP != "203.0.113.7" {
@@ -94,7 +106,7 @@ func TestDeviceInfo_ForwardedHeaderHonoredWhenTrusted(t *testing.T) {
 // 開了信任但 header 是垃圾:退回連線對端,不把來路不明的字串寫進 DB。
 func TestDeviceInfo_GarbageForwardedFallsBackToPeer(t *testing.T) {
 	auth := &fakeOAuth{}
-	dev := completeLogin(t, transport.Deps{TrustProxyHeaders: true}, auth, map[string]string{
+	dev := completeLogin(t, transport.Deps{TrustedProxies: loopbackProxies(t)}, auth, map[string]string{
 		"X-Forwarded-For": "不是IP, 203.0.113.7",
 	})
 	if dev.IP != "127.0.0.1" && dev.IP != "::1" {
@@ -134,7 +146,7 @@ func TestDeviceInfo_RefreshSessionAlsoRecordsDevice(t *testing.T) {
 func TestDeviceInfo_NotAudited(t *testing.T) {
 	const ua = "Mozilla/5.0 (X11; TestOS) 稽核不該有我"
 	auth := &fakeOAuth{}
-	srv, sink := newServer(t, transport.Deps{Auth: auth, TrustProxyHeaders: true})
+	srv, sink := newServer(t, transport.Deps{Auth: auth, TrustedProxies: loopbackProxies(t)})
 	client := platformv1connect.NewAuthServiceClient(srv.Client(), srv.URL)
 	req := connect.NewRequest(&platformv1.CompleteDiscordLoginRequest{
 		Code: "oauth-code", State: oauthState,

@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"net/netip"
 	"strings"
 
 	"connectrpc.com/connect"
@@ -14,9 +15,9 @@ import (
 //
 // 認證攔截器對本服務整體豁免(publicProcedures),因為登入前本來就沒有 token。
 type authHandler struct {
-	svc        AuthService
-	cookie     stateCookieConfig
-	trustProxy bool
+	svc     AuthService
+	cookie  stateCookieConfig
+	trusted []netip.Prefix
 }
 
 func (h authHandler) StartDiscordLogin(
@@ -54,7 +55,7 @@ func (h authHandler) CompleteDiscordLogin(
 	if code == "" || state == "" {
 		return nil, clearCookieOnError(invalidArgument("code 與 state 必填"), clear)
 	}
-	dev := deviceInfo(req.Peer().Addr, req.Header(), h.trustProxy)
+	dev := deviceInfo(req.Peer().Addr, req.Header(), h.trusted)
 	session, profile, err := h.svc.CompleteDiscordLogin(ctx, code, state, fromCookie, dev)
 	if err != nil {
 		// 失敗也要清:一次性憑證留著只是多給一次重放機會。
@@ -78,7 +79,7 @@ func (h authHandler) RefreshSession(
 	if token == "" {
 		return nil, invalidArgument("refresh_token 必填")
 	}
-	session, err := h.svc.RefreshSession(ctx, token, deviceInfo(req.Peer().Addr, req.Header(), h.trustProxy))
+	session, err := h.svc.RefreshSession(ctx, token, deviceInfo(req.Peer().Addr, req.Header(), h.trusted))
 	if err != nil {
 		return nil, toConnectError(err)
 	}

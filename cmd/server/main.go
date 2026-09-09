@@ -69,6 +69,14 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("HESTIA_BASE_PATH: %w", err)
 	}
+	// 願意相信其轉發標頭的對端網段(見 transport.Deps.TrustedProxies)。
+	// 空 = 誰都不信,sessions.ip 一律記連線對端。服務放在 Cloudflare Tunnel
+	// 後面時對端永遠是 cloudflared,不設就等於每一列 session 都記同一個假 IP,
+	// 那個欄位形同不存在。
+	trustedProxies, err := transport.ParseTrustedProxies(os.Getenv("HESTIA_TRUSTED_PROXIES"))
+	if err != nil {
+		return fmt.Errorf("HESTIA_TRUSTED_PROXIES: %w", err)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -106,7 +114,8 @@ func run() error {
 		ServiceTokens: serviceTokens(),
 		// 入口層據此決定路由前綴與 cookie 的 Path(兩者必須一致,
 		// 不然登入看起來成功但每一支 RPC 都拿不到 cookie)。
-		BasePath: basePath,
+		BasePath:       basePath,
+		TrustedProxies: trustedProxies,
 	}
 
 	// ── 身分:Discord 憑證齊全才啟用。缺了就讓 AuthService 保持 Unimplemented,
@@ -171,7 +180,10 @@ func run() error {
 		errCh <- ignoreCanceled(runner.Run(ctx))
 	}()
 	go func() {
-		slog.Info("http 啟動", "addr", addr)
+		// 印出可信代理:設錯時 sessions.ip 會全部變成代理自己的位址,
+		// 那是幾個月後才會有人發現的壞法,啟動時就要看得到。
+		slog.Info("http 啟動", "addr", addr, "base_path", basePath,
+			"trusted_proxies", trustedProxies)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 			return

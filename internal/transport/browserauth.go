@@ -3,6 +3,7 @@ package transport
 import (
 	"errors"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"time"
@@ -69,10 +70,10 @@ var (
 
 // browserAuth 是四條瀏覽器路由的 handler。
 type browserAuth struct {
-	svc        AuthService
-	state      stateCookieConfig
-	session    sessionCookieConfig
-	trustProxy bool
+	svc     AuthService
+	state   stateCookieConfig
+	session sessionCookieConfig
+	trusted []netip.Prefix
 }
 
 // register 把路由掛上 mux。路徑是**相對於掛載前綴**的 ——
@@ -176,7 +177,7 @@ func (h browserAuth) callback(w http.ResponseWriter, r *http.Request) {
 	// cookie 讀不到就是空字串,**照樣往下送**:比對權威在 identity
 	// (它會回 ErrStateMismatch)。這裡沒有任何提前放行的分支。
 	fromCookie := stateFromCookie(r.Header)
-	dev := deviceInfo(r.RemoteAddr, r.Header, h.trustProxy)
+	dev := deviceInfo(r.RemoteAddr, r.Header, h.trusted)
 	session, _, err := h.svc.CompleteDiscordLogin(r.Context(), code, state, fromCookie, dev)
 	if err != nil {
 		h.failLogin(w, r, action, err)
@@ -225,7 +226,7 @@ func (h browserAuth) refresh(w http.ResponseWriter, r *http.Request) {
 		h.abort(w, r, http.StatusUnauthorized, action, reasonFor(ErrUnauthenticated))
 		return
 	}
-	session, err := h.svc.RefreshSession(r.Context(), token, deviceInfo(r.RemoteAddr, r.Header, h.trustProxy))
+	session, err := h.svc.RefreshSession(r.Context(), token, deviceInfo(r.RemoteAddr, r.Header, h.trusted))
 	if err != nil {
 		// 換發失敗代表這個瀏覽器手上的 refresh token 已經沒用了
 		// (過期、撤銷、重用偵測)。清掉兩個 cookie,讓下一次請求乾淨地

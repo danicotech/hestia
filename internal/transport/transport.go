@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"sort"
 	"strings"
 
@@ -85,12 +86,18 @@ type Deps struct {
 	// Unimplemented(不會靜默忽略——忽略等於把記錄寫到錯的人頭上)。
 	ActingUsers activitylog.ActorResolver
 
-	// TrustProxyHeaders 決定要不要用 X-Forwarded-For 當 session 的來源 IP。
+	// TrustedProxies 是「願意相信其轉發標頭」的對端網段(env
+	// HESTIA_TRUSTED_PROXIES,用 ParseTrustedProxies 解析)。落在清單內的
+	// 對端送來的 CF-Connecting-IP / X-Forwarded-For 才會被當成 session 的來源 IP。
 	//
-	// **預設 false**:XFF 是純請求標頭,誰都能填。只有在服務確定只接受
-	// 來自可信反向代理的連線時才開;開著卻直接暴露在外網,等於讓稽核紀錄裡的
-	// 來源 IP 變成攻擊者可自選的欄位。
-	TrustProxyHeaders bool
+	// **預設 nil = 誰都不信**,一律記連線對端位址。轉發標頭是純請求標頭,
+	// 誰都能填;用網段比對而不是一個布林開關,是因為開關在「服務同時接得到
+	// 代理與其他來源」時就破功了——那時來源 IP 變成攻擊者可自選的欄位,
+	// 而稽核紀錄裡一個能自選的來源比沒有更糟。
+	//
+	// 部署形狀(2026-09-09):cloudflared 在同一台機器上,對端是回送位址,
+	// 所以值是 127.0.0.1,::1。
+	TrustedProxies []netip.Prefix
 
 	// BasePath 是全部端點的掛載前綴(env HESTIA_BASE_PATH),例如 "/api"。
 	//
@@ -196,9 +203,9 @@ func New(deps Deps) (*Server, error) {
 
 	mux := http.NewServeMux()
 	mux.Handle(platformv1connect.NewAuthServiceHandler(authHandler{
-		svc:        deps.Auth,
-		cookie:     stateCookie,
-		trustProxy: deps.TrustProxyHeaders,
+		svc:     deps.Auth,
+		cookie:  stateCookie,
+		trusted: deps.TrustedProxies,
 	}, opts...))
 	mux.Handle(platformv1connect.NewMeServiceHandler(meHandler{
 		profiles: deps.Profiles, writer: deps.ProfileWrites, privacy: deps.Privacy,
@@ -220,10 +227,10 @@ func New(deps Deps) (*Server, error) {
 	// 授權後是把使用者的瀏覽器重導到 redirect_uri,那是一個普通的 GET,
 	// 沒有 Connect 的 header 也沒有 JSON body。少了這條路徑,登入走不完。
 	browserAuth{
-		svc:        deps.Auth,
-		state:      stateCookie,
-		session:    newSessionCookieConfig(basePath),
-		trustProxy: deps.TrustProxyHeaders,
+		svc:     deps.Auth,
+		state:   stateCookie,
+		session: newSessionCookieConfig(basePath),
+		trusted: deps.TrustedProxies,
 	}.register(mux)
 
 	// 由外而內:稽核(看得到前綴外的探測流量)→ 剝前綴 → connect mux。
