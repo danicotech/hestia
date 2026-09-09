@@ -80,5 +80,8 @@ func toSessionView(s *identity.Session) *transport.SessionView {
 		RefreshToken:          s.RefreshToken,
 		RefreshTokenExpiresAt: s.ExpiresAt,
 		UserPublicID:          s.UserPublicID,
+		// 登入時帶進 state 的站內相對路徑。瀏覽器回呼路由靠它把人送回原本
+		// 那一頁;不轉過去的話,每次登入都只能落在首頁。
+		Redirect: s.Redirect,
 	}
 }

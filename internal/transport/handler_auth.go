@@ -88,17 +88,22 @@ func (h authHandler) RefreshSession(
 }
 
 // Logout 兩種用法:帶 refresh_token 撤銷指定 session;不帶則撤銷
-// Authorization header 對應的當前 session(所以要讀 header)。
+// 請求所帶憑證對應的當前 session(所以要讀 header / cookie)。
+//
+// 取憑證用 userCredential 而不是只讀 Authorization:瀏覽器的 session 在
+// HttpOnly cookie 裡(前端讀不到,填不進 body),只讀 header 會讓網頁端
+// 除了專用的 POST {base}/auth/logout 之外沒有第二條登出路徑。
+// 順序仍是 Bearer 優先,與攔截器同一條規則。
 func (h authHandler) Logout(
 	ctx context.Context, req *connect.Request[platformv1.LogoutRequest],
 ) (*connect.Response[platformv1.LogoutResponse], error) {
 	if h.svc == nil {
 		return nil, unimplemented("AuthService.Logout")
 	}
-	accessToken, _ := bearerToken(req.Header().Get("Authorization"))
+	accessToken, _ := userCredential(req.Header())
 	refreshToken := strings.TrimSpace(req.Msg.GetRefreshToken())
 	if accessToken == "" && refreshToken == "" {
-		return nil, invalidArgument("需要 Authorization: Bearer 或 refresh_token 其一")
+		return nil, invalidArgument("需要 Authorization: Bearer、access_token cookie 或 refresh_token 其一")
 	}
 	if err := h.svc.Logout(ctx, accessToken, refreshToken); err != nil {
 		return nil, toConnectError(err)

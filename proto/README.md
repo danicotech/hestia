@@ -154,6 +154,9 @@ catch (e) {
 | `provider_exchange_failed` | unavailable | 與 Discord 交換憑證失敗,稍後重試 |
 | `account_deleted` | permission_denied | 帳號已註銷 |
 | `identity_invalid_config` | internal | 身分服務設定有問題 |
+| `oauth_denied` | permission_denied | 使用者在 Discord 授權頁按了取消 → **不是錯誤**,顯示「你取消了登入」 |
+| `oauth_callback_invalid` | invalid_argument | 回呼缺 `code` 或 `state`(不是我們發出去的那個流程) |
+| `login_failed` | internal | 登入失敗且成因不對外分類(未映射錯誤在導回網址上的統一代表) |
 | `notification_invalid_request` | invalid_argument | 通知拉取/確認的參數不合法 |
 | `mixed_credentials` | permission_denied | 同時帶了服務憑證與使用者憑證 |
 | `service_on_user_rpc` | permission_denied | 這支使用者 RPC 不接受代打(契約上就不行,換憑證也沒用) |

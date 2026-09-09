@@ -92,12 +92,25 @@ type Deps struct {
 	// 來源 IP 變成攻擊者可自選的欄位。
 	TrustProxyHeaders bool
 
-	// StateCookiePath 是 OAuth state cookie 的 Path;空 = "/"。
+	// BasePath 是全部端點的掛載前綴(env HESTIA_BASE_PATH),例如 "/api"。
+	//
+	// **空字串 = 掛在根,行為與沒有這個欄位時完全相同**;沒設前綴的部署
+	// 連一層包裝都不會多(見 mountAt)。
+	//
+	// 部署形狀(2026-09-09):前端 https://arena.gengflow.com/、後端在同一個
+	// host 的 /api 底下。同源,所以 session cookie 不跨網域、SameSite=Lax 有效。
+	//
+	// 它同時決定 cookie 的 Path(見 sessioncookie.go / statecookie.go)。
+	// 格式不合法會讓 New 回錯 —— 前綴寫錯的後果是整個 API 掛在錯的位置,
+	// 而那在測試環境很可能只看起來像 404。
+	BasePath string
+
+	// StateCookiePath 明確指定 OAuth state cookie 的 Path,覆蓋 BasePath 的推導。
 	//
 	// 為什麼預設不是 "/auth":ConnectRPC 的路徑是 procedure 全名
 	// (/hestia.platform.v1.AuthService/CompleteDiscordLogin),設成 /auth
 	// 會讓瀏覽器不把 cookie 送到回呼那支 RPC,登入流程靜默失敗。
-	// 要收窄請填服務實際掛載的前綴。
+	// 空 = 用 BasePath;BasePath 也空 = "/"。
 	StateCookiePath string
 
 	// Logger 用於攔截器的告警(panic、稽核佇列滿、寫入失敗);nil = slog.Default()。
@@ -139,6 +152,18 @@ func New(deps Deps) (*Server, error) {
 	if err := verifyProcedureCoverage(); err != nil {
 		return nil, err
 	}
+	// 掛載前綴的設定錯誤在這裡就炸。前綴寫錯不會有任何徵兆 ——
+	// 端點只是全部搬到別的位置,在測試環境看起來像 404。
+	//
+	// 注意前綴**不影響**上面那道存取層級斷言,也不影響攔截器的清單比對:
+	// 兩者的判準是 proto descriptor 與 connect 的 Spec().Procedure(生成碼
+	// 裡的常數),與 URL 無關;前綴在進 connect mux 之前就被剝掉了。
+	// 那是刻意的性質,不是巧合 —— 若哪天 procedure 改成從 URL 解析,
+	// 所有清單比對都會落空,而那個方向是 fail open。
+	basePath, err := NormalizeBasePath(deps.BasePath)
+	if err != nil {
+		return nil, fmt.Errorf("掛載前綴(HESTIA_BASE_PATH)不合法:%w", err)
+	}
 	// 服務憑證的設定錯誤在這裡就炸(太短、重複、沒名字)——
 	// 一把不合格的 token 悄悄生效,比服務啟動失敗嚴重得多。
 	verifier, err := newServiceVerifier(deps.ServiceTokens)
@@ -167,10 +192,12 @@ func New(deps Deps) (*Server, error) {
 		connect.WithReadMaxBytes(maxRequestBytes),
 	}
 
+	stateCookie := newStateCookieConfig(deps.StateCookiePath, basePath)
+
 	mux := http.NewServeMux()
 	mux.Handle(platformv1connect.NewAuthServiceHandler(authHandler{
 		svc:        deps.Auth,
-		cookie:     newStateCookieConfig(deps.StateCookiePath),
+		cookie:     stateCookie,
 		trustProxy: deps.TrustProxyHeaders,
 	}, opts...))
 	mux.Handle(platformv1connect.NewMeServiceHandler(meHandler{
@@ -189,7 +216,19 @@ func New(deps Deps) (*Server, error) {
 	mux.Handle(platformv1connect.NewNotificationServiceHandler(
 		notificationHandler{src: deps.Announcements}, opts...))
 
-	return &Server{handler: auditHTTP(mux, queue, log), audit: queue}, nil
+	// 瀏覽器用的登入路由(browserauth.go)。它們**不是** RPC:Discord 完成
+	// 授權後是把使用者的瀏覽器重導到 redirect_uri,那是一個普通的 GET,
+	// 沒有 Connect 的 header 也沒有 JSON body。少了這條路徑,登入走不完。
+	browserAuth{
+		svc:        deps.Auth,
+		state:      stateCookie,
+		session:    newSessionCookieConfig(basePath),
+		trustProxy: deps.TrustProxyHeaders,
+	}.register(mux)
+
+	// 由外而內:稽核(看得到前綴外的探測流量)→ 剝前綴 → connect mux。
+	// 順序不能反,理由見 auditHTTP 與 mountAt 的說明。
+	return &Server{handler: auditHTTP(mountAt(basePath, mux), queue, log, basePath), audit: queue}, nil
 }
 
 // verifyProcedureCoverage 在啟動時用 proto descriptor 反查,確認每個 RPC 的

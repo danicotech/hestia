@@ -94,6 +94,11 @@ func TestToConnectError(t *testing.T) {
 		{errActingUserFormat, connect.CodeInvalidArgument},
 		{errActingUserProvider, connect.CodeInvalidArgument},
 
+		// 瀏覽器登入流程:錯誤碼會進導回網址,所以與 RPC 共用同一張表。
+		{errOAuthDenied, connect.CodePermissionDenied},
+		{errOAuthCallbackInvalid, connect.CodeInvalidArgument},
+		{errLoginFailed, connect.CodeInternal},
+
 		{ErrNotFound, connect.CodeNotFound},
 		{ErrUnauthenticated, connect.CodeUnauthenticated},
 		{ErrPermissionDenied, connect.CodePermissionDenied},

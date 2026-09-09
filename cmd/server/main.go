@@ -58,6 +58,17 @@ func run() error {
 	if addr == "" {
 		addr = ":8080"
 	}
+	// 掛載前綴。空 = 掛在根(預設,行為與加這個功能之前完全相同);
+	// 正式部署設 "/api" —— 前端在 https://arena.gengflow.com/,後端在同一個
+	// host 的 /api 底下,同源所以 session cookie 不跨網域。
+	//
+	// 這裡就正規化並在不合法時直接回錯:前綴寫錯不會有任何徵兆,
+	// 端點只是全部搬到別的位置,在測試環境看起來像 404。
+	// 正規化後的形狀是唯一的("" 或 "/xxx"),下面才能無條件字串相接。
+	basePath, err := transport.NormalizeBasePath(os.Getenv("HESTIA_BASE_PATH"))
+	if err != nil {
+		return fmt.Errorf("HESTIA_BASE_PATH: %w", err)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -93,6 +104,9 @@ func run() error {
 		ActingUsers:   activity,
 		Announcements: notificationpg.New(pool, notifyOpts()...),
 		ServiceTokens: serviceTokens(),
+		// 入口層據此決定路由前綴與 cookie 的 Path(兩者必須一致,
+		// 不然登入看起來成功但每一支 RPC 都拿不到 cookie)。
+		BasePath: basePath,
 	}
 
 	// ── 身分:Discord 憑證齊全才啟用。缺了就讓 AuthService 保持 Unimplemented,
@@ -129,15 +143,20 @@ func run() error {
 	maintenance.RegisterDefaults(runner, pool)
 	runner.Register("entitlement_reaper", time.Minute, reaper.New(pool).Reap)
 
+	// 全部端點掛在同一個前綴底下:healthz、ConnectRPC、瀏覽器登入路由。
+	// basePath 為空時這兩行就是 "GET /healthz" 與 "/",與從前一字不差。
+	//
+	// srv 自己會把前綴剝掉再交給 connect mux(transport.mountAt),
+	// 所以 procedure 路徑與存取層級斷言完全不受前綴影響。
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET "+basePath+"/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if err := pool.Ping(r.Context()); err != nil {
 			http.Error(w, "db: "+err.Error(), http.StatusServiceUnavailable)
 			return
 		}
 		_, _ = w.Write([]byte("ok"))
 	})
-	mux.Handle("/", srv)
+	mux.Handle(basePath+"/", srv)
 	httpSrv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 
 	// 三個背景元件各送一次 errCh。任何一個結束——不論 error 或 nil

@@ -28,7 +28,12 @@ const headerRequestID = "X-Request-Id"
 //
 // 注意:這一層拿不到 OTel span(span 由內層的 otelconnect 建立),
 // 所以補記的列 trace_id 為空;要看細節去 Grafana 用 request_id 撈。
-func auditHTTP(next http.Handler, queue *auditQueue, log *slog.Logger) http.Handler {
+//
+// basePath 是掛載前綴(可為空)。這一層刻意包在**剝掉前綴之前**:
+// 前綴外的探測流量(/wp-login.php、/.env)才留得下紀錄 —— 那正是最該留痕的
+// 流量,而剝前綴的那層對它們只會回 404 就沒了。代價是 r.URL.Path 帶著前綴,
+// 所以 auditAction 自己要把它拿掉(action 必須是 procedure 全名)。
+func auditHTTP(next http.Handler, queue *auditQueue, log *slog.Logger, basePath string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id, err := ulid.New()
 		if err != nil {
@@ -47,7 +52,7 @@ func auditHTTP(next http.Handler, queue *auditQueue, log *slog.Logger) http.Hand
 			if queue == nil || st.alreadyLogged() {
 				return
 			}
-			queue.submit(fallbackRecord(r, st, rec.status, elapsedMS(start)))
+			queue.submit(fallbackRecord(r, st, rec.status, elapsedMS(start), basePath))
 		}()
 		next.ServeHTTP(rec, r.WithContext(withState(r.Context(), st)))
 	})
@@ -55,15 +60,26 @@ func auditHTTP(next http.Handler, queue *auditQueue, log *slog.Logger) http.Hand
 
 // fallbackRecord 組出「沒進到 RPC 層」的那一列。
 // request 摘要一律 nil:請求體沒解出來(或根本不該解),沒有可信的白名單內容。
-func fallbackRecord(r *http.Request, st *callState, status int, latency int32) eventlog.Record {
+//
+// handler 留了說明(瀏覽器登入路由,見 callState.setAudit)就以它為準:
+// 那三個欄位是 handler **知道**的事實,HTTP 狀態碼只是它的投影 ——
+// 登入失敗導回前端用的是 302,光看狀態碼會把它記成成功。
+func fallbackRecord(r *http.Request, st *callState, status int, latency int32, basePath string) eventlog.Record {
 	channel, kind := channelKindFromContentType(r.Header.Get("Content-Type"))
-	code := codeFromHTTPStatus(status)
+	action, noteStatus, noteCode := st.auditNote()
+	if action == "" {
+		action = auditAction(r.URL.Path, basePath)
+	}
+	code := noteCode
+	if noteStatus == "" {
+		noteStatus, code = statusFromHTTP(status), codeFromHTTPStatus(status)
+	}
 	out := eventlog.Record{
 		RequestID: st.requestID,
 		Channel:   channel,
 		Kind:      kind,
-		Action:    auditAction(r.URL.Path),
-		Status:    statusFromHTTP(status),
+		Action:    action,
+		Status:    noteStatus,
 		LatencyMS: latency,
 		Response:  marshalSummary(map[string]any{"http_status": status}),
 	}
@@ -86,19 +102,24 @@ const unknownAction = "(non-rpc path)"
 // 的上限,但補記走的是另一條路,不受那條規則管 —— 實測 4001 字元直接落地,
 // 同一個威脅模型只擋了一半。
 //
-// 兩段處理,順序有意義:
+// 三段處理,順序有意義:
 //
+//   - **先剝掉掛載前綴。** action 記的必須是 procedure 全名
+//     (/hestia.platform.v1.X/Y),而不是 /api/hestia.platform.v1.X/Y ——
+//     前綴是部署細節,讓它進資料表會使同一支 RPC 在不同部署下長成兩個值
+//     (專案第 9 條)。剝不掉(路徑根本不在前綴底下)就是探測流量。
 //   - **不是 /hestia. 開頭的一律換成固定字串。** 這一層包住的是 connect mux,
 //     真正的 RPC 路徑一定是 procedure 全名;其餘全是探測流量,把它們的路徑
 //     原樣存下來對查稽核毫無幫助,卻是最省力的寫入管道。要看實際打了什麼,
 //     用 request_id 去 log 撈 —— log 不是要保留 180 天的資料表。
 //   - **是我們的 RPC 才留,而且照樣截斷。** 合法的 procedure 遠短於上限,
 //     會撞到截斷的只有「前綴對但後面接一長串」的變形攻擊。
-func auditAction(path string) string {
-	if !strings.HasPrefix(path, "/"+string(protoPackage)+".") {
+func auditAction(path, basePath string) string {
+	rest, ok := stripBasePath(path, basePath)
+	if !ok || !strings.HasPrefix(rest, "/"+string(protoPackage)+".") {
 		return unknownAction
 	}
-	action, _ := truncateUTF8(path, summaryMaxStringBytes)
+	action, _ := truncateUTF8(rest, summaryMaxStringBytes)
 	return action
 }
 

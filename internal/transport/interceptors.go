@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"runtime/debug"
 	"strings"
 
@@ -213,8 +214,8 @@ func allowsDelegation(procedure string, entry *serviceEntry) bool {
 
 // authInterceptor 決定「這次呼叫是誰」。兩條互斥的路徑:
 //
-//	X-Service-Token   → 服務身分 + X-Acting-User 解出的行為主體
-//	Authorization     → 使用者身分(Bearer → 內部 user id)
+//	X-Service-Token          → 服務身分 + X-Acting-User 解出的行為主體
+//	Authorization / cookie   → 使用者身分(access token → 內部 user id)
 //
 // 兩者同時出現 = 拒絕。不做「擇一採用」的猜測:猜測邏輯正是提權漏洞的來源。
 func authInterceptor(
@@ -224,10 +225,10 @@ func authInterceptor(
 		return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
 			procedure := req.Spec().Procedure
 			serviceToken := req.Header().Get(headerServiceToken)
-			bearer, hasBearer := bearerToken(req.Header().Get("Authorization"))
+			token, hasUser := userCredential(req.Header())
 
 			if serviceToken != "" {
-				if err := authenticateService(ctx, req, procedure, verifier, actors, hasBearer); err != nil {
+				if err := authenticateService(ctx, req, procedure, verifier, actors, hasUser); err != nil {
 					return nil, err
 				}
 				return next(ctx, req)
@@ -236,10 +237,10 @@ func authInterceptor(
 			if _, ok := publicProcedures[procedure]; ok {
 				return next(ctx, req)
 			}
-			if !hasBearer {
+			if !hasUser {
 				return nil, toConnectError(ErrUnauthenticated)
 			}
-			userID, err := auth.Authenticate(ctx, bearer)
+			userID, err := auth.Authenticate(ctx, token)
 			if err != nil {
 				return nil, toConnectError(err)
 			}
@@ -272,7 +273,9 @@ func authInterceptor(
 
 var (
 	// errMixedCredentials:同時帶服務與使用者憑證。拒絕而不是擇一。
-	errMixedCredentials = errors.New("不可同時提供 " + headerServiceToken + " 與 Authorization")
+	// 使用者憑證含 Authorization: Bearer 與 access_token cookie 兩種形態。
+	errMixedCredentials = errors.New(
+		"不可同時提供 " + headerServiceToken + " 與使用者憑證(Authorization / " + accessCookieName + " cookie)")
 	// errServiceOnUserRPC:服務身分打到**不在代打白名單**的使用者 RPC。
 	// 「代表某人」不等於「就是某人」:能代打哪幾支是逐條決定的
 	// (delegatedProcedures),沒列到的一律拒絕。
@@ -303,9 +306,11 @@ var (
 // allowsDelegation 為真時發生 —— 白名單外的使用者 RPC 在更前面就被擋掉了。
 func authenticateService(
 	ctx context.Context, req connect.AnyRequest, procedure string,
-	verifier *serviceVerifier, actors activitylog.ActorResolver, hasBearer bool,
+	verifier *serviceVerifier, actors activitylog.ActorResolver, hasUserCred bool,
 ) error {
-	if hasBearer {
+	// hasUserCred 含 Bearer 與 access_token cookie 兩種來源(userCredential):
+	// 「使用者憑證」是一個概念,不因為它躺在哪個 header 而變成兩件事。
+	if hasUserCred {
 		return connectError(connect.CodePermissionDenied, errMixedCredentials)
 	}
 	entry, ok := verifier.verify(req.Header().Get(headerServiceToken))
@@ -404,6 +409,42 @@ func authenticateService(
 		}
 	}
 	return nil
+}
+
+// userCredential 取出這次請求的**使用者**憑證,兩個來源、順序固定:
+//
+//  1. Authorization: Bearer   程式呼叫端(stentor、CLI、測試)
+//  2. access_token cookie     瀏覽器(HttpOnly,JS 讀不到)
+//
+// ## 順序不可反
+//
+// Bearer 是呼叫端**明確**附上的憑證,cookie 是瀏覽器自動帶的。一個帶了
+// Bearer 的請求,意圖已經寫得清清楚楚;讓一個恰好還留在瀏覽器裡的舊 cookie
+// 蓋掉它,就是「請求以另一個身分執行」——而且沒有任何徵兆。
+// 反過來(先 Bearer 再 cookie)則沒有這個問題:cookie 只在完全沒有 Bearer
+// 時才被看見。
+//
+// ## 兩者都沒有時行為完全不變
+//
+// 回 ("", false),與加這條路徑之前一模一樣 —— Unauthenticated。
+//
+// ## 接受 cookie 就等於啟用 cookie 認證,CSRF 因此成為真的威脅
+//
+// 防線是 cookie 自己的 SameSite=Lax(見 sessioncookie.go):跨站的 POST /
+// fetch 不會帶這個 cookie,而本服務所有 ConnectRPC 都是 POST。於是跨站送來的
+// 請求在這裡拿到的就是 ("", false) —— 與「沒有憑證」完全同一條路。
+//
+// ## cookie 也算「使用者憑證」,混合憑證的判定一併適用
+//
+// 帶著 X-Service-Token 又帶著 access_token cookie 的請求會被拒絕,與帶
+// Bearer 時相同。服務呼叫方(stentor)是伺服器,不會有我們的 cookie;
+// 真的同時出現只可能是有人在試探,而「擇一採用」的猜測正是提權漏洞的來源。
+func userCredential(header http.Header) (string, bool) {
+	if token, ok := bearerToken(header.Get("Authorization")); ok {
+		return token, true
+	}
+	token := cookieValue(header, accessCookieName)
+	return token, token != ""
 }
 
 // bearerToken 解析 "Bearer <token>";大小寫不敏感(RFC 7235 的 scheme 不分大小寫)。

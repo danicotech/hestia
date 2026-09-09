@@ -50,6 +50,38 @@ type callState struct {
 	delegated bool
 	// spaceID 是 handler 解析出的來源空間,寫進 event_logs.space_id。
 	spaceID int64
+
+	// ── 非 RPC handler 的稽核說明(瀏覽器登入路由)──
+	//
+	// 為什麼需要:瀏覽器路由不經過 connect 的攔截器,只會被最外層的
+	// auditHTTP 補記一列,而那一列預設只看得到 URL 與 HTTP 狀態碼。
+	// 兩者對登入都不誠實:
+	//
+	//   - action 會變成 "/auth/discord/callback",與同一件事的 RPC 版本
+	//     (/hestia.platform.v1.AuthService/CompleteDiscordLogin)是兩個值。
+	//     同一個概念在稽核表上有兩種寫法,查詢就得寫兩份(專案第 9 條)。
+	//   - status 會是 ok —— 登入失敗導回前端用的是 302,而 302 不是錯誤碼。
+	//     稽核表上「全部登入都成功」是最糟的一種說謊。
+	//
+	// 所以由 handler 明確說明結果,三個欄位一起給(理由同 setActing:
+	// 只設一半的組合正是稽核說謊的來源)。
+	auditAction string
+	auditStatus string
+	auditCode   string
+}
+
+// setAudit 讓非 RPC handler 明確說明這一列該記什麼。
+func (s *callState) setAudit(action, status, errorCode string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.auditAction, s.auditStatus, s.auditCode = action, status, errorCode
+}
+
+// auditNote 取回 handler 的說明;沒設過就三個都是空字串,由補記那層決定。
+func (s *callState) auditNote() (action, status, errorCode string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.auditAction, s.auditStatus, s.auditCode
 }
 
 func (s *callState) setUserID(id int64) {
@@ -257,6 +289,14 @@ func requireActingUser(ctx context.Context) (int64, error) {
 		return 0, toConnectError(ErrUnauthenticated)
 	}
 	return id, nil
+}
+
+// noteAudit 是瀏覽器路由留下稽核說明的統一入口(見 callState.setAudit)。
+// 不在請求情境時靜靜略過 —— 稽核不能反過來弄壞業務。
+func noteAudit(ctx context.Context, action, status, errorCode string) {
+	if st := stateFrom(ctx); st != nil {
+		st.setAudit(action, status, errorCode)
+	}
 }
 
 // noteSpace 把 handler 解出的來源空間記進便條,供 event_logs.space_id 使用。

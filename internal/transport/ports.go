@@ -149,6 +149,19 @@ type SessionView struct {
 	RefreshToken          string
 	RefreshTokenExpiresAt time.Time
 	UserPublicID          string
+
+	// Redirect 是 StartLogin 當時帶進 state 的**站內相對路徑**,
+	// 供瀏覽器回呼路由(browserauth.go)決定登入後把人送回哪一頁。
+	//
+	// 為什麼由這裡帶出來而不是入口層自己解 state:redirect 存在簽章過的
+	// state 裡,而 state 的格式與金鑰都屬於 identity。入口層若自己拆
+	// token 取值,就等於把那個格式複製了一份(專案第 9 條),
+	// 而且是複製在一個**沒有金鑰、驗不了簽章**的地方。
+	//
+	// 空字串是合法的(實作沒填、或使用者沒指定):呼叫端退回站台根目錄。
+	// 值仍會在消費點再過一次 identity.CleanRedirect —— open redirect 的
+	// 防線不依賴任何其他程式碼的正確性。
+	Redirect string
 }
 
 // DeviceInfo 是發 session 當下的裝置足跡,寫進 sessions.user_agent / ip。

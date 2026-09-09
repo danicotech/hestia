@@ -39,11 +39,25 @@ type stateCookieConfig struct {
 	path string
 }
 
-func newStateCookieConfig(path string) stateCookieConfig {
-	if path == "" {
-		path = defaultStateCookiePath
+// newStateCookieConfig 決定 state cookie 的 Path,優先序是:
+//
+//	Deps.StateCookiePath  明確指定(最權威,呼叫端知道自己在做什麼)
+//	掛載前綴              服務實際掛在哪就發到哪(/api → Path=/api)
+//	"/"                   掛在根時的唯一正確答案
+//
+// 為什麼前綴要參與:這個 cookie 必須同時送達兩個回呼入口 ——
+// 瀏覽器路由 {base}/auth/discord/callback 與 ConnectRPC 的
+// {base}/hestia.platform.v1.AuthService/CompleteDiscordLogin。
+// 兩者只在 {base} 這一層有共同祖先,所以 Path 就是 {base},不能再窄。
+func newStateCookieConfig(explicit, basePath string) stateCookieConfig {
+	switch {
+	case explicit != "":
+		return stateCookieConfig{path: explicit}
+	case basePath != "":
+		return stateCookieConfig{path: basePath}
+	default:
+		return stateCookieConfig{path: defaultStateCookiePath}
 	}
-	return stateCookieConfig{path: path}
 }
 
 // issue 產生「種下 state」的 cookie。
@@ -82,12 +96,7 @@ func (c stateCookieConfig) clear() *http.Cookie {
 // 讀不到就回空字串,**不做任何提前放行**——空值照樣往下送,
 // 由 identity 判定(它會回 ErrStateMismatch)。
 func stateFromCookie(header http.Header) string {
-	r := http.Request{Header: header}
-	c, err := r.Cookie(stateCookieName)
-	if err != nil || c == nil {
-		return ""
-	}
-	return c.Value
+	return cookieValue(header, stateCookieName)
 }
 
 // setCookie 把 Set-Cookie 掛到成功的回應上。

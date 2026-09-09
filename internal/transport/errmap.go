@@ -150,6 +150,19 @@ var errorCodes = []struct {
 	{errActingUserFormat, connect.CodeInvalidArgument, "acting_user_format"},
 	{errActingUserProvider, connect.CodeInvalidArgument, "acting_user_provider_unsupported"},
 
+	// ── 瀏覽器登入流程(browserauth.go)────────────────────────────
+	// 這三個**必須**在這張表上,不能自成一套字串:回呼失敗時錯誤碼會進
+	// 導回網址(/?login_error=<reason>),前端要用它挑文案。前端不該為了
+	// 「從 RPC 回來的」與「從網址回來的」維護兩份錯誤字典 —— 那正是
+	// 專案第 9 條要避免的重複。
+	//
+	// 三者都刻意**不帶任何外部輸入**:回呼的 query 全都是攻擊者可自由控制的
+	// 字串(那個 URL 誰都能組),把 provider 回的 error 原樣塞進導回網址
+	// 等於開一條反射式注入通道。值域封閉,對不上的一律折成 login_failed。
+	{errOAuthDenied, connect.CodePermissionDenied, "oauth_denied"},
+	{errOAuthCallbackInvalid, connect.CodeInvalidArgument, "oauth_callback_invalid"},
+	{errLoginFailed, connect.CodeInternal, "login_failed"},
+
 	// ── 入口層自己的 port 錯誤 ──────────────────────────────────
 	{ErrNotFound, connect.CodeNotFound, "not_found"},
 	{ErrUnauthenticated, connect.CodeUnauthenticated, "unauthenticated"},
