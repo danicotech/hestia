@@ -185,8 +185,14 @@ func run() error {
 	return runErr
 }
 
-// buildIdentity 在 Discord 憑證齊全時建立身分服務;完全沒設定時回 (nil, nil, nil)。
-// 設定「一半」視為錯誤——半套的登入設定只會在使用者按下登入時才炸,不如啟動就講。
+// buildIdentity 在 Discord 憑證齊全時建立身分服務;沒有 Discord 憑證時回 (nil, nil, nil)。
+//
+// 「是否啟用登入」只由 **Discord 三個憑證**決定,不把平台密鑰算進去:
+// PLATFORM_JWT_SECRET / _TOKEN_ENC_KEY 是平台自己的金鑰,先產生放著是正常的,
+// 不該因為「密鑰有了但還沒去申請 Discord 應用程式」就讓整個服務起不來
+// (那會擋住「先把服務跑起來看資料表」這種完全合理的事)。
+//
+// 但 Discord 三個之間仍是全有全無:半套的登入設定只會在使用者按下登入時才炸。
 func buildIdentity(pool *pgxpool.Pool, led *ledgerpg.Service) (identity.Service, *identity.Signer, error) {
 	cfg := identitypg.Config{
 		ClientID:     os.Getenv("PLATFORM_DISCORD_CLIENT_ID"),
@@ -196,18 +202,24 @@ func buildIdentity(pool *pgxpool.Pool, led *ledgerpg.Service) (identity.Service,
 	}
 	secret := os.Getenv("PLATFORM_JWT_SECRET")
 
-	set := 0
-	for _, v := range []string{cfg.ClientID, cfg.ClientSecret, cfg.RedirectURI, string(cfg.TokenEncKey), secret} {
+	discordSet := 0
+	for _, v := range []string{cfg.ClientID, cfg.ClientSecret, cfg.RedirectURI} {
 		if v != "" {
-			set++
+			discordSet++
 		}
 	}
-	switch set {
+	switch discordSet {
 	case 0:
-		return nil, nil, nil
-	case 5:
+		return nil, nil, nil // 還沒申請 Discord 應用程式:登入停用,其餘照跑
+	case 3:
 	default:
-		return nil, nil, errors.New("身分服務的 5 個環境變數必須全部設定或全部不設定(見 .env.example)")
+		return nil, nil, errors.New(
+			"PLATFORM_DISCORD_CLIENT_ID / _SECRET / _REDIRECT_URI 必須全部設定或全部不設定")
+	}
+	// 到這裡代表要啟用登入,平台密鑰就成了必要條件
+	if secret == "" || len(cfg.TokenEncKey) == 0 {
+		return nil, nil, errors.New(
+			"啟用 Discord 登入還需要 PLATFORM_JWT_SECRET 與 PLATFORM_TOKEN_ENC_KEY")
 	}
 
 	signer, err := identity.NewSigner([]byte(secret))
