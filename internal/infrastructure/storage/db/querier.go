@@ -91,7 +91,17 @@ type Querier interface {
 	// per_user_limit 的計數口徑(schemas/08):未撤銷的 entitlements + 非 cancelled/rejected
 	// 的 redemptions。退款(撤銷)與被拒/取消的工單釋放額度。
 	CountUserItemAcquisitions(ctx context.Context, arg CountUserItemAcquisitionsParams) (int64, error)
+	// 社群與空間的管理端查詢(cmd/admin)。
+	//
+	// 為什麼這幾支不在 activitylog.sql:那支是**執行期**的讀取路徑
+	// (guild → space,每則訊息都會走)。這裡是管理端的建立與列出,
+	// 頻率、權限、失敗後果都不同,混在一起會讓「哪些查詢在熱路徑上」看不出來。
+	//
+	// 目前唯一的呼叫端是 CLI。之後補管理 RPC 時直接複用這些查詢,
+	// 不要另外寫一份近義的 SQL(專案第 9 條)。
+	CreateCommunity(ctx context.Context, arg CreateCommunityParams) (CreateCommunityRow, error)
 	CreateIdentity(ctx context.Context, arg CreateIdentityParams) (PlatformIdentity, error)
+	CreateSpace(ctx context.Context, arg CreateSpaceParams) (CreateSpaceRow, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (PlatformUser, error)
 	// ══ 訊息舊版本 ══
 	// 刪除沒有可靠的事件時間(Discord 不給),所以冪等改用「一則訊息只會被刪一次」。
@@ -118,6 +128,7 @@ type Querier interface {
 	// —— 兩邊各寫一個常數就會出現「不再回傳但也不終止」的夾縫。
 	FailExhaustedAnnouncements(ctx context.Context, arg FailExhaustedAnnouncementsParams) (int64, error)
 	GetBalance(ctx context.Context, arg GetBalanceParams) (int64, error)
+	GetCommunityByPublicID(ctx context.Context, publicID string) (GetCommunityByPublicIDRow, error)
 	// LEFT JOIN:community 存在但 xp_ruleset_id 為 NULL(M1 可能還沒建 ruleset)時
 	// 回 NULL config,呼叫端採安全預設(無冷卻、無 cap);community 不存在 → 無列(ErrNoRows)
 	GetCommunityXpConfig(ctx context.Context, id int64) ([]byte, error)
@@ -175,6 +186,8 @@ type Querier interface {
 	GetShopItemForPurchase(ctx context.Context, publicID string) (GetShopItemForPurchaseRow, error)
 	// guild snowflake → (space_id, community_id)。community_id 是 activity_daily 的 PK 之一。
 	GetSpaceByExternalID(ctx context.Context, arg GetSpaceByExternalIDParams) (GetSpaceByExternalIDRow, error)
+	// 註冊前先查:CLI 重跑不該噴 UNIQUE violation,也不該無聲改掉既有設定。
+	GetSpaceByProviderExternalID(ctx context.Context, arg GetSpaceByProviderExternalIDParams) (GetSpaceByProviderExternalIDRow, error)
 	// 頻道註冊表(schemas/01 增補 C)= 白名單權威。
 	// 查無列 = 未註冊:log_messages 視為 false(白名單制),grant_xp 視為 true
 	// (欄位預設值;白名單管的是「內容要不要落地」,不是「要不要計分」)。
@@ -310,6 +323,7 @@ type Querier interface {
 	LastXpEventAtBySource(ctx context.Context, arg LastXpEventAtBySourceParams) (time.Time, error)
 	ListActiveSessionIDs(ctx context.Context, userID int64) ([]int64, error)
 	ListAdminAuditByActor(ctx context.Context, arg ListAdminAuditByActorParams) ([]PlatformAdminAuditLog, error)
+	ListCommunities(ctx context.Context) ([]ListCommunitiesRow, error)
 	ListCurrentConfigs(ctx context.Context) ([]ListCurrentConfigsRow, error)
 	ListEntriesByUser(ctx context.Context, arg ListEntriesByUserParams) ([]PlatformTokenEntry, error)
 	// 已下架的商品照樣回名稱:公告講的是「當時買了什麼」,
@@ -355,6 +369,8 @@ type Querier interface {
 	// include_delisted 只放寬 delisted_at 那一段:從未上架(listed_at IS NULL)與
 	// 上架時間未到的商品是草稿,任何情況都不對外露出。
 	ListListedItems(ctx context.Context, arg ListListedItemsParams) ([]ListListedItemsRow, error)
+	ListSpaceChannels(ctx context.Context, spaceID int64) ([]ListSpaceChannelsRow, error)
+	ListSpaces(ctx context.Context) ([]ListSpacesRow, error)
 	// 多幣別:一列一幣別。**沒有列 = 沒有那個幣別的餘額 = 0**(與 ledger.GetBalance
 	// 的「無列視為 0」同一口徑),不在這裡替不存在的幣別補零列——
 	// 餘額的權威只有 user_balances,補零就是在讀取側偽造資料。
@@ -579,6 +595,10 @@ type Querier interface {
 	UpdateRedemptionStatus(ctx context.Context, arg UpdateRedemptionStatusParams) (PlatformRedemption, error)
 	UpdateUserTimezone(ctx context.Context, arg UpdateUserTimezoneParams) (UpdateUserTimezoneRow, error)
 	UpsertDailyState(ctx context.Context, arg UpsertDailyStateParams) error
+	// 這裡用 upsert 而不是「先查再建」,是因為重跑的語意不同:再跑一次
+	// register-channel 帶不同旗標,意思就是「改成這樣」。
+	// archived_at 一併清掉:重新註冊等於重新啟用。
+	UpsertSpaceChannel(ctx context.Context, arg UpsertSpaceChannelParams) (UpsertSpaceChannelRow, error)
 	// 兩個旗標**各自可設**:NULL = 這次不動這一項。
 	//
 	//   建列時(INSERT 那一側)沒指定的項目落到 false —— 那是預設值,
