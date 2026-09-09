@@ -233,9 +233,13 @@ func New(deps Deps) (*Server, error) {
 		trusted: deps.TrustedProxies,
 	}.register(mux)
 
-	// 由外而內:稽核(看得到前綴外的探測流量)→ 剝前綴 → connect mux。
-	// 順序不能反,理由見 auditHTTP 與 mountAt 的說明。
-	return &Server{handler: auditHTTP(mountAt(basePath, mux), queue, log, basePath), audit: queue}, nil
+	// 稽核在最外層才看得到前綴外的探測流量;順序不能反,
+	// 理由見 auditHTTP 與 mountAt 的說明。
+	// 由外而內:稽核 → /login 暫時轉址(在前綴之外)→ 剝前綴 → connect mux。
+	return &Server{
+		handler: auditHTTP(withLoginShim(basePath, mountAt(basePath, mux)), queue, log, basePath),
+		audit:   queue,
+	}, nil
 }
 
 // verifyProcedureCoverage 在啟動時用 proto descriptor 反查,確認每個 RPC 的

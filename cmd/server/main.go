@@ -165,7 +165,13 @@ func run() error {
 		}
 		_, _ = w.Write([]byte("ok"))
 	})
-	mux.Handle(basePath+"/", srv)
+	// **掛在根而不是 basePath+"/"**:前綴之外也有 srv 要處理的路由
+	// (/login 轉址),而且稽核層本來就設計成看得到前綴外的探測流量
+	// (auditHTTP 的說明)。掛在前綴上的話那兩件事都到不了 srv,
+	// 前者失效、後者是有文件卻從未生效的功能。
+	//
+	// 不會多開放任何東西:srv 內層的 mountAt 對前綴外的路徑照樣回 404。
+	mux.Handle("/", srv)
 	httpSrv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 
 	// 三個背景元件各送一次 errCh。任何一個結束——不論 error 或 nil
