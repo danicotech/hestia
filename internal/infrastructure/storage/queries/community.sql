@@ -53,3 +53,39 @@ RETURNING id, external_id, name, kind, log_messages, grant_xp;
 -- name: ListSpaceChannels :many
 SELECT id, external_id, name, kind, log_messages, grant_xp, archived_at
 FROM platform.space_channels WHERE space_id = $1 ORDER BY id;
+
+-- name: ListChannelPurposes :many
+SELECT key, name, description, enabled FROM platform.channel_purposes
+WHERE enabled ORDER BY key;
+
+-- name: EnsureSpaceChannel :exec
+-- 設定用途前先確保頻道在 space_channels 裡有一列。
+-- space_channel_purposes 對它有外鍵(打錯 channel id 當場擋下),但註冊頻道
+-- 原本是「要不要記訊息」的動作,不該因此多逼使用者跑一次指令 —— 缺就補建,
+-- 用欄位預設(不記內容、計 XP),與現行未註冊頻道的行為完全相同。
+INSERT INTO platform.space_channels (space_id, external_id, name, kind)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (space_id, external_id) DO NOTHING;
+
+-- name: SetChannelPurpose :one
+INSERT INTO platform.space_channel_purposes (space_id, purpose, channel_external_id)
+VALUES ($1, $2, $3)
+ON CONFLICT (space_id, purpose) DO UPDATE
+SET channel_external_id = EXCLUDED.channel_external_id,
+    updated_at          = now()
+RETURNING id, purpose, channel_external_id;
+
+-- name: ClearChannelPurpose :execrows
+DELETE FROM platform.space_channel_purposes WHERE space_id = $1 AND purpose = $2;
+
+-- name: ListSpacePurposes :many
+SELECT p.purpose, p.channel_external_id, cp.name AS purpose_name
+FROM platform.space_channel_purposes p
+JOIN platform.channel_purposes cp ON cp.key = p.purpose
+WHERE p.space_id = $1 ORDER BY p.purpose;
+
+-- name: GetChannelForPurpose :one
+-- 投遞時用:這個空間的這個用途要貼到哪個頻道。
+-- 查無列 = 沒設定,呼叫端應略過而不是報錯(部署可能刻意不設某個用途)。
+SELECT channel_external_id FROM platform.space_channel_purposes
+WHERE space_id = $1 AND purpose = $2;

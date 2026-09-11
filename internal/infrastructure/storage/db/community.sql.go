@@ -10,6 +10,23 @@ import (
 	"time"
 )
 
+const clearChannelPurpose = `-- name: ClearChannelPurpose :execrows
+DELETE FROM platform.space_channel_purposes WHERE space_id = $1 AND purpose = $2
+`
+
+type ClearChannelPurposeParams struct {
+	SpaceID int64
+	Purpose string
+}
+
+func (q *Queries) ClearChannelPurpose(ctx context.Context, arg ClearChannelPurposeParams) (int64, error) {
+	result, err := q.db.Exec(ctx, clearChannelPurpose, arg.SpaceID, arg.Purpose)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const createCommunity = `-- name: CreateCommunity :one
 
 INSERT INTO platform.communities (public_id, name)
@@ -82,6 +99,52 @@ func (q *Queries) CreateSpace(ctx context.Context, arg CreateSpaceParams) (Creat
 	return i, err
 }
 
+const ensureSpaceChannel = `-- name: EnsureSpaceChannel :exec
+INSERT INTO platform.space_channels (space_id, external_id, name, kind)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (space_id, external_id) DO NOTHING
+`
+
+type EnsureSpaceChannelParams struct {
+	SpaceID    int64
+	ExternalID string
+	Name       *string
+	Kind       string
+}
+
+// 設定用途前先確保頻道在 space_channels 裡有一列。
+// space_channel_purposes 對它有外鍵(打錯 channel id 當場擋下),但註冊頻道
+// 原本是「要不要記訊息」的動作,不該因此多逼使用者跑一次指令 —— 缺就補建,
+// 用欄位預設(不記內容、計 XP),與現行未註冊頻道的行為完全相同。
+func (q *Queries) EnsureSpaceChannel(ctx context.Context, arg EnsureSpaceChannelParams) error {
+	_, err := q.db.Exec(ctx, ensureSpaceChannel,
+		arg.SpaceID,
+		arg.ExternalID,
+		arg.Name,
+		arg.Kind,
+	)
+	return err
+}
+
+const getChannelForPurpose = `-- name: GetChannelForPurpose :one
+SELECT channel_external_id FROM platform.space_channel_purposes
+WHERE space_id = $1 AND purpose = $2
+`
+
+type GetChannelForPurposeParams struct {
+	SpaceID int64
+	Purpose string
+}
+
+// 投遞時用:這個空間的這個用途要貼到哪個頻道。
+// 查無列 = 沒設定,呼叫端應略過而不是報錯(部署可能刻意不設某個用途)。
+func (q *Queries) GetChannelForPurpose(ctx context.Context, arg GetChannelForPurposeParams) (string, error) {
+	row := q.db.QueryRow(ctx, getChannelForPurpose, arg.SpaceID, arg.Purpose)
+	var channel_external_id string
+	err := row.Scan(&channel_external_id)
+	return channel_external_id, err
+}
+
 const getCommunityByPublicID = `-- name: GetCommunityByPublicID :one
 SELECT id, public_id, name FROM platform.communities WHERE public_id = $1
 `
@@ -127,6 +190,43 @@ func (q *Queries) GetSpaceByProviderExternalID(ctx context.Context, arg GetSpace
 		&i.Name,
 	)
 	return i, err
+}
+
+const listChannelPurposes = `-- name: ListChannelPurposes :many
+SELECT key, name, description, enabled FROM platform.channel_purposes
+WHERE enabled ORDER BY key
+`
+
+type ListChannelPurposesRow struct {
+	Key         string
+	Name        string
+	Description *string
+	Enabled     bool
+}
+
+func (q *Queries) ListChannelPurposes(ctx context.Context) ([]ListChannelPurposesRow, error) {
+	rows, err := q.db.Query(ctx, listChannelPurposes)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListChannelPurposesRow
+	for rows.Next() {
+		var i ListChannelPurposesRow
+		if err := rows.Scan(
+			&i.Key,
+			&i.Name,
+			&i.Description,
+			&i.Enabled,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listCommunities = `-- name: ListCommunities :many
@@ -211,6 +311,39 @@ func (q *Queries) ListSpaceChannels(ctx context.Context, spaceID int64) ([]ListS
 	return items, nil
 }
 
+const listSpacePurposes = `-- name: ListSpacePurposes :many
+SELECT p.purpose, p.channel_external_id, cp.name AS purpose_name
+FROM platform.space_channel_purposes p
+JOIN platform.channel_purposes cp ON cp.key = p.purpose
+WHERE p.space_id = $1 ORDER BY p.purpose
+`
+
+type ListSpacePurposesRow struct {
+	Purpose           string
+	ChannelExternalID string
+	PurposeName       string
+}
+
+func (q *Queries) ListSpacePurposes(ctx context.Context, spaceID int64) ([]ListSpacePurposesRow, error) {
+	rows, err := q.db.Query(ctx, listSpacePurposes, spaceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListSpacePurposesRow
+	for rows.Next() {
+		var i ListSpacePurposesRow
+		if err := rows.Scan(&i.Purpose, &i.ChannelExternalID, &i.PurposeName); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listSpaces = `-- name: ListSpaces :many
 SELECT s.id, s.public_id, s.community_id, s.provider, s.external_id, s.name,
        c.name AS community_name, c.public_id AS community_public_id
@@ -257,6 +390,34 @@ func (q *Queries) ListSpaces(ctx context.Context) ([]ListSpacesRow, error) {
 		return nil, err
 	}
 	return items, nil
+}
+
+const setChannelPurpose = `-- name: SetChannelPurpose :one
+INSERT INTO platform.space_channel_purposes (space_id, purpose, channel_external_id)
+VALUES ($1, $2, $3)
+ON CONFLICT (space_id, purpose) DO UPDATE
+SET channel_external_id = EXCLUDED.channel_external_id,
+    updated_at          = now()
+RETURNING id, purpose, channel_external_id
+`
+
+type SetChannelPurposeParams struct {
+	SpaceID           int64
+	Purpose           string
+	ChannelExternalID string
+}
+
+type SetChannelPurposeRow struct {
+	ID                int64
+	Purpose           string
+	ChannelExternalID string
+}
+
+func (q *Queries) SetChannelPurpose(ctx context.Context, arg SetChannelPurposeParams) (SetChannelPurposeRow, error) {
+	row := q.db.QueryRow(ctx, setChannelPurpose, arg.SpaceID, arg.Purpose, arg.ChannelExternalID)
+	var i SetChannelPurposeRow
+	err := row.Scan(&i.ID, &i.Purpose, &i.ChannelExternalID)
+	return i, err
 }
 
 const upsertSpaceChannel = `-- name: UpsertSpaceChannel :one

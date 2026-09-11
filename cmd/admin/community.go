@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/danicotech/hestia/internal/infrastructure/storage/db"
@@ -291,4 +292,13 @@ func yesNo(b bool) string {
 		return "是"
 	}
 	return "否"
+}
+
+// isForeignKeyViolation 判斷錯誤是不是外鍵違反(23503)。
+// 用於把「用途不存在」翻譯成看得懂的訊息 —— 原始訊息是
+// 「violates foreign key constraint "space_channel_purposes_purpose_fkey"」,
+// 對著終端機的人看不出該怎麼修。
+func isForeignKeyViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23503"
 }

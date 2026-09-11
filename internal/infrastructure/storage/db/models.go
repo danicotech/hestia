@@ -36,6 +36,35 @@ type PlatformAdminAuditLog struct {
 	CreatedAt   time.Time
 }
 
+// 三處隨機(開箱 / 小遊戲 / 賽事下注)共用的留痕。三件事:(1) 隨時算得出實際產出速率,不必等到通膨才發現;(2) 有人質疑黑箱時拿得出種子與賠率;(3) 賠率寫在設定不寫在程式,改了不必重新部署,改動進 admin_audit_logs。
+type PlatformChanceDraw struct {
+	ID           int64
+	CommunityID  int64
+	UserID       int64
+	Kind         string
+	Ref          string
+	OddsSnapshot []byte
+	Seed         string
+	Outcome      []byte
+	Stake        int64
+	Payout       int64
+	CreatedAt    time.Time
+}
+
+type PlatformChanceDrawsDefault struct {
+	ID           int64
+	CommunityID  int64
+	UserID       int64
+	Kind         string
+	Ref          string
+	OddsSnapshot []byte
+	Seed         string
+	Outcome      []byte
+	Stake        int64
+	Payout       int64
+	CreatedAt    time.Time
+}
+
 type PlatformChannelPurpose struct {
 	Key         string
 	Name        string
@@ -150,6 +179,34 @@ type PlatformEventLogsDefault struct {
 	CreatedAt time.Time
 }
 
+// 獎品在**建立時**就從管理員帳上扣除並凍結,不是開獎時才扣 —— 否則管理員在開獎前把點數花光,抽獎就變成空頭支票。
+type PlatformGiveaway struct {
+	ID          int64
+	PublicID    string
+	CommunityID int64
+	SpaceID     int64
+	Title       string
+	PrizeKind   string
+	PrizeRef    string
+	PrizeAmount *int64
+	WinnerCount int32
+	EntryCost   int64
+	Status      string
+	OpensAt     time.Time
+	ClosesAt    time.Time
+	DrawnAt     *time.Time
+	CreatedBy   int64
+	CreatedAt   time.Time
+}
+
+type PlatformGiveawayEntry struct {
+	ID         int64
+	GiveawayID int64
+	UserID     int64
+	Won        bool
+	EnteredAt  time.Time
+}
+
 type PlatformHighlight struct {
 	ID        int64
 	Period    string
@@ -207,6 +264,49 @@ type PlatformItemInstance struct {
 	LockedByTradeID *int64
 	AcquiredAt      time.Time
 	AcquiredVia     *string
+	LockedReason    *string
+}
+
+type PlatformLevelReward struct {
+	ID          int64
+	CommunityID int64
+	Subject     string
+	Level       int32
+	RewardKind  string
+	RewardRef   string
+	Amount      *int64
+	Note        *string
+	CreatedAt   time.Time
+}
+
+type PlatformLevelRewardGrant struct {
+	ID            int64
+	RewardID      int64
+	UserID        int64
+	PetInstanceID *int64
+	GrantedAt     time.Time
+}
+
+type PlatformLootBox struct {
+	ID           int64
+	PublicID     string
+	CommunityID  int64
+	Name         string
+	CostCurrency string
+	CostAmount   int64
+	DailyLimit   *int32
+	Enabled      bool
+	CreatedAt    time.Time
+}
+
+type PlatformLootBoxItem struct {
+	ID         int64
+	BoxID      int64
+	RewardKind string
+	RewardRef  string
+	Amount     *int64
+	Weight     int32
+	Remaining  *int32
 }
 
 type PlatformMarketListing struct {
@@ -297,6 +397,9 @@ type PlatformOutboxEvent struct {
 	Attempts    int32
 	NextRetryAt *time.Time
 	CreatedAt   time.Time
+	// 最後一次失敗的原因。沒有它的話,死信只知道「送不出去」,而那正是需要人介入時最該知道的一件事。
+	LastError *string
+	FailedAt  *time.Time
 }
 
 type PlatformPermission struct {
@@ -305,6 +408,26 @@ type PlatformPermission struct {
 	Description string
 	IsDangerous bool
 	CreatedAt   time.Time
+}
+
+type PlatformPetEquipment struct {
+	ID             int64
+	PetInstanceID  int64
+	Slot           string
+	ItemInstanceID int64
+	EquippedAt     time.Time
+}
+
+// 寵物的可變狀態。等級不存欄位,由 xp 用 xp_rulesets.config 的曲線反推(schemas/24)。擁有權、稀缺、交易鎖全在 item_instances —— 寵物可以連同等級在市集換手。
+type PlatformPetState struct {
+	ItemInstanceID int64
+	OwnerID        int64
+	Nickname       *string
+	Xp             int64
+	Deployed       bool
+	LastFedAt      *time.Time
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 type PlatformPresenceSpan struct {
@@ -535,9 +658,10 @@ type PlatformUserXp struct {
 	UserID      int64
 	CommunityID int64
 	Xp          int64
-	Level       int32
-	LastXpAt    *time.Time
-	UpdatedAt   time.Time
+	// **不使用**(2026-09-11 起)。等級是 xp 的純函數:level = floor((xp / base) ^ (1/exponent)) + 1,曲線見 xp_rulesets.config。存成欄位就會有與 xp 不一致的一天,而 xp 才是事實。
+	Level     int32
+	LastXpAt  *time.Time
+	UpdatedAt time.Time
 }
 
 type PlatformVoiceSession struct {
@@ -575,6 +699,8 @@ type PlatformXpEvent struct {
 	Amount      int64
 	RefID       *string
 	CreatedAt   time.Time
+	// NULL = 這筆 XP 是給人的;有值 = 給那隻寵物的。同一個活動事件會產生兩列(人一列、出戰寵物一列)。
+	PetInstanceID *int64
 }
 
 type PlatformXpEventType struct {

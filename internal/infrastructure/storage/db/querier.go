@@ -83,6 +83,7 @@ type Querier interface {
 	// 截止線早於 now(),未撤銷且未過期的列不可能落在它之前。
 	// rotated_from 的子列指標由 FK 的 ON DELETE SET NULL 自動斷開,不會撞 FK。
 	CleanupSessions(ctx context.Context, retentionDays int32) (int64, error)
+	ClearChannelPurpose(ctx context.Context, arg ClearChannelPurposeParams) (int64, error)
 	ClosePresenceSpan(ctx context.Context, arg ClosePresenceSpanParams) error
 	CloseReaction(ctx context.Context, arg CloseReactionParams) error
 	// 帶 joined_at 讓分區裁剪生效(voice_sessions 按 joined_at 分區)。
@@ -116,6 +117,11 @@ type Querier interface {
 	EnsureMonthPartitions(ctx context.Context) error
 	// 預設列(兩級 optout 都是 false)。ON CONFLICT DO NOTHING:重跑不炸。
 	EnsurePrivacySettings(ctx context.Context, userID int64) error
+	// 設定用途前先確保頻道在 space_channels 裡有一列。
+	// space_channel_purposes 對它有外鍵(打錯 channel id 當場擋下),但註冊頻道
+	// 原本是「要不要記訊息」的動作,不該因此多逼使用者跑一次指令 —— 缺就補建,
+	// 用欄位預設(不記內容、計 XP),與現行未註冊頻道的行為完全相同。
+	EnsureSpaceChannel(ctx context.Context, arg EnsureSpaceChannelParams) error
 	// 與 EnsureBalanceRow 同模式:先保證投影列存在,才能 FOR UPDATE 串行化同 user 的併發入帳
 	EnsureUserXpRow(ctx context.Context, arg EnsureUserXpRowParams) error
 	// 毒訊息終止:重試次數用完、可見性也逾時了(= 沒有人正在處理它),
@@ -128,6 +134,9 @@ type Querier interface {
 	// —— 兩邊各寫一個常數就會出現「不再回傳但也不終止」的夾縫。
 	FailExhaustedAnnouncements(ctx context.Context, arg FailExhaustedAnnouncementsParams) (int64, error)
 	GetBalance(ctx context.Context, arg GetBalanceParams) (int64, error)
+	// 投遞時用:這個空間的這個用途要貼到哪個頻道。
+	// 查無列 = 沒設定,呼叫端應略過而不是報錯(部署可能刻意不設某個用途)。
+	GetChannelForPurpose(ctx context.Context, arg GetChannelForPurposeParams) (string, error)
 	GetCommunityByPublicID(ctx context.Context, publicID string) (GetCommunityByPublicIDRow, error)
 	// LEFT JOIN:community 存在但 xp_ruleset_id 為 NULL(M1 可能還沒建 ruleset)時
 	// 回 NULL config,呼叫端採安全預設(無冷卻、無 cap);community 不存在 → 無列(ErrNoRows)
@@ -323,6 +332,7 @@ type Querier interface {
 	LastXpEventAtBySource(ctx context.Context, arg LastXpEventAtBySourceParams) (time.Time, error)
 	ListActiveSessionIDs(ctx context.Context, userID int64) ([]int64, error)
 	ListAdminAuditByActor(ctx context.Context, arg ListAdminAuditByActorParams) ([]PlatformAdminAuditLog, error)
+	ListChannelPurposes(ctx context.Context) ([]ListChannelPurposesRow, error)
 	ListCommunities(ctx context.Context) ([]ListCommunitiesRow, error)
 	ListCurrentConfigs(ctx context.Context) ([]ListCurrentConfigsRow, error)
 	ListEntriesByUser(ctx context.Context, arg ListEntriesByUserParams) ([]PlatformTokenEntry, error)
@@ -370,6 +380,7 @@ type Querier interface {
 	// 上架時間未到的商品是草稿,任何情況都不對外露出。
 	ListListedItems(ctx context.Context, arg ListListedItemsParams) ([]ListListedItemsRow, error)
 	ListSpaceChannels(ctx context.Context, spaceID int64) ([]ListSpaceChannelsRow, error)
+	ListSpacePurposes(ctx context.Context, spaceID int64) ([]ListSpacePurposesRow, error)
 	ListSpaces(ctx context.Context) ([]ListSpacesRow, error)
 	// 多幣別:一列一幣別。**沒有列 = 沒有那個幣別的餘額 = 0**(與 ledger.GetBalance
 	// 的「無列視為 0」同一口徑),不在這裡替不存在的幣別補零列——
@@ -570,6 +581,7 @@ type Querier interface {
 	// 輪替鏈:從任一列沿 rotated_from 往上(被取代者)與往下(取代者)展開整條。
 	// 複合 FK 保證整條鏈同屬一個使用者,不可能撤到別人的裝置。升冪回傳。
 	SessionChainIDs(ctx context.Context, sessionID int64) ([]int64, error)
+	SetChannelPurpose(ctx context.Context, arg SetChannelPurposeParams) (SetChannelPurposeRow, error)
 	SetIdempotencyResponse(ctx context.Context, arg SetIdempotencyResponseParams) error
 	// ── 我的檔案(ProfileStore)────────────────────────────────────────────
 	// 時區字串的合法性檢查(pg_timezone_names)**不在這個檔案**:sqlc 的內建

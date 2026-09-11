@@ -42,6 +42,15 @@ const usage = `用法:
         沒給 --community 就順便建一個同名的社群。
         已經註冊過的話不動它,只印出現況。
 
+  admin list-purposes
+        列出可設定的頻道用途
+
+  admin set-channel   --guild <id> --purpose <用途> --channel <id> [--name <名稱>] [--kind <型別>]
+  admin clear-channel --guild <id> --purpose <用途>
+        設定/取消「這個伺服器的公告貼哪裡」。取代了 stentor 舊的 CHANNEL_MAP
+        環境變數——那是一份全域對應,bot 進第二個伺服器時就沒有正確答案可給。
+        頻道若還沒在 space_channels 裡,會一併補建。
+
   admin register-channel --guild <id> --channel <id> --kind <text|voice|forum|announcement>
                         [--name <名稱>] [--log-messages] [--no-xp]
         註冊單一頻道。**只有想保存訊息內容時才需要**——
@@ -81,6 +90,12 @@ func run() error {
 		return registerSpace(ctx, pool, os.Args[2:])
 	case "register-channel":
 		return registerChannel(ctx, pool, os.Args[2:])
+	case "list-purposes":
+		return listPurposes(ctx, pool)
+	case "set-channel":
+		return setChannel(ctx, pool, os.Args[2:])
+	case "clear-channel":
+		return clearChannel(ctx, pool, os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Println(usage)
 		return nil

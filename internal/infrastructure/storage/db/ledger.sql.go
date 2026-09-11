@@ -39,7 +39,7 @@ func (q *Queries) ApplyBalanceDelta(ctx context.Context, arg ApplyBalanceDeltaPa
 }
 
 const claimPendingOutbox = `-- name: ClaimPendingOutbox :many
-SELECT id, topic, payload, status, attempts, next_retry_at, created_at FROM platform.outbox_events
+SELECT id, topic, payload, status, attempts, next_retry_at, created_at, last_error, failed_at FROM platform.outbox_events
 WHERE status = 'pending'
   AND (next_retry_at IS NULL OR next_retry_at <= now())
   -- COALESCE 不可省:topic <> ALL(NULL) 求值為 NULL 而非 true,
@@ -78,6 +78,8 @@ func (q *Queries) ClaimPendingOutbox(ctx context.Context, arg ClaimPendingOutbox
 			&i.Attempts,
 			&i.NextRetryAt,
 			&i.CreatedAt,
+			&i.LastError,
+			&i.FailedAt,
 		); err != nil {
 			return nil, err
 		}
