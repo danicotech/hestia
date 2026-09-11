@@ -2,19 +2,31 @@
 -- append-only、同 transaction 更新餘額、鎖依 user_id 升冪、動錢一律冪等。
 -- 這裡刻意「沒有」UPDATE/DELETE token_entries 的 query —— 不要新增。
 
+-- 餘額與分錄都帶 community_id(schemas/23):NULL = 全域幣。
+-- 每一支都用 COALESCE(community_id, 0) 比對,因為 NULL = NULL 為 NULL 而不是 true——
+-- 直接寫 community_id = $3 會讓全域幣的每一次查詢都查不到列,
+-- 而那個 bug 的表現是「餘額突然變 0」,不是報錯。
+--
+-- scope 一律由 currencies 現查,不由呼叫端傳:它必須等於 currencies.scope
+-- (複合外鍵擋著),讓呼叫端傳就是給了一個唯一的錯法。
+
 -- name: LockBalanceForUpdate :one
 SELECT balance FROM platform.user_balances
 WHERE user_id = $1 AND currency = $2
+  AND COALESCE(community_id, 0) = COALESCE(sqlc.narg(community_id)::bigint, 0)
 FOR UPDATE;
 
 -- name: EnsureBalanceRow :exec
-INSERT INTO platform.user_balances (user_id, currency, balance)
-VALUES ($1, $2, 0)
-ON CONFLICT (user_id, currency) DO NOTHING;
+INSERT INTO platform.user_balances (user_id, currency, community_id, scope, balance)
+SELECT $1, $2, sqlc.narg(community_id)::bigint, c.scope, 0
+FROM platform.currencies c WHERE c.code = $2
+ON CONFLICT (user_id, currency, COALESCE(community_id, 0)) DO NOTHING;
 
 -- name: InsertTokenEntry :one
-INSERT INTO platform.token_entries (user_id, currency, amount, reason, ref_type, ref_id, actor_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+INSERT INTO platform.token_entries
+  (user_id, currency, community_id, scope, amount, reason, ref_type, ref_id, actor_id)
+SELECT $1, $2, sqlc.narg(community_id)::bigint, c.scope, $3, $4, $5, $6, $7
+FROM platform.currencies c WHERE c.code = $2
 RETURNING id, created_at;
 
 -- name: ApplyBalanceDelta :one
@@ -22,17 +34,20 @@ RETURNING id, created_at;
 UPDATE platform.user_balances
 SET balance = balance + $3, updated_at = now()
 WHERE user_id = $1 AND currency = $2
+  AND COALESCE(community_id, 0) = COALESCE(sqlc.narg(community_id)::bigint, 0)
 RETURNING balance;
 
 -- name: GetBalance :one
 SELECT balance FROM platform.user_balances
-WHERE user_id = $1 AND currency = $2;
+WHERE user_id = $1 AND currency = $2
+  AND COALESCE(community_id, 0) = COALESCE(sqlc.narg(community_id)::bigint, 0);
 
 -- name: SumEntriesForUser :one
 -- 對帳 job 用:驗證 SUM(entries) = balance
 SELECT COALESCE(SUM(amount), 0)::bigint AS total
 FROM platform.token_entries
-WHERE user_id = $1 AND currency = $2;
+WHERE user_id = $1 AND currency = $2
+  AND COALESCE(community_id, 0) = COALESCE(sqlc.narg(community_id)::bigint, 0);
 
 -- name: ListEntriesByUser :many
 SELECT * FROM platform.token_entries
@@ -55,17 +70,27 @@ UPDATE platform.idempotency_keys SET response = $2 WHERE key = $1;
 
 -- name: ReconcileBalances :many
 -- 對帳:找出 SUM(entries) 與 balance 不一致的每一組(含只有分錄沒有餘額列、或反之)
+--
+-- **分組必須含 community**:少了它,SUM 會把同一個人在所有社群的分錄加在一起,
+-- 而那個總和幾乎永遠不等於任何單一列的 balance —— 對帳會變成全表誤報,
+-- 比不對帳更糟(沒有人會再相信它)。
 SELECT
-  COALESCE(b.user_id, s.user_id)::bigint   AS user_id,
-  COALESCE(b.currency, s.currency)::text   AS currency,
-  COALESCE(b.balance, 0)::bigint           AS balance,
-  COALESCE(s.total, 0)::bigint             AS entry_total
+  COALESCE(b.user_id, s.user_id)::bigint        AS user_id,
+  COALESCE(b.currency, s.currency)::text        AS currency,
+  -- 補 0 而不是讓它是 NULL:community id 從 1 起算,0 明確代表全域幣。
+  -- 留 NULL 的話這一欄要變成指標型別,而對帳報告的每個使用點都得多一次解參照,
+  -- 換來的只是重述「全域」這件 scope 已經說過的事。
+  COALESCE(b.community_id, s.community_id, 0)::bigint AS community_key,
+  COALESCE(b.balance, 0)::bigint                AS balance,
+  COALESCE(s.total, 0)::bigint                  AS entry_total
 FROM platform.user_balances b
 FULL JOIN (
-  SELECT user_id, currency, SUM(amount) AS total
+  SELECT user_id, currency, community_id, SUM(amount) AS total
   FROM platform.token_entries
-  GROUP BY user_id, currency
-) s ON s.user_id = b.user_id AND s.currency = b.currency
+  GROUP BY user_id, currency, community_id
+) s ON s.user_id = b.user_id
+   AND s.currency = b.currency
+   AND COALESCE(s.community_id, 0) = COALESCE(b.community_id, 0)
 WHERE COALESCE(b.balance, 0) <> COALESCE(s.total, 0);
 
 -- name: InsertOutboxEvent :one

@@ -243,7 +243,8 @@ func (s *Service) Reconcile(ctx context.Context) ([]ledger.Mismatch, error) {
 	for _, r := range rows {
 		out = append(out, ledger.Mismatch{
 			UserID: r.UserID, Currency: r.Currency,
-			Balance: r.Balance, EntryTotal: r.EntryTotal,
+			CommunityKey: r.CommunityKey,
+			Balance:      r.Balance, EntryTotal: r.EntryTotal,
 		})
 	}
 	return out, nil

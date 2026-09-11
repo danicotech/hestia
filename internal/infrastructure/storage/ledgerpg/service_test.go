@@ -344,7 +344,12 @@ func TestReconcile(t *testing.T) {
 		`UPDATE platform.user_balances SET balance = balance + 1 WHERE user_id=$1`, u); err != nil {
 		t.Fatalf("弄壞快取: %v", err)
 	}
-	mis, _ = svc.Reconcile(ctx)
+	// 不可以吞掉錯誤:查詢壞掉時回傳的是空切片,與「帳是平的」完全一樣,
+	// 而後者正是這個測試要排除的情況(2026-09-11 真的被這個寫法藏過一次)。
+	mis, err = svc.Reconcile(ctx)
+	if err != nil {
+		t.Fatalf("reconcile(弄壞之後): %v", err)
+	}
 	found := false
 	for _, m := range mis {
 		if m.UserID == u && m.Balance == 778 && m.EntryTotal == 777 {

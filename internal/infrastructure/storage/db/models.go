@@ -36,6 +36,14 @@ type PlatformAdminAuditLog struct {
 	CreatedAt   time.Time
 }
 
+type PlatformChannelPurpose struct {
+	Key         string
+	Name        string
+	Description *string
+	Enabled     bool
+	CreatedAt   time.Time
+}
+
 type PlatformCommunity struct {
 	ID          int64
 	PublicID    string
@@ -76,6 +84,8 @@ type PlatformCurrency struct {
 	Symbol    *string
 	Tradable  bool
 	CreatedAt time.Time
+	// global = 平台通用幣,餘額與分錄的 community_id 為 NULL;community = 社群限定點數,必須帶 community_id。一旦有餘額就改不動(複合外鍵擋著)——把流通中的幣改作用域是資料搬遷,不該是一句 UPDATE。
+	Scope string
 }
 
 type PlatformDailyClaim struct {
@@ -289,6 +299,14 @@ type PlatformOutboxEvent struct {
 	CreatedAt   time.Time
 }
 
+type PlatformPermission struct {
+	Key         string
+	Name        string
+	Description string
+	IsDangerous bool
+	CreatedAt   time.Time
+}
+
 type PlatformPresenceSpan struct {
 	ID        int64
 	UserID    int64
@@ -334,6 +352,10 @@ type PlatformRole struct {
 	Key       string
 	Name      string
 	CreatedAt time.Time
+	PublicID  string
+	// NULL = 內建角色(owner/admin/moderator/auditor),管理端不得刪除或改權限:它們是系統啟動與緊急救援的依據,刪掉之後沒有人能修好自己的權限。社群要不同的權限組合,複製一份成自己的角色。
+	CommunityID *int64
+	CreatedBy   *int64
 }
 
 type PlatformRolePermission struct {
@@ -396,6 +418,16 @@ type PlatformSpaceChannel struct {
 	ArchivedAt  *time.Time
 }
 
+type PlatformSpaceChannelPurpose struct {
+	ID                int64
+	SpaceID           int64
+	Purpose           string
+	ChannelExternalID string
+	UpdatedBy         *int64
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+}
+
 type PlatformSpaceMember struct {
 	ID        int64
 	SpaceID   int64
@@ -427,6 +459,9 @@ type PlatformTokenEntry struct {
 	RefID     *int64
 	ActorID   *int64
 	CreatedAt time.Time
+	// 對帳式因此改為依 (user_id, currency, community_id) 分組。不分組的 SUM 會永遠等於總額而失去檢查價值——.claude/skills/ledger-invariants 已同步更新。
+	CommunityID *int64
+	Scope       string
 }
 
 type PlatformUser struct {
@@ -443,10 +478,13 @@ type PlatformUser struct {
 }
 
 type PlatformUserBalance struct {
-	UserID    int64
-	Currency  string
-	Balance   int64
-	UpdatedAt time.Time
+	UserID      int64
+	Currency    string
+	Balance     int64
+	UpdatedAt   time.Time
+	CommunityID *int64
+	Scope       string
+	ID          int64
 }
 
 type PlatformUserDailyState struct {

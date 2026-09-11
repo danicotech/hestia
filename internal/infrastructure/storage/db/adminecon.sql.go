@@ -11,7 +11,7 @@ import (
 
 const getTokenEntryByID = `-- name: GetTokenEntryByID :one
 
-SELECT id, user_id, currency, amount, reason, ref_type, ref_id, actor_id, created_at FROM platform.token_entries WHERE id = $1
+SELECT id, user_id, currency, amount, reason, ref_type, ref_id, actor_id, created_at, community_id, scope FROM platform.token_entries WHERE id = $1
 `
 
 // 管理員經濟操作 query。動錢一律走 ledger 的 ApplyInTx,這裡只有讀取;
@@ -30,6 +30,8 @@ func (q *Queries) GetTokenEntryByID(ctx context.Context, id int64) (PlatformToke
 		&i.RefID,
 		&i.ActorID,
 		&i.CreatedAt,
+		&i.CommunityID,
+		&i.Scope,
 	)
 	return i, err
 }

@@ -95,10 +95,13 @@ type ApplyResult struct {
 
 // Mismatch 是對帳發現的不一致。
 type Mismatch struct {
-	UserID     int64
-	Currency   string
-	Balance    int64 // user_balances 快取值
-	EntryTotal int64 // SUM(token_entries) 真值
+	UserID   int64
+	Currency string
+	// CommunityKey 是 COALESCE(community_id, 0):0 = 全域幣。
+	// 不分社群的話,同一個人在兩個社群各有一組餘額時,報告會指不出是哪一組壞了。
+	CommunityKey int64
+	Balance      int64 // user_balances 快取值
+	EntryTotal   int64 // SUM(token_entries) 真值
 }
 
 // 錯誤語意:呼叫端據此決定回 4xx 還是重試。

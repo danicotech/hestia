@@ -14,18 +14,25 @@ const applyBalanceDelta = `-- name: ApplyBalanceDelta :one
 UPDATE platform.user_balances
 SET balance = balance + $3, updated_at = now()
 WHERE user_id = $1 AND currency = $2
+  AND COALESCE(community_id, 0) = COALESCE($4::bigint, 0)
 RETURNING balance
 `
 
 type ApplyBalanceDeltaParams struct {
-	UserID   int64
-	Currency string
-	Balance  int64
+	UserID      int64
+	Currency    string
+	Balance     int64
+	CommunityID *int64
 }
 
 // 呼叫前必須已 LockBalanceForUpdate;CHECK(balance >= 0) 是最後防線,不是主要檢查
 func (q *Queries) ApplyBalanceDelta(ctx context.Context, arg ApplyBalanceDeltaParams) (int64, error) {
-	row := q.db.QueryRow(ctx, applyBalanceDelta, arg.UserID, arg.Currency, arg.Balance)
+	row := q.db.QueryRow(ctx, applyBalanceDelta,
+		arg.UserID,
+		arg.Currency,
+		arg.Balance,
+		arg.CommunityID,
+	)
 	var balance int64
 	err := row.Scan(&balance)
 	return balance, err
@@ -83,33 +90,37 @@ func (q *Queries) ClaimPendingOutbox(ctx context.Context, arg ClaimPendingOutbox
 }
 
 const ensureBalanceRow = `-- name: EnsureBalanceRow :exec
-INSERT INTO platform.user_balances (user_id, currency, balance)
-VALUES ($1, $2, 0)
-ON CONFLICT (user_id, currency) DO NOTHING
+INSERT INTO platform.user_balances (user_id, currency, community_id, scope, balance)
+SELECT $1, $2, $3::bigint, c.scope, 0
+FROM platform.currencies c WHERE c.code = $2
+ON CONFLICT (user_id, currency, COALESCE(community_id, 0)) DO NOTHING
 `
 
 type EnsureBalanceRowParams struct {
-	UserID   int64
-	Currency string
+	UserID      int64
+	Currency    string
+	CommunityID *int64
 }
 
 func (q *Queries) EnsureBalanceRow(ctx context.Context, arg EnsureBalanceRowParams) error {
-	_, err := q.db.Exec(ctx, ensureBalanceRow, arg.UserID, arg.Currency)
+	_, err := q.db.Exec(ctx, ensureBalanceRow, arg.UserID, arg.Currency, arg.CommunityID)
 	return err
 }
 
 const getBalance = `-- name: GetBalance :one
 SELECT balance FROM platform.user_balances
 WHERE user_id = $1 AND currency = $2
+  AND COALESCE(community_id, 0) = COALESCE($3::bigint, 0)
 `
 
 type GetBalanceParams struct {
-	UserID   int64
-	Currency string
+	UserID      int64
+	Currency    string
+	CommunityID *int64
 }
 
 func (q *Queries) GetBalance(ctx context.Context, arg GetBalanceParams) (int64, error) {
-	row := q.db.QueryRow(ctx, getBalance, arg.UserID, arg.Currency)
+	row := q.db.QueryRow(ctx, getBalance, arg.UserID, arg.Currency, arg.CommunityID)
 	var balance int64
 	err := row.Scan(&balance)
 	return balance, err
@@ -169,19 +180,22 @@ func (q *Queries) InsertOutboxEvent(ctx context.Context, arg InsertOutboxEventPa
 }
 
 const insertTokenEntry = `-- name: InsertTokenEntry :one
-INSERT INTO platform.token_entries (user_id, currency, amount, reason, ref_type, ref_id, actor_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+INSERT INTO platform.token_entries
+  (user_id, currency, community_id, scope, amount, reason, ref_type, ref_id, actor_id)
+SELECT $1, $2, $8::bigint, c.scope, $3, $4, $5, $6, $7
+FROM platform.currencies c WHERE c.code = $2
 RETURNING id, created_at
 `
 
 type InsertTokenEntryParams struct {
-	UserID   int64
-	Currency string
-	Amount   int64
-	Reason   string
-	RefType  *string
-	RefID    *int64
-	ActorID  *int64
+	UserID      int64
+	Currency    string
+	Amount      int64
+	Reason      string
+	RefType     *string
+	RefID       *int64
+	ActorID     *int64
+	CommunityID *int64
 }
 
 type InsertTokenEntryRow struct {
@@ -198,6 +212,7 @@ func (q *Queries) InsertTokenEntry(ctx context.Context, arg InsertTokenEntryPara
 		arg.RefType,
 		arg.RefID,
 		arg.ActorID,
+		arg.CommunityID,
 	)
 	var i InsertTokenEntryRow
 	err := row.Scan(&i.ID, &i.CreatedAt)
@@ -205,7 +220,7 @@ func (q *Queries) InsertTokenEntry(ctx context.Context, arg InsertTokenEntryPara
 }
 
 const listEntriesByUser = `-- name: ListEntriesByUser :many
-SELECT id, user_id, currency, amount, reason, ref_type, ref_id, actor_id, created_at FROM platform.token_entries
+SELECT id, user_id, currency, amount, reason, ref_type, ref_id, actor_id, created_at, community_id, scope FROM platform.token_entries
 WHERE user_id = $1
 ORDER BY created_at DESC
 LIMIT $2 OFFSET $3
@@ -236,6 +251,8 @@ func (q *Queries) ListEntriesByUser(ctx context.Context, arg ListEntriesByUserPa
 			&i.RefID,
 			&i.ActorID,
 			&i.CreatedAt,
+			&i.CommunityID,
+			&i.Scope,
 		); err != nil {
 			return nil, err
 		}
@@ -249,21 +266,31 @@ func (q *Queries) ListEntriesByUser(ctx context.Context, arg ListEntriesByUserPa
 
 const lockBalanceForUpdate = `-- name: LockBalanceForUpdate :one
 
+
 SELECT balance FROM platform.user_balances
 WHERE user_id = $1 AND currency = $2
+  AND COALESCE(community_id, 0) = COALESCE($3::bigint, 0)
 FOR UPDATE
 `
 
 type LockBalanceForUpdateParams struct {
-	UserID   int64
-	Currency string
+	UserID      int64
+	Currency    string
+	CommunityID *int64
 }
 
 // 帳本 query。使用規則見 .claude/skills/ledger-invariants:
 // append-only、同 transaction 更新餘額、鎖依 user_id 升冪、動錢一律冪等。
 // 這裡刻意「沒有」UPDATE/DELETE token_entries 的 query —— 不要新增。
+// 餘額與分錄都帶 community_id(schemas/23):NULL = 全域幣。
+// 每一支都用 COALESCE(community_id, 0) 比對,因為 NULL = NULL 為 NULL 而不是 true——
+// 直接寫 community_id = $3 會讓全域幣的每一次查詢都查不到列,
+// 而那個 bug 的表現是「餘額突然變 0」,不是報錯。
+//
+// scope 一律由 currencies 現查,不由呼叫端傳:它必須等於 currencies.scope
+// (複合外鍵擋著),讓呼叫端傳就是給了一個唯一的錯法。
 func (q *Queries) LockBalanceForUpdate(ctx context.Context, arg LockBalanceForUpdateParams) (int64, error) {
-	row := q.db.QueryRow(ctx, lockBalanceForUpdate, arg.UserID, arg.Currency)
+	row := q.db.QueryRow(ctx, lockBalanceForUpdate, arg.UserID, arg.Currency, arg.CommunityID)
 	var balance int64
 	err := row.Scan(&balance)
 	return balance, err
@@ -310,27 +337,38 @@ func (q *Queries) MarkOutboxRetry(ctx context.Context, arg MarkOutboxRetryParams
 
 const reconcileBalances = `-- name: ReconcileBalances :many
 SELECT
-  COALESCE(b.user_id, s.user_id)::bigint   AS user_id,
-  COALESCE(b.currency, s.currency)::text   AS currency,
-  COALESCE(b.balance, 0)::bigint           AS balance,
-  COALESCE(s.total, 0)::bigint             AS entry_total
+  COALESCE(b.user_id, s.user_id)::bigint        AS user_id,
+  COALESCE(b.currency, s.currency)::text        AS currency,
+  -- 補 0 而不是讓它是 NULL:community id 從 1 起算,0 明確代表全域幣。
+  -- 留 NULL 的話這一欄要變成指標型別,而對帳報告的每個使用點都得多一次解參照,
+  -- 換來的只是重述「全域」這件 scope 已經說過的事。
+  COALESCE(b.community_id, s.community_id, 0)::bigint AS community_key,
+  COALESCE(b.balance, 0)::bigint                AS balance,
+  COALESCE(s.total, 0)::bigint                  AS entry_total
 FROM platform.user_balances b
 FULL JOIN (
-  SELECT user_id, currency, SUM(amount) AS total
+  SELECT user_id, currency, community_id, SUM(amount) AS total
   FROM platform.token_entries
-  GROUP BY user_id, currency
-) s ON s.user_id = b.user_id AND s.currency = b.currency
+  GROUP BY user_id, currency, community_id
+) s ON s.user_id = b.user_id
+   AND s.currency = b.currency
+   AND COALESCE(s.community_id, 0) = COALESCE(b.community_id, 0)
 WHERE COALESCE(b.balance, 0) <> COALESCE(s.total, 0)
 `
 
 type ReconcileBalancesRow struct {
-	UserID     int64
-	Currency   string
-	Balance    int64
-	EntryTotal int64
+	UserID       int64
+	Currency     string
+	CommunityKey int64
+	Balance      int64
+	EntryTotal   int64
 }
 
 // 對帳:找出 SUM(entries) 與 balance 不一致的每一組(含只有分錄沒有餘額列、或反之)
+//
+// **分組必須含 community**:少了它,SUM 會把同一個人在所有社群的分錄加在一起,
+// 而那個總和幾乎永遠不等於任何單一列的 balance —— 對帳會變成全表誤報,
+// 比不對帳更糟(沒有人會再相信它)。
 func (q *Queries) ReconcileBalances(ctx context.Context) ([]ReconcileBalancesRow, error) {
 	rows, err := q.db.Query(ctx, reconcileBalances)
 	if err != nil {
@@ -343,6 +381,7 @@ func (q *Queries) ReconcileBalances(ctx context.Context) ([]ReconcileBalancesRow
 		if err := rows.Scan(
 			&i.UserID,
 			&i.Currency,
+			&i.CommunityKey,
 			&i.Balance,
 			&i.EntryTotal,
 		); err != nil {
@@ -374,16 +413,18 @@ const sumEntriesForUser = `-- name: SumEntriesForUser :one
 SELECT COALESCE(SUM(amount), 0)::bigint AS total
 FROM platform.token_entries
 WHERE user_id = $1 AND currency = $2
+  AND COALESCE(community_id, 0) = COALESCE($3::bigint, 0)
 `
 
 type SumEntriesForUserParams struct {
-	UserID   int64
-	Currency string
+	UserID      int64
+	Currency    string
+	CommunityID *int64
 }
 
 // 對帳 job 用:驗證 SUM(entries) = balance
 func (q *Queries) SumEntriesForUser(ctx context.Context, arg SumEntriesForUserParams) (int64, error) {
-	row := q.db.QueryRow(ctx, sumEntriesForUser, arg.UserID, arg.Currency)
+	row := q.db.QueryRow(ctx, sumEntriesForUser, arg.UserID, arg.Currency, arg.CommunityID)
 	var total int64
 	err := row.Scan(&total)
 	return total, err

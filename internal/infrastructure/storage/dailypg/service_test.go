@@ -327,6 +327,22 @@ func TestTimezoneChangeCooldown(t *testing.T) {
 		`UPDATE platform.daily_claims SET claimed_at = now() - interval '21 hours' WHERE user_id=$1`, u); err != nil {
 		t.Fatalf("撥 claimed_at: %v", err)
 	}
+	// 日期也要一起釘成「**東京的**昨天」。
+	//
+	// backdate() 減的那一天是用改時區**之前**的時區算出來的;而這裡已經改成
+	// Asia/Tokyo(+9)。當 UTC 過了 15:00(台北 23:00 到隔天 08:00,每天 9 小時),
+	// 東京的今天比原時區多一天,連續判定就變成隔了兩天,streak 歸 1。
+	// 這個測試因此每天有 9 小時會紅,而且與被測邏輯無關。
+	if _, err := pool.Exec(ctx,
+		`UPDATE platform.daily_claims
+		 SET claim_date = (now() AT TIME ZONE 'Asia/Tokyo')::date - 1 WHERE user_id=$1`, u); err != nil {
+		t.Fatalf("釘 claim_date: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`UPDATE platform.user_daily_state
+		 SET last_claim_date = (now() AT TIME ZONE 'Asia/Tokyo')::date - 1 WHERE user_id=$1`, u); err != nil {
+		t.Fatalf("釘 last_claim_date: %v", err)
+	}
 	res, err := svc.Claim(ctx, u)
 	if err != nil {
 		t.Fatalf("冷卻已滿仍被拒: %v", err)

@@ -401,6 +401,13 @@ type Querier interface {
 	// 帳本 query。使用規則見 .claude/skills/ledger-invariants:
 	// append-only、同 transaction 更新餘額、鎖依 user_id 升冪、動錢一律冪等。
 	// 這裡刻意「沒有」UPDATE/DELETE token_entries 的 query —— 不要新增。
+	// 餘額與分錄都帶 community_id(schemas/23):NULL = 全域幣。
+	// 每一支都用 COALESCE(community_id, 0) 比對,因為 NULL = NULL 為 NULL 而不是 true——
+	// 直接寫 community_id = $3 會讓全域幣的每一次查詢都查不到列,
+	// 而那個 bug 的表現是「餘額突然變 0」,不是報錯。
+	//
+	// scope 一律由 currencies 現查,不由呼叫端傳:它必須等於 currencies.scope
+	// (複合外鍵擋著),讓呼叫端傳就是給了一個唯一的錯法。
 	LockBalanceForUpdate(ctx context.Context, arg LockBalanceForUpdateParams) (int64, error)
 	// 對話 chunk 聚合(schemas/12-ai-corpus.md)。
 	// 設計核心:不對單則訊息做 embedding,合併成對話 chunk 才有檢索價值(grill Q16)。
@@ -505,6 +512,10 @@ type Querier interface {
 	// (schemas/02 增補 F),這個數字從 0 變正就是安全事件,不是效能指標。
 	RecentSessionReuse(ctx context.Context, windowHours int32) (int64, error)
 	// 對帳:找出 SUM(entries) 與 balance 不一致的每一組(含只有分錄沒有餘額列、或反之)
+	//
+	// **分組必須含 community**:少了它,SUM 會把同一個人在所有社群的分錄加在一起,
+	// 而那個總和幾乎永遠不等於任何單一列的 balance —— 對帳會變成全表誤報,
+	// 比不對帳更糟(沒有人會再相信它)。
 	ReconcileBalances(ctx context.Context) ([]ReconcileBalancesRow, error)
 	// 取消後又按回來:復用同一列。activity_daily.reactions **不再加一次** ——
 	// 否則按了取消再按就是無限刷參與度。
