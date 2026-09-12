@@ -186,6 +186,17 @@ var delegatedProcedures = map[string]struct{}{
 	platformv1connect.MeServiceUpdatePrivacyProcedure:      {},
 	platformv1connect.ShopServicePurchaseProcedure:         {},
 	platformv1connect.ShopServiceCancelRedemptionProcedure: {},
+	// 小遊戲 / 開箱 / 抽獎 / 寵物(schemas/25):全部是使用者對自己做的事,
+	// 而且**只能在 Discord 裡做**(網頁端還不存在)。DrawGiveaway 不在此列 ——
+	// 它把獎品發出去,屬於管理動作。
+	platformv1connect.PlayServicePlayGameProcedure:      {},
+	platformv1connect.PlayServiceListLootBoxesProcedure: {},
+	platformv1connect.PlayServiceOpenLootBoxProcedure:   {},
+	platformv1connect.PlayServiceListGiveawaysProcedure: {},
+	platformv1connect.PlayServiceEnterGiveawayProcedure: {},
+	platformv1connect.PlayServiceListPetsProcedure:      {},
+	platformv1connect.PlayServiceDeployPetProcedure:     {},
+	platformv1connect.PlayServiceRenamePetProcedure:     {},
 }
 
 // delegableGlobally 回報這個 procedure **在契約上**能不能被代打

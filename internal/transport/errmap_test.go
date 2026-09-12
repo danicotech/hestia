@@ -19,6 +19,7 @@ import (
 	"github.com/danicotech/hestia/internal/core/platform/identity"
 	"github.com/danicotech/hestia/internal/core/platform/ledger"
 	"github.com/danicotech/hestia/internal/core/platform/notification"
+	"github.com/danicotech/hestia/internal/core/platform/play"
 	"github.com/danicotech/hestia/internal/core/platform/shop"
 )
 
@@ -32,6 +33,15 @@ func TestToConnectError(t *testing.T) {
 		{ledger.ErrIdempotencyConflict, connect.CodeAborted},
 		{ledger.ErrInFlight, connect.CodeUnavailable},
 		{ledger.ErrInvalidOp, connect.CodeInvalidArgument},
+
+		{play.ErrNotFound, connect.CodeNotFound},
+		{play.ErrDisabled, connect.CodeFailedPrecondition},
+		{play.ErrDailyLimit, connect.CodeResourceExhausted},
+		{play.ErrPoolEmpty, connect.CodeFailedPrecondition},
+		{play.ErrAlreadyEntered, connect.CodeAlreadyExists},
+		{play.ErrClosed, connect.CodeFailedPrecondition},
+		{play.ErrNotOwner, connect.CodePermissionDenied},
+		{play.ErrInvalidParams, connect.CodeInvalidArgument},
 
 		{daily.ErrAlreadyClaimed, connect.CodeAlreadyExists},
 		{daily.ErrTimezoneChangeCooldown, connect.CodeFailedPrecondition},

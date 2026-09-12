@@ -294,3 +294,9 @@ WHERE c.public_id = $1;
 -- guild id 過來(schemas/22 的 A 方案),那時這支查詢就不再需要。
 SELECT public_id FROM platform.communities
 WHERE (SELECT count(*) FROM platform.communities) = 1;
+
+-- name: GetSoleCommunityID :one
+-- 與 GetSoleCommunityPublicID 同樣的語意,回內部 id 給入口層用。
+-- 兩個以上社群時回 0 列 —— 呼叫端必須失敗而不是猜。
+SELECT id FROM platform.communities
+WHERE (SELECT count(*) FROM platform.communities) = 1;

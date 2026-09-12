@@ -169,3 +169,18 @@ func (s *Service) Leaderboard(
 	}
 	return out, nil
 }
+
+// SoleCommunityID 實作 transport.CommunityResolver。
+//
+// 只有在全庫剛好一個社群時才回答。兩個以上時回錯,理由見介面說明:
+// 猜錯的後果是跨社群的資料互相汙染,而且沒有任何徵兆。
+func (s *Service) SoleCommunityID(ctx context.Context) (int64, error) {
+	id, err := s.q.GetSoleCommunityID(ctx)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, fmt.Errorf("系統裡不是剛好一個社群,無法推定: %w", shop.ErrUserNotFound)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("推定社群: %w", err)
+	}
+	return id, nil
+}

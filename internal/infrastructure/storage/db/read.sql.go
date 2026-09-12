@@ -63,6 +63,20 @@ func (q *Queries) GetDeployedPet(ctx context.Context, ownerID int64) (GetDeploye
 	return i, err
 }
 
+const getSoleCommunityID = `-- name: GetSoleCommunityID :one
+SELECT id FROM platform.communities
+WHERE (SELECT count(*) FROM platform.communities) = 1
+`
+
+// 與 GetSoleCommunityPublicID 同樣的語意,回內部 id 給入口層用。
+// 兩個以上社群時回 0 列 —— 呼叫端必須失敗而不是猜。
+func (q *Queries) GetSoleCommunityID(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, getSoleCommunityID)
+	var id int64
+	err := row.Scan(&id)
+	return id, err
+}
+
 const getSoleCommunityPublicID = `-- name: GetSoleCommunityPublicID :one
 SELECT public_id FROM platform.communities
 WHERE (SELECT count(*) FROM platform.communities) = 1

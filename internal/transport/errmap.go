@@ -12,6 +12,7 @@ import (
 	"github.com/danicotech/hestia/internal/core/platform/identity"
 	"github.com/danicotech/hestia/internal/core/platform/ledger"
 	"github.com/danicotech/hestia/internal/core/platform/notification"
+	"github.com/danicotech/hestia/internal/core/platform/play"
 	"github.com/danicotech/hestia/internal/core/platform/shop"
 )
 
@@ -66,6 +67,18 @@ var errorCodes = []struct {
 	code   connect.Code
 	reason string
 }{
+	// ── 遊戲 / 開箱 / 抽獎 / 寵物(play,schemas/25)────────────────
+	{play.ErrNotFound, connect.CodeNotFound, "play_not_found"},
+	{play.ErrDisabled, connect.CodeFailedPrecondition, "play_disabled"},
+	// 到上限不是錯誤是規則。用 ResourceExhausted 讓 client 分得出
+	// 「今天不能再玩」與「這次請求壞了」。
+	{play.ErrDailyLimit, connect.CodeResourceExhausted, "play_daily_limit"},
+	{play.ErrPoolEmpty, connect.CodeFailedPrecondition, "play_pool_empty"},
+	{play.ErrAlreadyEntered, connect.CodeAlreadyExists, "play_already_entered"},
+	{play.ErrClosed, connect.CodeFailedPrecondition, "play_closed"},
+	{play.ErrNotOwner, connect.CodePermissionDenied, "play_not_owner"},
+	{play.ErrInvalidParams, connect.CodeInvalidArgument, "play_invalid_params"},
+
 	// ── 帳本(ledger)──────────────────────────────────────────────
 	{ledger.ErrInsufficientBalance, connect.CodeFailedPrecondition, "insufficient_balance"},
 	{ledger.ErrIdempotencyConflict, connect.CodeAborted, "idempotency_conflict"},

@@ -33,6 +33,7 @@ import (
 	"github.com/danicotech/hestia/internal/infrastructure/storage/identitypg"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/ledgerpg"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/notificationpg"
+	"github.com/danicotech/hestia/internal/infrastructure/storage/playpg"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/readpg"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/shoppg"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/xppg"
@@ -111,6 +112,10 @@ func run() error {
 		Activity:      activity,
 		ActingUsers:   activity,
 		Announcements: notificationpg.New(pool, notifyOpts()...),
+		// 小遊戲 / 開箱 / 抽獎 / 寵物(schemas/25)。動錢全部走帳本,
+		// 與抽籤留痕同 tx —— 少了留痕,產出速率就算不出來。
+		Play:          playpg.New(pool, led),
+		Communities:   read,
 		ServiceTokens: serviceTokens(),
 		// 入口層據此決定路由前綴與 cookie 的 Path(兩者必須一致,
 		// 不然登入看起來成功但每一支 RPC 都拿不到 cookie)。

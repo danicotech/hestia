@@ -128,6 +128,14 @@ catch (e) {
 
 | reason | code | 意思 |
 |---|---|---|
+| `play_not_found` | not_found | 箱子 / 抽獎 / 寵物不存在 |
+| `play_disabled` | failed_precondition | 這個項目目前停用 |
+| `play_daily_limit` | resource_exhausted | 今天的抽籤次數用完了(三個賭博管道共用計數) |
+| `play_pool_empty` | failed_precondition | 有限獎池已經抽完 |
+| `play_already_entered` | already_exists | 這場抽獎已經報名過 |
+| `play_closed` | failed_precondition | 抽獎已結束或已開獎 |
+| `play_not_owner` | permission_denied | 這不是你的寵物 |
+| `play_invalid_params` | invalid_argument | 遊戲選項 / 投注額 / 暱稱不合法 |
 | `insufficient_balance` | failed_precondition | 餘額不足 |
 | `idempotency_conflict` | aborted | 同一把冪等鍵配到不同的請求內容 |
 | `idempotency_in_flight` | unavailable | 同一把冪等鍵正在處理中,稍後重試會拿到原結果 |

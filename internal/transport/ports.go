@@ -206,3 +206,14 @@ type AuthService interface {
 	// 實作端的 VerifyAccess 是這條路徑上唯一一次驗證,不構成重複。
 	Logout(ctx context.Context, accessToken, refreshToken string) error
 }
+
+// CommunityResolver 回答「這次操作屬於哪個社群」。
+//
+// 目前只有一種答案:全庫唯一的那個社群。事件還沒帶發生地
+// (schemas/22 的 A 方案未落地),所以入口層沒有更好的資訊可用。
+//
+// **兩個以上社群時實作必須失敗,不可以猜。** 猜錯的話,B 社群的人
+// 會在 A 社群的排行榜上、用 A 社群的箱子,而那不會有任何徵兆。
+type CommunityResolver interface {
+	SoleCommunityID(ctx context.Context) (int64, error)
+}

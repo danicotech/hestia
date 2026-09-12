@@ -1,0 +1,171 @@
+syntax = "proto3";
+
+// 小遊戲、開箱、抽獎、寵物(schemas/25)。
+//
+// 主體一律是認證出來的使用者 —— 請求裡沒有 user_public_id,
+// 與 me.proto 同樣的理由:不接受「代別人玩」,那是不存在的需求。
+package hestia.platform.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/danicotech/hestia/gen/hestia/platform/v1;platformv1";
+
+// ── 小遊戲 ────────────────────────────────────────────────────
+
+message PlayGameRequest {
+  // rps / dice / guess / roulette。
+  string game = 1;
+  // 玩家的選擇。每一款都必須帶:沒有選擇的遊戲不是「機率加上自己決定的
+  // 操作」,而同樣期望值下,有操作的體感完全不同。
+  string choice = 2;
+  // 投注額,必須為正。
+  int64 stake = 3;
+  // **必填。** 動錢一律冪等(帳本鐵則三),而遊戲是最容易被連點的地方。
+  // Discord 的 interaction id 是天然的鍵。
+  string idempotency_key = 4;
+}
+
+message PlayGameResponse {
+  string game = 1;
+  string choice = 2;
+  // 這局開出來的東西(對手出什麼、骰幾點、輪盤停在哪)。
+  string result = 3;
+  int64 stake = 4;
+  // 回收總額,**含本金**。0 = 全輸。淨變動 = returned - stake。
+  //
+  // 欄位名是 returned 不是 payout:payout 是下注領域的詞,而閘道的
+  // 邊界檢查(stentor 的 check-boundaries)會擋下活動層詞彙出現在
+  // 呈現層 —— 小遊戲是平台功能,不該借用賽事的語彙。
+  int64 returned = 5;
+  int64 balance = 6;
+  // 亂數種子。有人質疑黑箱時拿得出來 —— 與賠率一起進 chance_draws。
+  string seed = 7;
+}
+
+// ── 開箱 ──────────────────────────────────────────────────────
+
+message ListLootBoxesRequest {}
+
+message ListLootBoxesResponse {
+  repeated LootBox boxes = 1;
+}
+
+// LootBox 刻意**不揭露獎池內容與機率**。
+// 要不要公開是營運決定,應該由說明文件與後台設定表達,
+// 而不是由「讀取側剛好有這個欄位」決定。
+message LootBox {
+  string public_id = 1;
+  string name = 2;
+  string currency = 3;
+  int64 cost = 4;
+  // 每人每日上限;0 = 不限。
+  int32 daily_limit = 5;
+}
+
+message OpenLootBoxRequest {
+  string box_public_id = 1;
+  string idempotency_key = 2;
+}
+
+message OpenLootBoxResponse {
+  string box_name = 1;
+  // tokens / item / entitlement
+  string reward_kind = 2;
+  string reward_name = 3;
+  // reward_kind = tokens 時的金額。
+  int64 amount = 4;
+  int64 balance = 5;
+  string seed = 6;
+}
+
+// ── 抽獎活動 ──────────────────────────────────────────────────
+
+message ListGiveawaysRequest {}
+
+message ListGiveawaysResponse {
+  repeated Giveaway giveaways = 1;
+}
+
+message Giveaway {
+  string public_id = 1;
+  string title = 2;
+  // 報名費;0 = 免費參加。
+  int64 entry_cost = 3;
+  int32 winner_count = 4;
+  int64 entries = 5;
+  google.protobuf.Timestamp closes_at = 6;
+}
+
+message EnterGiveawayRequest {
+  string giveaway_public_id = 1;
+}
+
+message EnterGiveawayResponse {}
+
+message DrawGiveawayRequest {
+  string giveaway_public_id = 1;
+}
+
+message DrawGiveawayResponse {
+  string title = 1;
+  repeated GiveawayWinner winners = 2;
+}
+
+message GiveawayWinner {
+  string user_public_id = 1;
+  string display_name = 2;
+}
+
+// ── 寵物 ──────────────────────────────────────────────────────
+
+message ListPetsRequest {}
+
+message ListPetsResponse {
+  repeated Pet pets = 1;
+}
+
+message Pet {
+  string public_id = 1;
+  // 主人取的暱稱;沒取就是物品定義的名稱。
+  string name = 2;
+  string rarity = 3;
+  string icon_url = 4;
+  int64 xp = 5;
+  int32 level = 6;
+  // 出戰中的寵物會跟著主人一起漲 XP。同時只有一隻。
+  bool deployed = 7;
+}
+
+message DeployPetRequest {
+  string pet_public_id = 1;
+}
+
+message DeployPetResponse {}
+
+message RenamePetRequest {
+  string pet_public_id = 1;
+  // 空字串 = 還原成物品定義的名稱。
+  string nickname = 2;
+}
+
+message RenamePetResponse {}
+
+// PlayService 是這四個功能的入口。
+//
+// 一個服務而不是四個:它們共用同一組錯誤語意與同一個抽籤留痕,
+// 拆開只會讓閘道拿四個 client 指向同一個位址。
+service PlayService {
+  rpc PlayGame(PlayGameRequest) returns (PlayGameResponse);
+
+  rpc ListLootBoxes(ListLootBoxesRequest) returns (ListLootBoxesResponse);
+  rpc OpenLootBox(OpenLootBoxRequest) returns (OpenLootBoxResponse);
+
+  rpc ListGiveaways(ListGiveawaysRequest) returns (ListGiveawaysResponse);
+  rpc EnterGiveaway(EnterGiveawayRequest) returns (EnterGiveawayResponse);
+  // DrawGiveaway 需要 economy.config 權限:它會把獎品發出去。
+  rpc DrawGiveaway(DrawGiveawayRequest) returns (DrawGiveawayResponse);
+
+  rpc ListPets(ListPetsRequest) returns (ListPetsResponse);
+  rpc DeployPet(DeployPetRequest) returns (DeployPetResponse);
+  rpc RenamePet(RenamePetRequest) returns (RenamePetResponse);
+}

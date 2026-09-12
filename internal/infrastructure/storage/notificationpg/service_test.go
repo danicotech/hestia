@@ -88,6 +88,9 @@ func payloadFor(t *testing.T, ctx context.Context, topic string, user int64) map
 		return map[string]any{"order_id": 555111, "listing_public_id": "01LIST",
 			"item_instance_public_id": "01INST", "buyer_id": user, "seller_id": user,
 			"currency": "coin", "price": 250, "fee": 12}
+	case notification.TopicLevelUp:
+		return map[string]any{"user_id": user, "community_id": 1,
+			"subject": "user", "from_level": 4, "to_level": 5}
 	case notification.TopicRedemptionHandled:
 		return map[string]any{"redemption_public_id": "01RED", "user_id": user,
 			"item_public_id": newItem(t, ctx, "手工"), "status": "fulfilled",

@@ -27,6 +27,7 @@ import (
 	"github.com/danicotech/hestia/internal/core/platform/daily"
 	"github.com/danicotech/hestia/internal/core/platform/eventlog"
 	"github.com/danicotech/hestia/internal/core/platform/ledger"
+	"github.com/danicotech/hestia/internal/core/platform/play"
 	"github.com/danicotech/hestia/internal/core/platform/shop"
 )
 
@@ -85,6 +86,13 @@ type Deps struct {
 	// 實作:storage/activitylogpg。nil 時服務呼叫帶了 X-Acting-User 會回
 	// Unimplemented(不會靜默忽略——忽略等於把記錄寫到錯的人頭上)。
 	ActingUsers activitylog.ActorResolver
+
+	// Play 是小遊戲 / 開箱 / 抽獎 / 寵物(schemas/25)。
+	// nil 時 PlayService 的九個 RPC 一律回 Unimplemented。
+	Play play.Service
+
+	// Communities 回答「這次操作屬於哪個社群」。實作:readpg。
+	Communities CommunityResolver
 
 	// TrustedProxies 是「願意相信其轉發標頭」的對端網段(env
 	// HESTIA_TRUSTED_PROXIES,用 ParseTrustedProxies 解析)。落在清單內的
@@ -218,6 +226,9 @@ func New(deps Deps) (*Server, error) {
 	mux.Handle(platformv1connect.NewAdminEconomyServiceHandler(adminEconomyHandler{
 		svc: deps.AdminEcon, shop: deps.Shop,
 		directory: deps.Directory, entries: deps.LedgerEntries,
+	}, opts...))
+	mux.Handle(platformv1connect.NewPlayServiceHandler(playHandler{
+		svc: deps.Play, dir: deps.Directory, communities: deps.Communities,
 	}, opts...))
 	mux.Handle(platformv1connect.NewActivityServiceHandler(activityHandler{svc: deps.Activity}, opts...))
 	mux.Handle(platformv1connect.NewNotificationServiceHandler(

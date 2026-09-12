@@ -221,6 +221,9 @@ type Querier interface {
 	GetSessionIDByPublicID(ctx context.Context, arg GetSessionIDByPublicIDParams) (int64, error)
 	// is_listed 用 DB 時鐘計算(單一時鐘來源):listed_at 非空且已到、delisted_at 空或未到。
 	GetShopItemForPurchase(ctx context.Context, publicID string) (GetShopItemForPurchaseRow, error)
+	// 與 GetSoleCommunityPublicID 同樣的語意,回內部 id 給入口層用。
+	// 兩個以上社群時回 0 列 —— 呼叫端必須失敗而不是猜。
+	GetSoleCommunityID(ctx context.Context) (int64, error)
 	// 呼叫端沒指定社群時的退路:**只有在全庫剛好一個社群時**才回答。
 	//
 	// 兩個以上就回 0 列,讓呼叫端明確失敗 —— 猜一個的話,B 社群的人會看到
