@@ -12,6 +12,7 @@ package platformv1
 import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 	reflect "reflect"
 	sync "sync"
 	unsafe "unsafe"
@@ -799,11 +800,556 @@ func (x *UpdatePrivacyResponse) GetSettings() *PrivacySettings {
 	return nil
 }
 
+// GetSummary 一次回 /profile 要顯示的全部內容。
+//
+// 為什麼不讓呼叫端打四支:Discord 的互動視窗只有 3 秒,四次往返很容易超時,
+// 而超時的表現是指令「沒有反應」—— 使用者只會再按一次,然後再超時一次。
+type GetSummaryRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetSummaryRequest) Reset() {
+	*x = GetSummaryRequest{}
+	mi := &file_hestia_platform_v1_me_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetSummaryRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetSummaryRequest) ProtoMessage() {}
+
+func (x *GetSummaryRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_platform_v1_me_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetSummaryRequest.ProtoReflect.Descriptor instead.
+func (*GetSummaryRequest) Descriptor() ([]byte, []int) {
+	return file_hestia_platform_v1_me_proto_rawDescGZIP(), []int{17}
+}
+
+type GetSummaryResponse struct {
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Profile  *UserProfile           `protobuf:"bytes,1,opt,name=profile,proto3" json:"profile,omitempty"`
+	Balances []*Balance             `protobuf:"bytes,2,rep,name=balances,proto3" json:"balances,omitempty"`
+	// 每個社群一列。沒有參加任何社群時是空的。
+	Xp []*CommunityXp `protobuf:"bytes,3,rep,name=xp,proto3" json:"xp,omitempty"`
+	// 出戰中的寵物;沒有就不帶(不是錯誤,多數人一開始都沒有)。
+	Pet *PetSummary `protobuf:"bytes,4,opt,name=pet,proto3,oneof" json:"pet,omitempty"`
+	// 最近取得的徽章,**不是全部** —— embed 有長度上限,全部送會被截掉。
+	Badges        []*BadgeSummary `protobuf:"bytes,5,rep,name=badges,proto3" json:"badges,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetSummaryResponse) Reset() {
+	*x = GetSummaryResponse{}
+	mi := &file_hestia_platform_v1_me_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetSummaryResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetSummaryResponse) ProtoMessage() {}
+
+func (x *GetSummaryResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_platform_v1_me_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetSummaryResponse.ProtoReflect.Descriptor instead.
+func (*GetSummaryResponse) Descriptor() ([]byte, []int) {
+	return file_hestia_platform_v1_me_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *GetSummaryResponse) GetProfile() *UserProfile {
+	if x != nil {
+		return x.Profile
+	}
+	return nil
+}
+
+func (x *GetSummaryResponse) GetBalances() []*Balance {
+	if x != nil {
+		return x.Balances
+	}
+	return nil
+}
+
+func (x *GetSummaryResponse) GetXp() []*CommunityXp {
+	if x != nil {
+		return x.Xp
+	}
+	return nil
+}
+
+func (x *GetSummaryResponse) GetPet() *PetSummary {
+	if x != nil {
+		return x.Pet
+	}
+	return nil
+}
+
+func (x *GetSummaryResponse) GetBadges() []*BadgeSummary {
+	if x != nil {
+		return x.Badges
+	}
+	return nil
+}
+
+// CommunityXp 是一個人在某社群的經驗與等級。
+//
+// 等級與進度由後端算好,不讓呈現層自己算:曲線存在 xp_rulesets.config,
+// 各端各算一次就會有兩份實作,而其中一份遲早與資料庫不同步 ——
+// 「網頁說我 12 級,bot 說我 11 級」是查不出來的那種問題。
+type CommunityXp struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	CommunityPublicId string                 `protobuf:"bytes,1,opt,name=community_public_id,json=communityPublicId,proto3" json:"community_public_id,omitempty"`
+	CommunityName     string                 `protobuf:"bytes,2,opt,name=community_name,json=communityName,proto3" json:"community_name,omitempty"`
+	Xp                int64                  `protobuf:"varint,3,opt,name=xp,proto3" json:"xp,omitempty"`
+	Level             int32                  `protobuf:"varint,4,opt,name=level,proto3" json:"level,omitempty"`
+	// 本級已累積 / 本級總共需要。兩個一起才畫得出進度條。
+	XpIntoLevel   int64 `protobuf:"varint,5,opt,name=xp_into_level,json=xpIntoLevel,proto3" json:"xp_into_level,omitempty"`
+	XpForLevel    int64 `protobuf:"varint,6,opt,name=xp_for_level,json=xpForLevel,proto3" json:"xp_for_level,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CommunityXp) Reset() {
+	*x = CommunityXp{}
+	mi := &file_hestia_platform_v1_me_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CommunityXp) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CommunityXp) ProtoMessage() {}
+
+func (x *CommunityXp) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_platform_v1_me_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CommunityXp.ProtoReflect.Descriptor instead.
+func (*CommunityXp) Descriptor() ([]byte, []int) {
+	return file_hestia_platform_v1_me_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *CommunityXp) GetCommunityPublicId() string {
+	if x != nil {
+		return x.CommunityPublicId
+	}
+	return ""
+}
+
+func (x *CommunityXp) GetCommunityName() string {
+	if x != nil {
+		return x.CommunityName
+	}
+	return ""
+}
+
+func (x *CommunityXp) GetXp() int64 {
+	if x != nil {
+		return x.Xp
+	}
+	return 0
+}
+
+func (x *CommunityXp) GetLevel() int32 {
+	if x != nil {
+		return x.Level
+	}
+	return 0
+}
+
+func (x *CommunityXp) GetXpIntoLevel() int64 {
+	if x != nil {
+		return x.XpIntoLevel
+	}
+	return 0
+}
+
+func (x *CommunityXp) GetXpForLevel() int64 {
+	if x != nil {
+		return x.XpForLevel
+	}
+	return 0
+}
+
+type PetSummary struct {
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	PublicId string                 `protobuf:"bytes,1,opt,name=public_id,json=publicId,proto3" json:"public_id,omitempty"`
+	// 主人取的暱稱;沒取就是物品定義的名稱。
+	Name          string `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	IconUrl       string `protobuf:"bytes,3,opt,name=icon_url,json=iconUrl,proto3" json:"icon_url,omitempty"`
+	Rarity        string `protobuf:"bytes,4,opt,name=rarity,proto3" json:"rarity,omitempty"`
+	Xp            int64  `protobuf:"varint,5,opt,name=xp,proto3" json:"xp,omitempty"`
+	Level         int32  `protobuf:"varint,6,opt,name=level,proto3" json:"level,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PetSummary) Reset() {
+	*x = PetSummary{}
+	mi := &file_hestia_platform_v1_me_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PetSummary) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PetSummary) ProtoMessage() {}
+
+func (x *PetSummary) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_platform_v1_me_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PetSummary.ProtoReflect.Descriptor instead.
+func (*PetSummary) Descriptor() ([]byte, []int) {
+	return file_hestia_platform_v1_me_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *PetSummary) GetPublicId() string {
+	if x != nil {
+		return x.PublicId
+	}
+	return ""
+}
+
+func (x *PetSummary) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *PetSummary) GetIconUrl() string {
+	if x != nil {
+		return x.IconUrl
+	}
+	return ""
+}
+
+func (x *PetSummary) GetRarity() string {
+	if x != nil {
+		return x.Rarity
+	}
+	return ""
+}
+
+func (x *PetSummary) GetXp() int64 {
+	if x != nil {
+		return x.Xp
+	}
+	return 0
+}
+
+func (x *PetSummary) GetLevel() int32 {
+	if x != nil {
+		return x.Level
+	}
+	return 0
+}
+
+// BadgeSummary 是一枚徽章。徽章不是獨立系統,是 category='badge' 的物品。
+type BadgeSummary struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	PublicId      string                 `protobuf:"bytes,1,opt,name=public_id,json=publicId,proto3" json:"public_id,omitempty"`
+	Name          string                 `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	Rarity        string                 `protobuf:"bytes,3,opt,name=rarity,proto3" json:"rarity,omitempty"`
+	IconUrl       string                 `protobuf:"bytes,4,opt,name=icon_url,json=iconUrl,proto3" json:"icon_url,omitempty"`
+	AcquiredAt    *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=acquired_at,json=acquiredAt,proto3" json:"acquired_at,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *BadgeSummary) Reset() {
+	*x = BadgeSummary{}
+	mi := &file_hestia_platform_v1_me_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BadgeSummary) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BadgeSummary) ProtoMessage() {}
+
+func (x *BadgeSummary) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_platform_v1_me_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BadgeSummary.ProtoReflect.Descriptor instead.
+func (*BadgeSummary) Descriptor() ([]byte, []int) {
+	return file_hestia_platform_v1_me_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *BadgeSummary) GetPublicId() string {
+	if x != nil {
+		return x.PublicId
+	}
+	return ""
+}
+
+func (x *BadgeSummary) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *BadgeSummary) GetRarity() string {
+	if x != nil {
+		return x.Rarity
+	}
+	return ""
+}
+
+func (x *BadgeSummary) GetIconUrl() string {
+	if x != nil {
+		return x.IconUrl
+	}
+	return ""
+}
+
+func (x *BadgeSummary) GetAcquiredAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.AcquiredAt
+	}
+	return nil
+}
+
+type GetLeaderboardRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 社群的 public_id。
+	CommunityPublicId string `protobuf:"bytes,1,opt,name=community_public_id,json=communityPublicId,proto3" json:"community_public_id,omitempty"`
+	// 取前幾名;<= 0 或超過上限一律夾到預設值(不為了顯示參數讓指令失敗)。
+	Limit         int32 `protobuf:"varint,2,opt,name=limit,proto3" json:"limit,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetLeaderboardRequest) Reset() {
+	*x = GetLeaderboardRequest{}
+	mi := &file_hestia_platform_v1_me_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetLeaderboardRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetLeaderboardRequest) ProtoMessage() {}
+
+func (x *GetLeaderboardRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_platform_v1_me_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetLeaderboardRequest.ProtoReflect.Descriptor instead.
+func (*GetLeaderboardRequest) Descriptor() ([]byte, []int) {
+	return file_hestia_platform_v1_me_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *GetLeaderboardRequest) GetCommunityPublicId() string {
+	if x != nil {
+		return x.CommunityPublicId
+	}
+	return ""
+}
+
+func (x *GetLeaderboardRequest) GetLimit() int32 {
+	if x != nil {
+		return x.Limit
+	}
+	return 0
+}
+
+type GetLeaderboardResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Entries       []*LeaderboardEntry    `protobuf:"bytes,1,rep,name=entries,proto3" json:"entries,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetLeaderboardResponse) Reset() {
+	*x = GetLeaderboardResponse{}
+	mi := &file_hestia_platform_v1_me_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetLeaderboardResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetLeaderboardResponse) ProtoMessage() {}
+
+func (x *GetLeaderboardResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_platform_v1_me_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetLeaderboardResponse.ProtoReflect.Descriptor instead.
+func (*GetLeaderboardResponse) Descriptor() ([]byte, []int) {
+	return file_hestia_platform_v1_me_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *GetLeaderboardResponse) GetEntries() []*LeaderboardEntry {
+	if x != nil {
+		return x.Entries
+	}
+	return nil
+}
+
+type LeaderboardEntry struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Rank          int32                  `protobuf:"varint,1,opt,name=rank,proto3" json:"rank,omitempty"`
+	UserPublicId  string                 `protobuf:"bytes,2,opt,name=user_public_id,json=userPublicId,proto3" json:"user_public_id,omitempty"`
+	DisplayName   string                 `protobuf:"bytes,3,opt,name=display_name,json=displayName,proto3" json:"display_name,omitempty"`
+	Xp            int64                  `protobuf:"varint,4,opt,name=xp,proto3" json:"xp,omitempty"`
+	Level         int32                  `protobuf:"varint,5,opt,name=level,proto3" json:"level,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LeaderboardEntry) Reset() {
+	*x = LeaderboardEntry{}
+	mi := &file_hestia_platform_v1_me_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LeaderboardEntry) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LeaderboardEntry) ProtoMessage() {}
+
+func (x *LeaderboardEntry) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_platform_v1_me_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LeaderboardEntry.ProtoReflect.Descriptor instead.
+func (*LeaderboardEntry) Descriptor() ([]byte, []int) {
+	return file_hestia_platform_v1_me_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *LeaderboardEntry) GetRank() int32 {
+	if x != nil {
+		return x.Rank
+	}
+	return 0
+}
+
+func (x *LeaderboardEntry) GetUserPublicId() string {
+	if x != nil {
+		return x.UserPublicId
+	}
+	return ""
+}
+
+func (x *LeaderboardEntry) GetDisplayName() string {
+	if x != nil {
+		return x.DisplayName
+	}
+	return ""
+}
+
+func (x *LeaderboardEntry) GetXp() int64 {
+	if x != nil {
+		return x.Xp
+	}
+	return 0
+}
+
+func (x *LeaderboardEntry) GetLevel() int32 {
+	if x != nil {
+		return x.Level
+	}
+	return 0
+}
+
 var File_hestia_platform_v1_me_proto protoreflect.FileDescriptor
 
 const file_hestia_platform_v1_me_proto_rawDesc = "" +
 	"\n" +
-	"\x1bhestia/platform/v1/me.proto\x12\x12hestia.platform.v1\x1a\x1fhestia/platform/v1/common.proto\"\x13\n" +
+	"\x1bhestia/platform/v1/me.proto\x12\x12hestia.platform.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1fhestia/platform/v1/common.proto\"\x13\n" +
 	"\x11GetProfileRequest\"O\n" +
 	"\x12GetProfileResponse\x129\n" +
 	"\aprofile\x18\x01 \x01(\v2\x1f.hestia.platform.v1.UserProfileR\aprofile\"/\n" +
@@ -838,10 +1384,55 @@ const file_hestia_platform_v1_me_proto_rawDesc = "" +
 	"\x10_opt_out_loggingB\x14\n" +
 	"\x12_opt_out_ai_corpus\"X\n" +
 	"\x15UpdatePrivacyResponse\x12?\n" +
-	"\bsettings\x18\x01 \x01(\v2#.hestia.platform.v1.PrivacySettingsR\bsettings2\xaf\x06\n" +
+	"\bsettings\x18\x01 \x01(\v2#.hestia.platform.v1.PrivacySettingsR\bsettings\"\x13\n" +
+	"\x11GetSummaryRequest\"\xb2\x02\n" +
+	"\x12GetSummaryResponse\x129\n" +
+	"\aprofile\x18\x01 \x01(\v2\x1f.hestia.platform.v1.UserProfileR\aprofile\x127\n" +
+	"\bbalances\x18\x02 \x03(\v2\x1b.hestia.platform.v1.BalanceR\bbalances\x12/\n" +
+	"\x02xp\x18\x03 \x03(\v2\x1f.hestia.platform.v1.CommunityXpR\x02xp\x125\n" +
+	"\x03pet\x18\x04 \x01(\v2\x1e.hestia.platform.v1.PetSummaryH\x00R\x03pet\x88\x01\x01\x128\n" +
+	"\x06badges\x18\x05 \x03(\v2 .hestia.platform.v1.BadgeSummaryR\x06badgesB\x06\n" +
+	"\x04_pet\"\xd0\x01\n" +
+	"\vCommunityXp\x12.\n" +
+	"\x13community_public_id\x18\x01 \x01(\tR\x11communityPublicId\x12%\n" +
+	"\x0ecommunity_name\x18\x02 \x01(\tR\rcommunityName\x12\x0e\n" +
+	"\x02xp\x18\x03 \x01(\x03R\x02xp\x12\x14\n" +
+	"\x05level\x18\x04 \x01(\x05R\x05level\x12\"\n" +
+	"\rxp_into_level\x18\x05 \x01(\x03R\vxpIntoLevel\x12 \n" +
+	"\fxp_for_level\x18\x06 \x01(\x03R\n" +
+	"xpForLevel\"\x96\x01\n" +
+	"\n" +
+	"PetSummary\x12\x1b\n" +
+	"\tpublic_id\x18\x01 \x01(\tR\bpublicId\x12\x12\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\x12\x19\n" +
+	"\bicon_url\x18\x03 \x01(\tR\aiconUrl\x12\x16\n" +
+	"\x06rarity\x18\x04 \x01(\tR\x06rarity\x12\x0e\n" +
+	"\x02xp\x18\x05 \x01(\x03R\x02xp\x12\x14\n" +
+	"\x05level\x18\x06 \x01(\x05R\x05level\"\xaf\x01\n" +
+	"\fBadgeSummary\x12\x1b\n" +
+	"\tpublic_id\x18\x01 \x01(\tR\bpublicId\x12\x12\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\x12\x16\n" +
+	"\x06rarity\x18\x03 \x01(\tR\x06rarity\x12\x19\n" +
+	"\bicon_url\x18\x04 \x01(\tR\aiconUrl\x12;\n" +
+	"\vacquired_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
+	"acquiredAt\"]\n" +
+	"\x15GetLeaderboardRequest\x12.\n" +
+	"\x13community_public_id\x18\x01 \x01(\tR\x11communityPublicId\x12\x14\n" +
+	"\x05limit\x18\x02 \x01(\x05R\x05limit\"X\n" +
+	"\x16GetLeaderboardResponse\x12>\n" +
+	"\aentries\x18\x01 \x03(\v2$.hestia.platform.v1.LeaderboardEntryR\aentries\"\x95\x01\n" +
+	"\x10LeaderboardEntry\x12\x12\n" +
+	"\x04rank\x18\x01 \x01(\x05R\x04rank\x12$\n" +
+	"\x0euser_public_id\x18\x02 \x01(\tR\fuserPublicId\x12!\n" +
+	"\fdisplay_name\x18\x03 \x01(\tR\vdisplayName\x12\x0e\n" +
+	"\x02xp\x18\x04 \x01(\x03R\x02xp\x12\x14\n" +
+	"\x05level\x18\x05 \x01(\x05R\x05level2\xf5\a\n" +
 	"\tMeService\x12[\n" +
 	"\n" +
 	"GetProfile\x12%.hestia.platform.v1.GetProfileRequest\x1a&.hestia.platform.v1.GetProfileResponse\x12[\n" +
+	"\n" +
+	"GetSummary\x12%.hestia.platform.v1.GetSummaryRequest\x1a&.hestia.platform.v1.GetSummaryResponse\x12g\n" +
+	"\x0eGetLeaderboard\x12).hestia.platform.v1.GetLeaderboardRequest\x1a*.hestia.platform.v1.GetLeaderboardResponse\x12[\n" +
 	"\n" +
 	"GetBalance\x12%.hestia.platform.v1.GetBalanceRequest\x1a&.hestia.platform.v1.GetBalanceResponse\x12a\n" +
 	"\fListBalances\x12'.hestia.platform.v1.ListBalancesRequest\x1a(.hestia.platform.v1.ListBalancesResponse\x12m\n" +
@@ -864,7 +1455,7 @@ func file_hestia_platform_v1_me_proto_rawDescGZIP() []byte {
 	return file_hestia_platform_v1_me_proto_rawDescData
 }
 
-var file_hestia_platform_v1_me_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
+var file_hestia_platform_v1_me_proto_msgTypes = make([]protoimpl.MessageInfo, 25)
 var file_hestia_platform_v1_me_proto_goTypes = []any{
 	(*GetProfileRequest)(nil),        // 0: hestia.platform.v1.GetProfileRequest
 	(*GetProfileResponse)(nil),       // 1: hestia.platform.v1.GetProfileResponse
@@ -883,43 +1474,63 @@ var file_hestia_platform_v1_me_proto_goTypes = []any{
 	(*GetPrivacyResponse)(nil),       // 14: hestia.platform.v1.GetPrivacyResponse
 	(*UpdatePrivacyRequest)(nil),     // 15: hestia.platform.v1.UpdatePrivacyRequest
 	(*UpdatePrivacyResponse)(nil),    // 16: hestia.platform.v1.UpdatePrivacyResponse
-	(*UserProfile)(nil),              // 17: hestia.platform.v1.UserProfile
-	(*Balance)(nil),                  // 18: hestia.platform.v1.Balance
-	(*Entitlement)(nil),              // 19: hestia.platform.v1.Entitlement
-	(RedemptionStatus)(0),            // 20: hestia.platform.v1.RedemptionStatus
-	(*Redemption)(nil),               // 21: hestia.platform.v1.Redemption
+	(*GetSummaryRequest)(nil),        // 17: hestia.platform.v1.GetSummaryRequest
+	(*GetSummaryResponse)(nil),       // 18: hestia.platform.v1.GetSummaryResponse
+	(*CommunityXp)(nil),              // 19: hestia.platform.v1.CommunityXp
+	(*PetSummary)(nil),               // 20: hestia.platform.v1.PetSummary
+	(*BadgeSummary)(nil),             // 21: hestia.platform.v1.BadgeSummary
+	(*GetLeaderboardRequest)(nil),    // 22: hestia.platform.v1.GetLeaderboardRequest
+	(*GetLeaderboardResponse)(nil),   // 23: hestia.platform.v1.GetLeaderboardResponse
+	(*LeaderboardEntry)(nil),         // 24: hestia.platform.v1.LeaderboardEntry
+	(*UserProfile)(nil),              // 25: hestia.platform.v1.UserProfile
+	(*Balance)(nil),                  // 26: hestia.platform.v1.Balance
+	(*Entitlement)(nil),              // 27: hestia.platform.v1.Entitlement
+	(RedemptionStatus)(0),            // 28: hestia.platform.v1.RedemptionStatus
+	(*Redemption)(nil),               // 29: hestia.platform.v1.Redemption
+	(*timestamppb.Timestamp)(nil),    // 30: google.protobuf.Timestamp
 }
 var file_hestia_platform_v1_me_proto_depIdxs = []int32{
-	17, // 0: hestia.platform.v1.GetProfileResponse.profile:type_name -> hestia.platform.v1.UserProfile
-	18, // 1: hestia.platform.v1.GetBalanceResponse.balance:type_name -> hestia.platform.v1.Balance
-	18, // 2: hestia.platform.v1.ListBalancesResponse.balances:type_name -> hestia.platform.v1.Balance
-	19, // 3: hestia.platform.v1.ListEntitlementsResponse.entitlements:type_name -> hestia.platform.v1.Entitlement
-	20, // 4: hestia.platform.v1.ListRedemptionsRequest.status:type_name -> hestia.platform.v1.RedemptionStatus
-	21, // 5: hestia.platform.v1.ListRedemptionsResponse.redemptions:type_name -> hestia.platform.v1.Redemption
-	17, // 6: hestia.platform.v1.UpdateTimezoneResponse.profile:type_name -> hestia.platform.v1.UserProfile
+	25, // 0: hestia.platform.v1.GetProfileResponse.profile:type_name -> hestia.platform.v1.UserProfile
+	26, // 1: hestia.platform.v1.GetBalanceResponse.balance:type_name -> hestia.platform.v1.Balance
+	26, // 2: hestia.platform.v1.ListBalancesResponse.balances:type_name -> hestia.platform.v1.Balance
+	27, // 3: hestia.platform.v1.ListEntitlementsResponse.entitlements:type_name -> hestia.platform.v1.Entitlement
+	28, // 4: hestia.platform.v1.ListRedemptionsRequest.status:type_name -> hestia.platform.v1.RedemptionStatus
+	29, // 5: hestia.platform.v1.ListRedemptionsResponse.redemptions:type_name -> hestia.platform.v1.Redemption
+	25, // 6: hestia.platform.v1.UpdateTimezoneResponse.profile:type_name -> hestia.platform.v1.UserProfile
 	12, // 7: hestia.platform.v1.GetPrivacyResponse.settings:type_name -> hestia.platform.v1.PrivacySettings
 	12, // 8: hestia.platform.v1.UpdatePrivacyResponse.settings:type_name -> hestia.platform.v1.PrivacySettings
-	0,  // 9: hestia.platform.v1.MeService.GetProfile:input_type -> hestia.platform.v1.GetProfileRequest
-	2,  // 10: hestia.platform.v1.MeService.GetBalance:input_type -> hestia.platform.v1.GetBalanceRequest
-	4,  // 11: hestia.platform.v1.MeService.ListBalances:input_type -> hestia.platform.v1.ListBalancesRequest
-	6,  // 12: hestia.platform.v1.MeService.ListEntitlements:input_type -> hestia.platform.v1.ListEntitlementsRequest
-	8,  // 13: hestia.platform.v1.MeService.ListRedemptions:input_type -> hestia.platform.v1.ListRedemptionsRequest
-	10, // 14: hestia.platform.v1.MeService.UpdateTimezone:input_type -> hestia.platform.v1.UpdateTimezoneRequest
-	13, // 15: hestia.platform.v1.MeService.GetPrivacy:input_type -> hestia.platform.v1.GetPrivacyRequest
-	15, // 16: hestia.platform.v1.MeService.UpdatePrivacy:input_type -> hestia.platform.v1.UpdatePrivacyRequest
-	1,  // 17: hestia.platform.v1.MeService.GetProfile:output_type -> hestia.platform.v1.GetProfileResponse
-	3,  // 18: hestia.platform.v1.MeService.GetBalance:output_type -> hestia.platform.v1.GetBalanceResponse
-	5,  // 19: hestia.platform.v1.MeService.ListBalances:output_type -> hestia.platform.v1.ListBalancesResponse
-	7,  // 20: hestia.platform.v1.MeService.ListEntitlements:output_type -> hestia.platform.v1.ListEntitlementsResponse
-	9,  // 21: hestia.platform.v1.MeService.ListRedemptions:output_type -> hestia.platform.v1.ListRedemptionsResponse
-	11, // 22: hestia.platform.v1.MeService.UpdateTimezone:output_type -> hestia.platform.v1.UpdateTimezoneResponse
-	14, // 23: hestia.platform.v1.MeService.GetPrivacy:output_type -> hestia.platform.v1.GetPrivacyResponse
-	16, // 24: hestia.platform.v1.MeService.UpdatePrivacy:output_type -> hestia.platform.v1.UpdatePrivacyResponse
-	17, // [17:25] is the sub-list for method output_type
-	9,  // [9:17] is the sub-list for method input_type
-	9,  // [9:9] is the sub-list for extension type_name
-	9,  // [9:9] is the sub-list for extension extendee
-	0,  // [0:9] is the sub-list for field type_name
+	25, // 9: hestia.platform.v1.GetSummaryResponse.profile:type_name -> hestia.platform.v1.UserProfile
+	26, // 10: hestia.platform.v1.GetSummaryResponse.balances:type_name -> hestia.platform.v1.Balance
+	19, // 11: hestia.platform.v1.GetSummaryResponse.xp:type_name -> hestia.platform.v1.CommunityXp
+	20, // 12: hestia.platform.v1.GetSummaryResponse.pet:type_name -> hestia.platform.v1.PetSummary
+	21, // 13: hestia.platform.v1.GetSummaryResponse.badges:type_name -> hestia.platform.v1.BadgeSummary
+	30, // 14: hestia.platform.v1.BadgeSummary.acquired_at:type_name -> google.protobuf.Timestamp
+	24, // 15: hestia.platform.v1.GetLeaderboardResponse.entries:type_name -> hestia.platform.v1.LeaderboardEntry
+	0,  // 16: hestia.platform.v1.MeService.GetProfile:input_type -> hestia.platform.v1.GetProfileRequest
+	17, // 17: hestia.platform.v1.MeService.GetSummary:input_type -> hestia.platform.v1.GetSummaryRequest
+	22, // 18: hestia.platform.v1.MeService.GetLeaderboard:input_type -> hestia.platform.v1.GetLeaderboardRequest
+	2,  // 19: hestia.platform.v1.MeService.GetBalance:input_type -> hestia.platform.v1.GetBalanceRequest
+	4,  // 20: hestia.platform.v1.MeService.ListBalances:input_type -> hestia.platform.v1.ListBalancesRequest
+	6,  // 21: hestia.platform.v1.MeService.ListEntitlements:input_type -> hestia.platform.v1.ListEntitlementsRequest
+	8,  // 22: hestia.platform.v1.MeService.ListRedemptions:input_type -> hestia.platform.v1.ListRedemptionsRequest
+	10, // 23: hestia.platform.v1.MeService.UpdateTimezone:input_type -> hestia.platform.v1.UpdateTimezoneRequest
+	13, // 24: hestia.platform.v1.MeService.GetPrivacy:input_type -> hestia.platform.v1.GetPrivacyRequest
+	15, // 25: hestia.platform.v1.MeService.UpdatePrivacy:input_type -> hestia.platform.v1.UpdatePrivacyRequest
+	1,  // 26: hestia.platform.v1.MeService.GetProfile:output_type -> hestia.platform.v1.GetProfileResponse
+	18, // 27: hestia.platform.v1.MeService.GetSummary:output_type -> hestia.platform.v1.GetSummaryResponse
+	23, // 28: hestia.platform.v1.MeService.GetLeaderboard:output_type -> hestia.platform.v1.GetLeaderboardResponse
+	3,  // 29: hestia.platform.v1.MeService.GetBalance:output_type -> hestia.platform.v1.GetBalanceResponse
+	5,  // 30: hestia.platform.v1.MeService.ListBalances:output_type -> hestia.platform.v1.ListBalancesResponse
+	7,  // 31: hestia.platform.v1.MeService.ListEntitlements:output_type -> hestia.platform.v1.ListEntitlementsResponse
+	9,  // 32: hestia.platform.v1.MeService.ListRedemptions:output_type -> hestia.platform.v1.ListRedemptionsResponse
+	11, // 33: hestia.platform.v1.MeService.UpdateTimezone:output_type -> hestia.platform.v1.UpdateTimezoneResponse
+	14, // 34: hestia.platform.v1.MeService.GetPrivacy:output_type -> hestia.platform.v1.GetPrivacyResponse
+	16, // 35: hestia.platform.v1.MeService.UpdatePrivacy:output_type -> hestia.platform.v1.UpdatePrivacyResponse
+	26, // [26:36] is the sub-list for method output_type
+	16, // [16:26] is the sub-list for method input_type
+	16, // [16:16] is the sub-list for extension type_name
+	16, // [16:16] is the sub-list for extension extendee
+	0,  // [0:16] is the sub-list for field type_name
 }
 
 func init() { file_hestia_platform_v1_me_proto_init() }
@@ -929,13 +1540,14 @@ func file_hestia_platform_v1_me_proto_init() {
 	}
 	file_hestia_platform_v1_common_proto_init()
 	file_hestia_platform_v1_me_proto_msgTypes[15].OneofWrappers = []any{}
+	file_hestia_platform_v1_me_proto_msgTypes[18].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_hestia_platform_v1_me_proto_rawDesc), len(file_hestia_platform_v1_me_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   17,
+			NumMessages:   25,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

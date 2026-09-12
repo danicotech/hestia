@@ -77,6 +77,13 @@ type ProfileReader interface {
 	Profile(ctx context.Context, userID int64) (*readmodel.ProfileView, error)
 	// Balances 一次回全部幣別的餘額(前端要一次顯示,不該打 N 次)。
 	Balances(ctx context.Context, userID int64) ([]readmodel.BalanceView, error)
+	// Summary 一次回 /profile 要的全部內容(檔案、餘額、等級、寵物、徽章)。
+	//
+	// 為什麼不讓入口層自己組四支:等級要用曲線算,而曲線存在資料庫。
+	// 在這裡組完,「等級怎麼算」就只有一個實作位置。
+	Summary(ctx context.Context, userID int64) (*readmodel.SummaryView, error)
+	// Leaderboard 回某社群的 XP 排行。limit 超出範圍由實作夾到預設值。
+	Leaderboard(ctx context.Context, communityPublicID string, limit int32) ([]readmodel.LeaderboardEntry, error)
 }
 
 // ProfileWriter 是「我的檔案」的寫入 port。

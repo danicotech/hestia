@@ -4,6 +4,7 @@ syntax = "proto3";
 // 所以請求裡沒有 user_public_id——不接受「代查別人」,那是管理端的事。
 package hestia.platform.v1;
 
+import "google/protobuf/timestamp.proto";
 import "hestia/platform/v1/common.proto";
 
 option go_package = "github.com/danicotech/hestia/gen/hestia/platform/v1;platformv1";
@@ -107,8 +108,83 @@ message UpdatePrivacyResponse {
   PrivacySettings settings = 1;
 }
 
+// GetSummary 一次回 /profile 要顯示的全部內容。
+//
+// 為什麼不讓呼叫端打四支:Discord 的互動視窗只有 3 秒,四次往返很容易超時,
+// 而超時的表現是指令「沒有反應」—— 使用者只會再按一次,然後再超時一次。
+message GetSummaryRequest {}
+
+message GetSummaryResponse {
+  UserProfile profile = 1;
+  repeated Balance balances = 2;
+  // 每個社群一列。沒有參加任何社群時是空的。
+  repeated CommunityXp xp = 3;
+  // 出戰中的寵物;沒有就不帶(不是錯誤,多數人一開始都沒有)。
+  optional PetSummary pet = 4;
+  // 最近取得的徽章,**不是全部** —— embed 有長度上限,全部送會被截掉。
+  repeated BadgeSummary badges = 5;
+}
+
+// CommunityXp 是一個人在某社群的經驗與等級。
+//
+// 等級與進度由後端算好,不讓呈現層自己算:曲線存在 xp_rulesets.config,
+// 各端各算一次就會有兩份實作,而其中一份遲早與資料庫不同步 ——
+// 「網頁說我 12 級,bot 說我 11 級」是查不出來的那種問題。
+message CommunityXp {
+  string community_public_id = 1;
+  string community_name = 2;
+  int64 xp = 3;
+  int32 level = 4;
+  // 本級已累積 / 本級總共需要。兩個一起才畫得出進度條。
+  int64 xp_into_level = 5;
+  int64 xp_for_level = 6;
+}
+
+message PetSummary {
+  string public_id = 1;
+  // 主人取的暱稱;沒取就是物品定義的名稱。
+  string name = 2;
+  string icon_url = 3;
+  string rarity = 4;
+  int64 xp = 5;
+  int32 level = 6;
+}
+
+// BadgeSummary 是一枚徽章。徽章不是獨立系統,是 category='badge' 的物品。
+message BadgeSummary {
+  string public_id = 1;
+  string name = 2;
+  string rarity = 3;
+  string icon_url = 4;
+  google.protobuf.Timestamp acquired_at = 5;
+}
+
+message GetLeaderboardRequest {
+  // 社群的 public_id。
+  string community_public_id = 1;
+  // 取前幾名;<= 0 或超過上限一律夾到預設值(不為了顯示參數讓指令失敗)。
+  int32 limit = 2;
+}
+
+message GetLeaderboardResponse {
+  repeated LeaderboardEntry entries = 1;
+}
+
+message LeaderboardEntry {
+  int32 rank = 1;
+  string user_public_id = 2;
+  string display_name = 3;
+  int64 xp = 4;
+  int32 level = 5;
+}
+
 service MeService {
   rpc GetProfile(GetProfileRequest) returns (GetProfileResponse);
+  // 個人檔案總覽(/profile)。在代打白名單內:使用者的 Discord 身分由
+  // Discord 自己證明,看自己的檔案是合理的。
+  rpc GetSummary(GetSummaryRequest) returns (GetSummaryResponse);
+  // 排行榜。純讀取、不涉個資以外的資訊,同樣可代打。
+  rpc GetLeaderboard(GetLeaderboardRequest) returns (GetLeaderboardResponse);
   rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse);
   rpc ListBalances(ListBalancesRequest) returns (ListBalancesResponse);
   rpc ListEntitlements(ListEntitlementsRequest) returns (ListEntitlementsResponse);

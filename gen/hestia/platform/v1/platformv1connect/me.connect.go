@@ -37,6 +37,11 @@ const (
 const (
 	// MeServiceGetProfileProcedure is the fully-qualified name of the MeService's GetProfile RPC.
 	MeServiceGetProfileProcedure = "/hestia.platform.v1.MeService/GetProfile"
+	// MeServiceGetSummaryProcedure is the fully-qualified name of the MeService's GetSummary RPC.
+	MeServiceGetSummaryProcedure = "/hestia.platform.v1.MeService/GetSummary"
+	// MeServiceGetLeaderboardProcedure is the fully-qualified name of the MeService's GetLeaderboard
+	// RPC.
+	MeServiceGetLeaderboardProcedure = "/hestia.platform.v1.MeService/GetLeaderboard"
 	// MeServiceGetBalanceProcedure is the fully-qualified name of the MeService's GetBalance RPC.
 	MeServiceGetBalanceProcedure = "/hestia.platform.v1.MeService/GetBalance"
 	// MeServiceListBalancesProcedure is the fully-qualified name of the MeService's ListBalances RPC.
@@ -59,6 +64,11 @@ const (
 // MeServiceClient is a client for the hestia.platform.v1.MeService service.
 type MeServiceClient interface {
 	GetProfile(context.Context, *connect.Request[v1.GetProfileRequest]) (*connect.Response[v1.GetProfileResponse], error)
+	// 個人檔案總覽(/profile)。在代打白名單內:使用者的 Discord 身分由
+	// Discord 自己證明,看自己的檔案是合理的。
+	GetSummary(context.Context, *connect.Request[v1.GetSummaryRequest]) (*connect.Response[v1.GetSummaryResponse], error)
+	// 排行榜。純讀取、不涉個資以外的資訊,同樣可代打。
+	GetLeaderboard(context.Context, *connect.Request[v1.GetLeaderboardRequest]) (*connect.Response[v1.GetLeaderboardResponse], error)
 	GetBalance(context.Context, *connect.Request[v1.GetBalanceRequest]) (*connect.Response[v1.GetBalanceResponse], error)
 	ListBalances(context.Context, *connect.Request[v1.ListBalancesRequest]) (*connect.Response[v1.ListBalancesResponse], error)
 	ListEntitlements(context.Context, *connect.Request[v1.ListEntitlementsRequest]) (*connect.Response[v1.ListEntitlementsResponse], error)
@@ -86,6 +96,18 @@ func NewMeServiceClient(httpClient connect.HTTPClient, baseURL string, opts ...c
 			httpClient,
 			baseURL+MeServiceGetProfileProcedure,
 			connect.WithSchema(meServiceMethods.ByName("GetProfile")),
+			connect.WithClientOptions(opts...),
+		),
+		getSummary: connect.NewClient[v1.GetSummaryRequest, v1.GetSummaryResponse](
+			httpClient,
+			baseURL+MeServiceGetSummaryProcedure,
+			connect.WithSchema(meServiceMethods.ByName("GetSummary")),
+			connect.WithClientOptions(opts...),
+		),
+		getLeaderboard: connect.NewClient[v1.GetLeaderboardRequest, v1.GetLeaderboardResponse](
+			httpClient,
+			baseURL+MeServiceGetLeaderboardProcedure,
+			connect.WithSchema(meServiceMethods.ByName("GetLeaderboard")),
 			connect.WithClientOptions(opts...),
 		),
 		getBalance: connect.NewClient[v1.GetBalanceRequest, v1.GetBalanceResponse](
@@ -136,6 +158,8 @@ func NewMeServiceClient(httpClient connect.HTTPClient, baseURL string, opts ...c
 // meServiceClient implements MeServiceClient.
 type meServiceClient struct {
 	getProfile       *connect.Client[v1.GetProfileRequest, v1.GetProfileResponse]
+	getSummary       *connect.Client[v1.GetSummaryRequest, v1.GetSummaryResponse]
+	getLeaderboard   *connect.Client[v1.GetLeaderboardRequest, v1.GetLeaderboardResponse]
 	getBalance       *connect.Client[v1.GetBalanceRequest, v1.GetBalanceResponse]
 	listBalances     *connect.Client[v1.ListBalancesRequest, v1.ListBalancesResponse]
 	listEntitlements *connect.Client[v1.ListEntitlementsRequest, v1.ListEntitlementsResponse]
@@ -148,6 +172,16 @@ type meServiceClient struct {
 // GetProfile calls hestia.platform.v1.MeService.GetProfile.
 func (c *meServiceClient) GetProfile(ctx context.Context, req *connect.Request[v1.GetProfileRequest]) (*connect.Response[v1.GetProfileResponse], error) {
 	return c.getProfile.CallUnary(ctx, req)
+}
+
+// GetSummary calls hestia.platform.v1.MeService.GetSummary.
+func (c *meServiceClient) GetSummary(ctx context.Context, req *connect.Request[v1.GetSummaryRequest]) (*connect.Response[v1.GetSummaryResponse], error) {
+	return c.getSummary.CallUnary(ctx, req)
+}
+
+// GetLeaderboard calls hestia.platform.v1.MeService.GetLeaderboard.
+func (c *meServiceClient) GetLeaderboard(ctx context.Context, req *connect.Request[v1.GetLeaderboardRequest]) (*connect.Response[v1.GetLeaderboardResponse], error) {
+	return c.getLeaderboard.CallUnary(ctx, req)
 }
 
 // GetBalance calls hestia.platform.v1.MeService.GetBalance.
@@ -188,6 +222,11 @@ func (c *meServiceClient) UpdatePrivacy(ctx context.Context, req *connect.Reques
 // MeServiceHandler is an implementation of the hestia.platform.v1.MeService service.
 type MeServiceHandler interface {
 	GetProfile(context.Context, *connect.Request[v1.GetProfileRequest]) (*connect.Response[v1.GetProfileResponse], error)
+	// 個人檔案總覽(/profile)。在代打白名單內:使用者的 Discord 身分由
+	// Discord 自己證明,看自己的檔案是合理的。
+	GetSummary(context.Context, *connect.Request[v1.GetSummaryRequest]) (*connect.Response[v1.GetSummaryResponse], error)
+	// 排行榜。純讀取、不涉個資以外的資訊,同樣可代打。
+	GetLeaderboard(context.Context, *connect.Request[v1.GetLeaderboardRequest]) (*connect.Response[v1.GetLeaderboardResponse], error)
 	GetBalance(context.Context, *connect.Request[v1.GetBalanceRequest]) (*connect.Response[v1.GetBalanceResponse], error)
 	ListBalances(context.Context, *connect.Request[v1.ListBalancesRequest]) (*connect.Response[v1.ListBalancesResponse], error)
 	ListEntitlements(context.Context, *connect.Request[v1.ListEntitlementsRequest]) (*connect.Response[v1.ListEntitlementsResponse], error)
@@ -211,6 +250,18 @@ func NewMeServiceHandler(svc MeServiceHandler, opts ...connect.HandlerOption) (s
 		MeServiceGetProfileProcedure,
 		svc.GetProfile,
 		connect.WithSchema(meServiceMethods.ByName("GetProfile")),
+		connect.WithHandlerOptions(opts...),
+	)
+	meServiceGetSummaryHandler := connect.NewUnaryHandler(
+		MeServiceGetSummaryProcedure,
+		svc.GetSummary,
+		connect.WithSchema(meServiceMethods.ByName("GetSummary")),
+		connect.WithHandlerOptions(opts...),
+	)
+	meServiceGetLeaderboardHandler := connect.NewUnaryHandler(
+		MeServiceGetLeaderboardProcedure,
+		svc.GetLeaderboard,
+		connect.WithSchema(meServiceMethods.ByName("GetLeaderboard")),
 		connect.WithHandlerOptions(opts...),
 	)
 	meServiceGetBalanceHandler := connect.NewUnaryHandler(
@@ -259,6 +310,10 @@ func NewMeServiceHandler(svc MeServiceHandler, opts ...connect.HandlerOption) (s
 		switch r.URL.Path {
 		case MeServiceGetProfileProcedure:
 			meServiceGetProfileHandler.ServeHTTP(w, r)
+		case MeServiceGetSummaryProcedure:
+			meServiceGetSummaryHandler.ServeHTTP(w, r)
+		case MeServiceGetLeaderboardProcedure:
+			meServiceGetLeaderboardHandler.ServeHTTP(w, r)
 		case MeServiceGetBalanceProcedure:
 			meServiceGetBalanceHandler.ServeHTTP(w, r)
 		case MeServiceListBalancesProcedure:
@@ -284,6 +339,14 @@ type UnimplementedMeServiceHandler struct{}
 
 func (UnimplementedMeServiceHandler) GetProfile(context.Context, *connect.Request[v1.GetProfileRequest]) (*connect.Response[v1.GetProfileResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("hestia.platform.v1.MeService.GetProfile is not implemented"))
+}
+
+func (UnimplementedMeServiceHandler) GetSummary(context.Context, *connect.Request[v1.GetSummaryRequest]) (*connect.Response[v1.GetSummaryResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("hestia.platform.v1.MeService.GetSummary is not implemented"))
+}
+
+func (UnimplementedMeServiceHandler) GetLeaderboard(context.Context, *connect.Request[v1.GetLeaderboardRequest]) (*connect.Response[v1.GetLeaderboardResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("hestia.platform.v1.MeService.GetLeaderboard is not implemented"))
 }
 
 func (UnimplementedMeServiceHandler) GetBalance(context.Context, *connect.Request[v1.GetBalanceRequest]) (*connect.Response[v1.GetBalanceResponse], error) {

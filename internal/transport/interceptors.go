@@ -171,6 +171,10 @@ var delegatedProcedures = map[string]struct{}{
 	platformv1connect.MeServiceListBalancesProcedure:     {},
 	platformv1connect.MeServiceListEntitlementsProcedure: {},
 	platformv1connect.MeServiceListRedemptionsProcedure:  {},
+	// 個人檔案總覽與排行榜:純讀取,而且看的就是呼叫者自己的資料
+	// (排行榜本來就是公開的)。與 GetProfile 同一類。
+	platformv1connect.MeServiceGetSummaryProcedure:     {},
+	platformv1connect.MeServiceGetLeaderboardProcedure: {},
 	// 隱私設定:使用者的 Discord 身分由 Discord 自己證明,從 /privacy 調整
 	// **自己的**設定是合理的 —— 而且這是唯一做得出 `/privacy optout` 的路徑
 	// (網頁端要先登入,而最需要退出的人正是只在 Discord 出沒的人)。

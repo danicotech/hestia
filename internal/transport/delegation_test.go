@@ -75,6 +75,20 @@ func (s *spyProfiles) SetTimezone(_ context.Context, _ int64, tz string) (*readm
 	return &readmodel.ProfileView{PublicID: "U1", Timezone: tz}, nil
 }
 
+// Summary 與 Profile 一樣記下主體:代打測試要驗「查的是誰的資料」。
+func (s *spyProfiles) Summary(_ context.Context, userID int64) (*readmodel.SummaryView, error) {
+	s.mu.Lock()
+	s.lastUser = userID
+	s.mu.Unlock()
+	return &readmodel.SummaryView{
+		Profile: readmodel.ProfileView{PublicID: fmt.Sprintf("U-%d", userID)},
+	}, nil
+}
+
+func (s *spyProfiles) Leaderboard(context.Context, string, int32) ([]readmodel.LeaderboardEntry, error) {
+	return nil, nil
+}
+
 func (s *spyProfiles) subject() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()

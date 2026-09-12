@@ -10,6 +10,22 @@ import (
 	"time"
 )
 
+const getCommunityCurveByPublicID = `-- name: GetCommunityCurveByPublicID :one
+SELECT r.config
+FROM platform.communities c
+LEFT JOIN platform.xp_rulesets r ON r.id = c.xp_ruleset_id
+WHERE c.public_id = $1
+`
+
+// 排行榜用:整個社群共用一份曲線,讀一次就夠。
+// LEFT JOIN 的理由同 ListUserXP —— 沒指派 ruleset 時回 NULL,呼叫端用預設。
+func (q *Queries) GetCommunityCurveByPublicID(ctx context.Context, publicID string) ([]byte, error) {
+	row := q.db.QueryRow(ctx, getCommunityCurveByPublicID, publicID)
+	var config []byte
+	err := row.Scan(&config)
+	return config, err
+}
+
 const getDeployedPet = `-- name: GetDeployedPet :one
 SELECT ps.item_instance_id,
        ii.public_id,
@@ -45,6 +61,23 @@ func (q *Queries) GetDeployedPet(ctx context.Context, ownerID int64) (GetDeploye
 		&i.Xp,
 	)
 	return i, err
+}
+
+const getSoleCommunityPublicID = `-- name: GetSoleCommunityPublicID :one
+SELECT public_id FROM platform.communities
+WHERE (SELECT count(*) FROM platform.communities) = 1
+`
+
+// 呼叫端沒指定社群時的退路:**只有在全庫剛好一個社群時**才回答。
+//
+// 兩個以上就回 0 列,讓呼叫端明確失敗 —— 猜一個的話,B 社群的人會看到
+// A 社群的排行榜,而那個錯誤沒有任何徵兆。正解是讓指令帶著發生地的
+// guild id 過來(schemas/22 的 A 方案),那時這支查詢就不再需要。
+func (q *Queries) GetSoleCommunityPublicID(ctx context.Context) (string, error) {
+	row := q.db.QueryRow(ctx, getSoleCommunityPublicID)
+	var public_id string
+	err := row.Scan(&public_id)
+	return public_id, err
 }
 
 const getUserPrivacy = `-- name: GetUserPrivacy :one

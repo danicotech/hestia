@@ -213,3 +213,62 @@ func announcementToProto(a notification.Announcement) *renderv1.Announcement {
 		},
 	}
 }
+
+func summaryToProto(s *readmodel.SummaryView) *platformv1.GetSummaryResponse {
+	out := &platformv1.GetSummaryResponse{
+		Profile:  profileToProto(&s.Profile),
+		Balances: make([]*platformv1.Balance, 0, len(s.Balances)),
+		Xp:       make([]*platformv1.CommunityXp, 0, len(s.XP)),
+		Badges:   make([]*platformv1.BadgeSummary, 0, len(s.Badges)),
+	}
+	for _, b := range s.Balances {
+		out.Balances = append(out.Balances,
+			&platformv1.Balance{Currency: b.Currency, Amount: b.Amount})
+	}
+	for _, x := range s.XP {
+		out.Xp = append(out.Xp, &platformv1.CommunityXp{
+			CommunityPublicId: x.CommunityPublicID,
+			CommunityName:     x.CommunityName,
+			Xp:                x.XP,
+			Level:             x.Level,
+			XpIntoLevel:       x.XPIntoLevel,
+			XpForLevel:        x.XPForLevel,
+		})
+	}
+	if s.Pet != nil {
+		out.Pet = &platformv1.PetSummary{
+			PublicId: s.Pet.PublicID,
+			Name:     s.Pet.Name,
+			IconUrl:  s.Pet.IconURL,
+			Rarity:   s.Pet.Rarity,
+			Xp:       s.Pet.XP,
+			Level:    s.Pet.Level,
+		}
+	}
+	for _, b := range s.Badges {
+		out.Badges = append(out.Badges, &platformv1.BadgeSummary{
+			PublicId:   b.PublicID,
+			Name:       b.Name,
+			Rarity:     b.Rarity,
+			IconUrl:    b.IconURL,
+			AcquiredAt: timestamppb.New(b.AcquiredAt),
+		})
+	}
+	return out
+}
+
+func leaderboardToProto(entries []readmodel.LeaderboardEntry) *platformv1.GetLeaderboardResponse {
+	out := &platformv1.GetLeaderboardResponse{
+		Entries: make([]*platformv1.LeaderboardEntry, 0, len(entries)),
+	}
+	for _, e := range entries {
+		out.Entries = append(out.Entries, &platformv1.LeaderboardEntry{
+			Rank:         e.Rank,
+			UserPublicId: e.PublicID,
+			DisplayName:  e.DisplayName,
+			Xp:           e.XP,
+			Level:        e.Level,
+		})
+	}
+	return out
+}

@@ -138,6 +138,9 @@ type Querier interface {
 	// 查無列 = 沒設定,呼叫端應略過而不是報錯(部署可能刻意不設某個用途)。
 	GetChannelForPurpose(ctx context.Context, arg GetChannelForPurposeParams) (string, error)
 	GetCommunityByPublicID(ctx context.Context, publicID string) (GetCommunityByPublicIDRow, error)
+	// 排行榜用:整個社群共用一份曲線,讀一次就夠。
+	// LEFT JOIN 的理由同 ListUserXP —— 沒指派 ruleset 時回 NULL,呼叫端用預設。
+	GetCommunityCurveByPublicID(ctx context.Context, publicID string) ([]byte, error)
 	// LEFT JOIN:community 存在但 xp_ruleset_id 為 NULL(M1 可能還沒建 ruleset)時
 	// 回 NULL config,呼叫端採安全預設(無冷卻、無 cap);community 不存在 → 無列(ErrNoRows)
 	GetCommunityXpConfig(ctx context.Context, id int64) ([]byte, error)
@@ -195,6 +198,12 @@ type Querier interface {
 	GetSessionIDByPublicID(ctx context.Context, arg GetSessionIDByPublicIDParams) (int64, error)
 	// is_listed 用 DB 時鐘計算(單一時鐘來源):listed_at 非空且已到、delisted_at 空或未到。
 	GetShopItemForPurchase(ctx context.Context, publicID string) (GetShopItemForPurchaseRow, error)
+	// 呼叫端沒指定社群時的退路:**只有在全庫剛好一個社群時**才回答。
+	//
+	// 兩個以上就回 0 列,讓呼叫端明確失敗 —— 猜一個的話,B 社群的人會看到
+	// A 社群的排行榜,而那個錯誤沒有任何徵兆。正解是讓指令帶著發生地的
+	// guild id 過來(schemas/22 的 A 方案),那時這支查詢就不再需要。
+	GetSoleCommunityPublicID(ctx context.Context) (string, error)
 	// guild snowflake → (space_id, community_id)。community_id 是 activity_daily 的 PK 之一。
 	GetSpaceByExternalID(ctx context.Context, arg GetSpaceByExternalIDParams) (GetSpaceByExternalIDRow, error)
 	// 註冊前先查:CLI 重跑不該噴 UNIQUE violation,也不該無聲改掉既有設定。

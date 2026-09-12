@@ -131,3 +131,60 @@ type LedgerEntriesPage struct {
 	Entries       []LedgerEntryView
 	NextPageToken string
 }
+
+// ── 個人檔案總覽(schemas/24、25;/profile 指令用)────────────────────────
+
+// CommunityXPView 是一個人在某個社群的 XP 與等級。
+//
+// 等級與進度在讀取側算好才送出去,不讓呼叫端自己算:曲線存在
+// xp_rulesets.config,而 Discord 閘道與網頁各算一次就會有兩份實作,
+// 其中一份遲早會跟資料庫裡的設定不同步。
+type CommunityXPView struct {
+	CommunityPublicID string
+	CommunityName     string
+	XP                int64
+	Level             int32
+	// XPIntoLevel / XPForLevel 是本級的進度(畫進度條用)。
+	XPIntoLevel int64
+	XPForLevel  int64
+}
+
+// PetView 是出戰中的寵物。等級同樣在讀取側算好。
+type PetView struct {
+	PublicID string
+	Name     string
+	IconURL  string
+	Rarity   string
+	XP       int64
+	Level    int32
+}
+
+// BadgeView 是一枚徽章。徽章不是獨立系統,是 category='badge' 的物品。
+type BadgeView struct {
+	PublicID   string
+	Name       string
+	Rarity     string
+	IconURL    string
+	AcquiredAt time.Time
+}
+
+// SummaryView 是 /profile 要顯示的全部內容。
+//
+// 做成一支查詢而不是讓呼叫端打四支:Discord 的互動只有 3 秒,
+// 四次往返很容易超時,而超時的表現是指令「沒有反應」。
+type SummaryView struct {
+	Profile  ProfileView
+	Balances []BalanceView
+	XP       []CommunityXPView
+	Pet      *PetView // nil = 沒有出戰中的寵物
+	Badges   []BadgeView
+}
+
+// LeaderboardEntry 是排行榜的一列。
+type LeaderboardEntry struct {
+	Rank        int32
+	PublicID    string
+	DisplayName string
+	XP          int64
+	Level       int32
+}

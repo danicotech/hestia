@@ -199,3 +199,42 @@ func (h meHandler) UpdatePrivacy(
 	}
 	return connect.NewResponse(&platformv1.UpdatePrivacyResponse{Settings: privacyToProto(v)}), nil
 }
+
+// GetSummary 是 /profile 的資料來源:一次回檔案、餘額、等級、寵物、徽章。
+func (h meHandler) GetSummary(
+	ctx context.Context, _ *connect.Request[platformv1.GetSummaryRequest],
+) (*connect.Response[platformv1.GetSummaryResponse], error) {
+	if h.profiles == nil {
+		return nil, unimplemented("MeService.GetSummary")
+	}
+	userID, err := requireUser(ctx)
+	if err != nil {
+		return nil, err
+	}
+	sum, err := h.profiles.Summary(ctx, userID)
+	if err != nil {
+		return nil, toConnectError(err)
+	}
+	return connect.NewResponse(summaryToProto(sum)), nil
+}
+
+// GetLeaderboard 回某社群的 XP 排行。
+//
+// 不要求呼叫者屬於該社群:排行榜本來就是公開的,而且 Discord 上看得到
+// 這個指令的人本來就在那個伺服器裡。
+func (h meHandler) GetLeaderboard(
+	ctx context.Context, req *connect.Request[platformv1.GetLeaderboardRequest],
+) (*connect.Response[platformv1.GetLeaderboardResponse], error) {
+	if h.profiles == nil {
+		return nil, unimplemented("MeService.GetLeaderboard")
+	}
+	if _, err := requireUser(ctx); err != nil {
+		return nil, err
+	}
+	entries, err := h.profiles.Leaderboard(ctx,
+		req.Msg.GetCommunityPublicId(), req.Msg.GetLimit())
+	if err != nil {
+		return nil, toConnectError(err)
+	}
+	return connect.NewResponse(leaderboardToProto(entries)), nil
+}

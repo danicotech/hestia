@@ -178,6 +178,15 @@ func (f fakeProfiles) Balances(context.Context, int64) ([]readmodel.BalanceView,
 func (f fakeProfiles) SetTimezone(_ context.Context, _ int64, tz string) (*readmodel.ProfileView, error) {
 	return &readmodel.ProfileView{PublicID: "U1", Timezone: tz}, nil
 }
+func (f fakeProfiles) Summary(context.Context, int64) (*readmodel.SummaryView, error) {
+	if f.view == nil {
+		return &readmodel.SummaryView{}, nil
+	}
+	return &readmodel.SummaryView{Profile: *f.view, Balances: f.balances}, nil
+}
+func (f fakeProfiles) Leaderboard(context.Context, string, int32) ([]readmodel.LeaderboardEntry, error) {
+	return nil, nil
+}
 
 type fakeEntries struct {
 	page    *readmodel.LedgerEntriesPage
