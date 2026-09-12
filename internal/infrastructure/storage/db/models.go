@@ -25,6 +25,8 @@ type ActivityBet struct {
 	PayoutRecalculated  bool
 	SettledAt           *time.Time
 	CreatedAt           time.Time
+	// 派彩分錄 id。與 ledger_stake_entry_id / ledger_refund_entry_id 構成完整稽核鏈:三種金流都能從注單直接定址到帳本分錄,不必反查。不設 FK —— token_entries 是按月分區表,無法由 DB 保證全域唯一(同 00003 的理由)。
+	LedgerPayoutEntryID *int64
 }
 
 // 串關的每一腿。同輪比賽彼此不共用選手,所以各腿天然無相關 —— 單淘汰的結構性保證。棄賽時該腿標 void 並從乘積中移除,剩餘腿仍用各自鎖定的 odds_milli 重算。
@@ -67,6 +69,8 @@ type ActivityHandicapItem struct {
 	SortOrder   int32
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
+	// ULID,對外唯一識別。proto 的 HandicapItem.public_id 與 SelectRequest.item_public_id 都指這個。
+	PublicID string
 }
 
 // 每次購買一列。退費只是 BP 內部的事(改 spent + 標 voided),不經 Ledger。外鍵指向 match_budgets 的複合鍵 —— 沒有預算的人連一列都插不進來。

@@ -28,11 +28,83 @@ type Querier interface {
 	AddUserXp(ctx context.Context, arg AddUserXpParams) (int64, error)
 	// 呼叫前必須已 LockBalanceForUpdate;CHECK(balance >= 0) 是最後防線,不是主要檢查
 	ApplyBalanceDelta(ctx context.Context, arg ApplyBalanceDeltaParams) (int64, error)
+	// 對帳修復:把 RecalcFencerStats 算出來的值寫回去。
+	// 刻意**不**在這支裡重寫一次統計 SQL —— 口徑只能有一個權威位置(鐵則 9),
+	// 兩份會慢慢長歪,而歪掉的那天沒有人看得出哪一份才對。
+	ApplyFencerStats(ctx context.Context, arg ApplyFencerStatsParams) (int64, error)
+	// 一次抽籤動輒數十位選手。用 unnest 兩個陣列做一次 UPDATE,而不是迴圈單筆:
+	// 少掉 N 次 round-trip 只是順帶的好處,真正的理由是**整批在一個語句裡**,
+	// 不會出現「寫到第 17 位時失敗、前 16 位已經有籤位」這種中途狀態。
+	// :execrows 讓 adapter 能驗證影響列數 == len(Seats);對不上代表有 player_id
+	// 不屬於這屆(或已被刪),那時候整筆 rollback 比寫進去一半安全。
+	AssignSeeds(ctx context.Context, arg AssignSeedsParams) (int64, error)
+	// 讀注單本體(不含腿)。呼叫前必須已 LockBetsForSettle —— 判定與派彩依賴的是
+	// **鎖之後**的狀態,鎖之前讀到的 status 可能是另一個 tx 正要改掉的舊快照。
+	//
+	// ORDER BY id 與取鎖順序一致,結算結果才可重現。
+	BetsByIDs(ctx context.Context, betIds []int64) ([]ActivityBet, error)
+	// ══ 列出自己的注單 ══════════════════════════════════════════════
+	// 某人在某屆的全部注單,新到舊。腿由 LegsByBetIDs 補齊(一次查詢,不是逐張回查)。
+	//
+	// id DESC 收尾:created_at 不唯一,同一次連點會落在同一個微秒,
+	// 沒有第二個排序鍵時清單順序會隨執行計畫變動,使用者每次重整看到的順序都不一樣。
+	// 走 bets_user_created_idx (user_id, created_at DESC)。
+	BetsByUser(ctx context.Context, arg BetsByUserParams) ([]ActivityBet, error)
+	// 批次讀場次,順序不拘(呼叫端自己用 public_id 索引)。
+	//
+	// **兩組 user_id 都要撈**,這是「選手不得對自己參與的場次下注」的兩條比對路徑:
+	//   tournament_players.user_id  有綁帳號報名的選手
+	//   fencers.user_id             純活動報名(tournament_players.user_id IS NULL)、
+	//                               但劍士本人曾經綁過平台帳號
+	// 只比對前者,一個沒綁帳號報名的選手就能用自己的平台帳號賭自己輸 —— 漏掉 fencers
+	// 那條等於整個檢查形同虛設。兩者都沒綁時擋不住,那是雙軌身分的固有代價。
+	//
+	// p1/p2 走 LEFT JOIN(對手未定時為 NULL),所以 fencers 也只能 LEFT JOIN。
+	// NULL 一律 COALESCE 成 0:0 不是合法的 id,而 betting.Participant.IsUser 對 0 恆回 false
+	// ——「兩邊都沒綁帳號」絕不能被當成「所有人都是這位選手」。
+	BettingMatchesByPublicIDs(ctx context.Context, publicIds []string) ([]BettingMatchesByPublicIDsRow, error)
+	// 賠率參數。tournaments.config 是逐屆規則的唯一權威(同 bp_per_rank_gap 的取法),
+	// 這裡只負責「把 JSONB 取成整數」,預設值一律不寫在 SQL 裡 ——
+	// 權威在 betting.OddsConfig.Normalize(),缺值回 0 由它補,兩邊各寫一份就會漂移。
+	//
+	// substring(... FROM '^-?[0-9]{1,18}$') 是必要的護欄,不是潔癖:
+	//   * config 是裁判手打進 JSONB 的,'2.5' 或 'abc' 都可能出現,
+	//     直接 ::bigint 會讓整個下注頁變成 SQLSTATE 22P02(白畫面,沒有人看得出原因);
+	//     取不到合法整數字面值就回 NULL → COALESCE 0 → Normalize 退回預設值,賽事照常開。
+	//   * 18 位上限保證轉得進 BIGINT,不會在 cast 時溢位。
+	//   * 只收純整數字面值,所以這條路徑上不存在任何 float / numeric 運算。
+	//
+	// payout_tolerance_bps 刻意不讀:它不是 schemas/21 訂的設定鍵,
+	// 也不在 tournament.ParseConfig 認得的欄位裡。在這裡自行發明一個鍵,
+	// 等於讓「config 有哪些鍵」多出第二個權威。零值 → Normalize 補 2%。
+	BettingOddsConfig(ctx context.Context, tournamentID int64) (BettingOddsConfigRow, error)
+	// ══ 賽事與場次 ══════════════════════════════════════════════════
+	// 下注一律以 slug 定位賽事(對外不出現內部 id)。查無列 = 呼叫端的 ErrTournamentNotFound。
+	BettingTournamentBySlug(ctx context.Context, slug string) (BettingTournamentBySlugRow, error)
+	// 綁定的第二支,**跑在 BindPlayerUser 之後**(鎖序)。反過來會與 SetPlayerRank
+	// (tournament_players → fencers)形成環:裁判正在評某人的段、那個人同時在綁帳號。
+	// 兩種失敗分得出來:
+	//   影響 0 列        → 這位 fencer 已綁在別的帳號上(ErrAlreadyBound)
+	//   撞 fencers_user_id_uq → 這個帳號已綁在別位 fencer 身上(ErrUserAlreadyBound)
+	// 兩處都寫是必要的:只寫一處的話,領獎時查哪一張表會得到不同答案。
+	BindFencerUser(ctx context.Context, arg BindFencerUserParams) (int64, error)
+	// 綁定的第一支(依鎖序 tournament_players 先於 fencers)。
+	// WHERE 帶 (user_id IS NULL OR user_id = @user_id):重複綁同一個帳號是冪等的
+	// 成功,綁到**不同**帳號則影響 0 列(no rows)→ adapter 回 ErrAlreadyBound。
+	// 改綁收款人要裁判介入並留稽核,不能靠這支 API 悄悄換掉。
+	BindPlayerUser(ctx context.Context, arg BindPlayerUserParams) (BindPlayerUserRow, error)
 	// ══ 彙總層 ══
 	// 一句話完成「有就加、沒有就建」。date 由事件時間在 UTC 下取日,
 	// 不用使用者時區:投影必須可重算(users.timezone 會變,拿它當分桶鍵
 	// 會讓同一批事實在不同時間重算出不同結果)。
 	BumpActivityDaily(ctx context.Context, arg BumpActivityDailyParams) error
+	// 報名第 4 步。**必須排在第 3 步之後**(鎖序第 2 條):tournament_players
+	// 插入成功才代表這一屆真的多參加了一次,順序反過來的話,撞 UNIQUE 被 rollback
+	// 的那一筆會在 rollback 前先卡住別人的 fencer 列。
+	// tournaments_played 用 +1 的增量寫法而不是先讀後寫:增量在 SQL 裡是原子的,
+	// 不需要為它多一道列鎖。真值隨時可用 RecalcFencerStats 對帳。
+	// discord_name 覆寫成最近一次報名填的(schemas/26),空字串不覆寫舊值。
+	BumpFencerOnRegistration(ctx context.Context, arg BumpFencerOnRegistrationParams) (ActivityFencer, error)
 	// delta 為 -1 時用 GREATEST 夾住 0:計數是衍生值,寧可保守也不要出現負數。
 	BumpMessageReactionCount(ctx context.Context, arg BumpMessageReactionCountParams) error
 	// 通知拉取(notificationpg):outbox_events → Discord 閘道的取貨口。
@@ -88,6 +160,11 @@ type Querier interface {
 	// rotated_from 的子列指標由 FK 的 ON DELETE SET NULL 自動斷開,不會撞 FK。
 	CleanupSessions(ctx context.Context, retentionDays int32) (int64, error)
 	ClearChannelPurpose(ctx context.Context, arg ClearChannelPurposeParams) (int64, error)
+	// 重抽與退回階段的第二步。先全部清成 NULL 再重寫,是因為
+	// UNIQUE (tournament_id, seed_no) 是立即檢查的:不清乾淨就重寫,
+	// 新舊籤位會在中途撞上(而且是撞在第幾列取決於寫入順序,難以重現)。
+	// NULL 不受 UNIQUE 限制,正是「未抽」要的語意。
+	ClearTournamentSeeds(ctx context.Context, tournamentID int64) error
 	CloseGiveaway(ctx context.Context, id int64) error
 	ClosePresenceSpan(ctx context.Context, arg ClosePresenceSpanParams) error
 	CloseReaction(ctx context.Context, arg CloseReactionParams) error
@@ -97,6 +174,9 @@ type Querier interface {
 	// 每日次數上限(schemas/25:20 次/人/日)。用 UTC 當日,與 XP 的 daily_cap 一致 ——
 	// 兩個「今天」用不同定義會讓人在某個時區看到兩者不同步。
 	CountDrawsToday(ctx context.Context, userID int64) (int64, error)
+	// 抽籤的守門條件,回 0 才能抽。只算 active:棄賽者本來就不進抽籤,
+	// 把他們算進來會讓裁判被一個永遠評不完的數字擋住。
+	CountUnrankedActivePlayers(ctx context.Context, tournamentID int64) (int64, error)
 	// per_user_limit 的計數口徑(schemas/08):未撤銷的 entitlements + 非 cancelled/rejected
 	// 的 redemptions。退款(撤銷)與被拒/取消的工單釋放額度。
 	CountUserItemAcquisitions(ctx context.Context, arg CountUserItemAcquisitionsParams) (int64, error)
@@ -119,6 +199,13 @@ type Querier interface {
 	CreateUser(ctx context.Context, arg CreateUserParams) (PlatformUser, error)
 	// 條件帶 remaining > 0:就算呼叫端算錯,DB 也不會讓它變成負數。
 	DecrementLootBoxItem(ctx context.Context, id int64) (int64, error)
+	// ═══ 抽籤(ReplaceDraw / RollbackToRanked)════════════════════
+	// 重抽與退回階段的第一步。必須真的刪掉而不是標記作廢:
+	// UNIQUE (tournament_id, round, slot) 會在下一次寫入時撞上舊列。
+	// handicap / bets 對 matches 有 FK,所以「已經有人下過注的對戰表」會在這裡
+	// 被資料庫擋下來 —— 那正是我們要的:drawing 階段本來就不該有注單,
+	// 真撞上了代表流程出了更大的問題,寧可整筆 rollback 也不要悄悄刪掉別人的注。
+	DeleteTournamentMatches(ctx context.Context, tournamentID int64) error
 	// ══ 訊息舊版本 ══
 	// 刪除沒有可靠的事件時間(Discord 不給),所以冪等改用「一則訊息只會被刪一次」。
 	DeletionRevisionExists(ctx context.Context, messageID string) (bool, error)
@@ -151,6 +238,10 @@ type Querier interface {
 	// 條件與 ClaimAnnouncements 的 attempts 門檻是同一個數字,由呼叫端傳同一個值
 	// —— 兩邊各寫一個常數就會出現「不再回傳但也不終止」的夾縫。
 	FailExhaustedAnnouncements(ctx context.Context, arg FailExhaustedAnnouncementsParams) (int64, error)
+	// 一場最多一列:只有低段位方會被建列(高段位方永不獲得反向補償),
+	// 所以「這場的預算」等於「施加者的預算」。LIMIT 1 是對這個不變量的防守,
+	// 不是在多列裡挑一列 —— 真的出現兩列代表發預算的路徑有 bug。
+	FindMatchBudgetByMatch(ctx context.Context, matchID int64) (FindMatchBudgetByMatchRow, error)
 	GetBalance(ctx context.Context, arg GetBalanceParams) (int64, error)
 	// 投遞時用:這個空間的這個用途要貼到哪個頻道。
 	// 查無列 = 沒設定,呼叫端應略過而不是報錯(部署可能刻意不設某個用途)。
@@ -162,13 +253,32 @@ type Querier interface {
 	// LEFT JOIN:community 存在但 xp_ruleset_id 為 NULL(M1 可能還沒建 ruleset)時
 	// 回 NULL config,呼叫端採安全預設(無冷卻、無 cap);community 不存在 → 無列(ErrNoRows)
 	GetCommunityXpConfig(ctx context.Context, id int64) ([]byte, error)
+	// **全檔唯一會讀出 passcode_hash 的地方**。選手與雜湊同一列一次讀出,
+	// 不拆成兩支:拆了就會讀兩次同一張表,中間有機會讀到不一致的狀態
+	// (裁判剛好在這一瞬重新產生通行碼)。
+	// 查無此 game_id 與通行碼錯誤在上層是同一個錯誤,這裡不做任何區分。
+	GetCredentialByGameID(ctx context.Context, arg GetCredentialByGameIDParams) (GetCredentialByGameIDRow, error)
 	// 經濟設定:不覆寫舊值,讀取取「生效時間最新」的一筆
 	GetCurrentConfig(ctx context.Context, key string) ([]byte, error)
 	GetDailyState(ctx context.Context, userID int64) (PlatformUserDailyState, error)
 	// 出戰中的寵物。一個人最多一隻(部分唯一索引保證),查無列 = 沒有出戰寵物。
 	GetDeployedPet(ctx context.Context, ownerID int64) (GetDeployedPetRow, error)
 	GetDeployedPetID(ctx context.Context, ownerID int64) (GetDeployedPetIDRow, error)
+	// ═══ 報名(CreateRegistration 的四個步驟)════════════════════
+	// 報名第 1 步。不加 FOR UPDATE:這裡只是要判斷「是不是回鍋選手」,
+	// 真正的權威是 UNIQUE (game_id),而拿不到列的那一邊會走 InsertFencerIfAbsent。
+	GetFencerByGameID(ctx context.Context, gameID string) (ActivityFencer, error)
 	GetGiveawayByPublicID(ctx context.Context, publicID string) (GetGiveawayByPublicIDRow, error)
+	// tournament_id 一起進 WHERE 而不是查到再比對:項目逐屆一套、價格逐屆可調,
+	// 拿上一屆的 public_id 買這一屆的場次必須是「找不到」,不是「找到但不給用」。
+	GetHandicapItemByPublicID(ctx context.Context, arg GetHandicapItemByPublicIDParams) (GetHandicapItemByPublicIDRow, error)
+	// 與 ListHandicapSelections 相反,這裡**含已作廢者**,voided 原樣回傳:
+	// 退選路徑必須分得出「已經退過」(ErrSelectionAlreadyVoided)與「不存在」
+	// (ErrSelectionNotFound)。過濾掉作廢列會讓重複退選看起來像查無此筆。
+	//
+	// match_public_id 是退選路徑的必要欄位:呼叫端拿它去 LockMatchForHandicap,
+	// 也就是「從一筆選擇找到它所屬的序列化點」。
+	GetHandicapSelection(ctx context.Context, publicID string) (GetHandicapSelectionRow, error)
 	// manual 購買的押款分錄 ref 指向 redemption;免費 manual 商品沒有分錄 → no rows。
 	GetHoldEntryForRedemption(ctx context.Context, refID *int64) (GetHoldEntryForRedemptionRow, error)
 	GetIdempotencyKey(ctx context.Context, key string) (PlatformIdempotencyKey, error)
@@ -196,9 +306,31 @@ type Querier interface {
 	GetLoginIdentity(ctx context.Context, arg GetLoginIdentityParams) (GetLoginIdentityRow, error)
 	// ── 開箱 ──────────────────────────────────────────────────────
 	GetLootBoxByPublicID(ctx context.Context, publicID string) (GetLootBoxByPublicIDRow, error)
+	// ── BP 預算 ─────────────────────────────────────────────────────
+	// 沒有列 = 本場無讓武(同段對決)、或這個人是高段位方、或根本不是這場的選手。
+	// 三者對呼叫端是同一件事,一律 ErrNoBudget —— 分得更細等於洩漏「這場的預算持有者
+	// 不是你」以外的資訊。
+	//
+	// JOIN tournament_players 只為了帶回 public_id:對外永不出現內部 BIGINT id(鐵則 5)。
+	GetMatchBudget(ctx context.Context, arg GetMatchBudgetParams) (GetMatchBudgetRow, error)
+	// 唯讀路徑(MyBudget / MatchHandicaps)的無鎖版本,欄位與 LockMatchForHandicap 完全一致。
+	//
+	// 一次撈齊而不是分三次查,是因為讓武的每個判斷(狀態、段位差、逐屆設定)都同時用到
+	// 這三者;分開查會讓它們來自不同的快照,出現「用舊段位算新預算」這種查不出來的錯。
+	GetMatchForHandicap(ctx context.Context, matchPublicID string) (GetMatchForHandicapRow, error)
 	// 查無列 = 從未設定 = false(不退出)。
 	GetOptOutLogging(ctx context.Context, userID int64) (bool, error)
 	GetPetByPublicID(ctx context.Context, publicID string) (GetPetByPublicIDRow, error)
+	// ═══ 選手讀取(tournament_players)════════════════════════════
+	// tournament_id 進 WHERE 而不是只用 public_id:public_id 全域唯一,但
+	// 「A 屆的選手 public_id 拿去 B 屆的路徑上操作」必須查不到,否則裁判權限
+	// 的範圍就從一屆變成全部。JOIN fencers 帶出 game_id(自然鍵,對戰表要顯示)。
+	GetPlayerByPublicID(ctx context.Context, arg GetPlayerByPublicIDParams) (GetPlayerByPublicIDRow, error)
+	// ═══ 交換籤位(SwapSeeds)════════════════════════════════════
+	// 交換前在 tx 內重讀真值。service 那次讀取發生在取鎖之前,不能用來當寫入依據
+	// (雖然 LockTournamentExclusive 已經讓交換彼此串行化,但「以鎖後讀到的值為準」
+	//  是一條不該有例外的規矩)。seed_no 為 NULL → adapter 回 ErrPlayerNotSeeded。
+	GetPlayerSeedForUpdate(ctx context.Context, arg GetPlayerSeedForUpdateParams) (GetPlayerSeedForUpdateRow, error)
 	// ══ Presence ══
 	GetPresenceSpan(ctx context.Context, arg GetPresenceSpanParams) (GetPresenceSpanRow, error)
 	// Purchase 把扣款分錄的 ref 指向 entitlement(ref_type='entitlement', ref_id=權益 id),
@@ -242,6 +374,41 @@ type Querier interface {
 	// audit 寫入用 audit.sql 的 InsertAdminAudit,不重複定義。
 	// 退款前讀原分錄(分區表,依 id 掃全分區;管理操作低頻,可接受)
 	GetTokenEntryByID(ctx context.Context, id int64) (PlatformTokenEntry, error)
+	// 《百業試鋒》賽事核心 query(schemas/20 + schemas/26)。
+	// 對應 port:internal/core/activity/tournament.Repo 與 internal/core/activity/signup.Repo。
+	// 涵蓋 activity.tournaments / fencers / tournament_players / matches 四張表。
+	//
+	// ── 稽核 ──────────────────────────────────────────────────────
+	// 破壞性操作(推進階段、抽籤、交換籤位、改段位、換發通行碼)必須寫
+	// platform.admin_audit_logs,**且與資料變更同一個 transaction**。
+	// 這裡**不另寫 insert** —— queries/audit.sql 的 InsertAdminAudit 就是那個權威位置
+	// (鐵則 9)。adapter 在同一個 tx 裡呼叫它即可。
+	//
+	// ── 鎖序(activity 這一側的約定,全檔一致)──────────────────────
+	// 1. 任何要寫 activity 子表的 transaction,**第一步先取賽事列的鎖**:
+	//      LockTournamentShared    一般寫入(報名、綁定、換通行碼、評段)
+	//      LockTournamentExclusive 裁判破壞性操作(抽籤、退回階段、交換籤位)
+	//    共享鎖彼此不互斥(報名可以並發),但會擋住 UpdateTournamentPhase ——
+	//    這正是「RequirePhase 檢查通過之後,階段不會在腳下被換掉」的來源。
+	//    獨佔鎖讓「重抽 / 交換籤位 / 退回階段」三者對同一屆賽事完全串行化;
+	//    它們都是低頻手動操作,用一列鎖換掉所有交錯情境很划算。
+	// 2. 取得賽事列的鎖之後,一律依 tournament_players → fencers → matches 的順序寫。
+	//    fencers 排在 tournament_players **之後**是因為 SetPlayerRank 必然是
+	//    「先寫本屆段位、再回寫跨屆快照」;報名雖然要先讀/建 fencer,但那一步只會
+	//    鎖到自己剛插入的新列(或等待並發的同 game_id 插入),不持有任何其他鎖。
+	// 3. matches 只有第 1 條裡的獨佔那一組會寫,所以它不可能與 1/2 形成環。
+	//    重抽開頭的 DeleteTournamentMatches 雖然在 tournament_players 之前動,
+	//    但 DELETE 子表不對父表取鎖,同樣構不成環。
+	// 4. 跨 schema(報名獎金走 Ledger.ApplyInTx)時,activity 的鎖永遠先取、
+	//    platform 的鎖後取(users → user_balances,與 shop/daily 同向)。
+	//
+	// ── passcode_hash 的流向 ───────────────────────────────────────
+	// 只有 GetCredentialByGameID 會 SELECT passcode_hash。其餘回傳選手的 query
+	// 一律列舉欄位、刻意漏掉它 —— tournament.Player 結構本身也沒有這個欄位,
+	// 一個查都沒查出來的值,不可能被誰不小心序列化到對戰表 API 上。
+	// ═══ 賽事(tournaments)═══════════════════════════════════════
+	// slug 在網址列上,不是秘密;查無回 ErrTournamentNotFound 由 adapter 轉。
+	GetTournamentBySlug(ctx context.Context, slug string) (ActivityTournament, error)
 	// ══ 防洗點:交易門檻 / 單日上限 / no_trade ══
 	// 一次算完一個人的交易資格(schemas/09「防洗點」四項的資料來源),全部用 DB 時鐘:
 	//   level            該使用者在各社群的最高等級(M1 只有一個社群;user_xp 是投影表)
@@ -291,6 +458,27 @@ type Querier interface {
 	IncrementReplyCount(ctx context.Context, messageID string) error
 	// reason NOT NULL 是刻意的:強迫動作當下寫理由(schemas/03)
 	InsertAdminAudit(ctx context.Context, arg InsertAdminAuditParams) (int64, error)
+	// ══ 下注 ════════════════════════════════════════════════════════
+	// 建注單。扣款分錄 id 此時還不存在(分錄的 ref_id 要指向注單、注單要指向分錄,
+	// 兩邊的 id 不可能同時先有),由 SetBetStakeEntry 在同一個 tx 內補上。
+	//
+	// created_at 由資料庫給並回傳:core 不該有第二個時鐘,注單的時間與帳本分錄的時間
+	// 必須出自同一個來源,否則對帳時會出現「分錄比注單早」這種查不出原因的排序。
+	InsertBet(ctx context.Context, arg InsertBetParams) (InsertBetRow, error)
+	// 一次寫入整張注單的腿。
+	//
+	// unnest 批次而不是迴圈單筆(同 InsertHandicapItems 的理由):一次往返、同一個敘述,
+	// 中途失敗不會留下半張串關 —— 半張串關比整張失敗糟得多,因為本金已經照全部的腿算過了。
+	//
+	// 三個陣列長度不一致時,unnest 會把短的補 NULL 而撞上 NOT NULL,當場失敗。
+	// 這正是要的:賠率陣列少一格代表呼叫端有 bug,默默插進去的會是一張賠率不對的注單。
+	//
+	// bet_legs_bet_match_uq (bet_id, match_id) 是「同一注單不可重複押同一場」的兜底
+	// (押完 p1 再押 p2 等於穩賺)。這裡刻意**沒有** ON CONFLICT:撞鍵要讓 23505 冒上來,
+	// 而不是靜靜少插一腿 —— 少一腿的注單會用多一腿算出來的賠付派彩。
+	//
+	// :execrows 讓 adapter 核對「插進去的列數 = 腿數」,這是上面那句的另一半保險。
+	InsertBetLegs(ctx context.Context, arg InsertBetLegsParams) (int64, error)
 	// 小遊戲、開箱、抽獎、寵物的查詢(schemas/25)。
 	//
 	// 檔名是 play 不是 chance:抽獎(giveaway)本身沒有隨機以外的共通點,
@@ -337,6 +525,38 @@ type Querier interface {
 	// 只有 INSERT:操作紀錄寫下去就不改(同帳本的 append-only 精神),
 	// 到期整個分區 DROP,不做逐列刪除。
 	InsertEventLog(ctx context.Context, arg InsertEventLogParams) error
+	// 報名第 1 步(建列)。ON CONFLICT DO NOTHING 而不是 DO UPDATE:
+	// 並發時兩個請求都查不到、都想建,撞鍵的那一邊要回頭重讀既有列繼續走完報名,
+	// 而不是把錯誤丟給使用者 —— 使用者只是按了報名,他沒有做錯任何事。
+	// DO NOTHING 時不回傳列(no rows),adapter 就是靠這個訊號決定重讀。
+	// discord_name 這裡不寫:它由 BumpFencerOnRegistration 統一更新(一個概念一個位置)。
+	InsertFencerIfAbsent(ctx context.Context, arg InsertFencerIfAbsentParams) (ActivityFencer, error)
+	// 把種子定義一次實例化到某一屆,回**實際插入**的列數。
+	//
+	// ON CONFLICT (tournament_id, category, name) DO NOTHING:重跑安裝回 0,不改價格。
+	// 改價是裁判的明確動作,不該由「不小心重跑一次 seed」造成。
+	//
+	// unnest 批次而不是迴圈單筆:34 次往返換一次,而且整批同一個敘述 ——
+	// 中途失敗不會留下半套項目。public_id(ULID)由 adapter 產生後傳入,SQL 生不出 ULID。
+	//
+	// NULLIF(..., '') 把空字串收斂成 NULL:text[] 參數的元素表達不了 NULL,
+	// 而「還沒寫」的 referee_note 在 DB 裡就該是 NULL(seed 目前全為 null,待裁判補)。
+	//
+	// 八個單引數 unnest 併排在子查詢裡,而不是 unnest(a, b, ...) AS v(...):
+	// sqlc 的 catalog 只認單引數 unnest,多引數形式會編譯失敗。兩者語意相同 ——
+	// select list 裡的多個集合回傳函數自 PG10 起同步展開(長度一致時逐列對齊)。
+	InsertHandicapItems(ctx context.Context, arg InsertHandicapItemsParams) (int64, error)
+	// 每買一次一列,同一項目買三次就是三列 —— 不是一列 qty=3。
+	// handicap_selections 刻意沒有 UNIQUE (match_id, player_id, item_id),所以這裡
+	// **不能**加 ON CONFLICT:重複購買同一項目是設計(09-12 定案),不是要吞掉的衝突。
+	//
+	// cost 由呼叫端傳入而不是就地 SELECT i.cost:價格快照要與餘額檢查看到的是同一個值,
+	// 這裡再查一次等於在檢查與寫入之間開一道改價的縫。
+	// 外鍵 handicap_selections_budget_fkey 指向 match_budgets 的複合鍵 ——
+	// 沒有預算的人連一列都插不進來,這是應用層檢查之外的第二道保險。
+	//
+	// CTE + JOIN 回填項目與場次快照,一次往返就給出完整的 Selection。
+	InsertHandicapSelection(ctx context.Context, arg InsertHandicapSelectionParams) (InsertHandicapSelectionRow, error)
 	// 與動錢同一個 transaction 寫入(見 ledger-invariants 第三條)。
 	// 在 tx 開頭先插(response 先 NULL),讓併發同 key 的第二個 tx 直接撞 PK;
 	// tx 若 rollback,key 同步消失,合法重試不會被擋。
@@ -356,6 +576,26 @@ type Querier interface {
 	// ══ 成交紀錄 ══
 	// 買賣雙方 + 金額 + 手續費全額記帳:任兩人的資金淨流向可查(防洗點稽核的資料來源)。
 	InsertMarketOrder(ctx context.Context, arg InsertMarketOrderParams) (InsertMarketOrderRow, error)
+	// 刻意**沒有** ON CONFLICT:複合主鍵 (match_id, player_id) 撞鍵時要讓 23505 冒上來,
+	// adapter 轉成 ErrBudgetExists,呼叫端再去比對既有金額與當下段位差是否一致。
+	// 吞掉衝突(DO NOTHING / DO UPDATE)會讓「抽籤後有人改了段位」變成默默覆蓋,
+	// 而已經花掉的 spent 會對不上新的 budget。
+	//
+	// 用 CTE 而不是單純 RETURNING:RETURNING 看不到 join 進來的 public_id,
+	// 而呼叫端拿到的 Budget 必須是完整的(少一個欄位就得多一次往返)。
+	InsertMatchBudget(ctx context.Context, arg InsertMatchBudgetParams) (InsertMatchBudgetRow, error)
+	// 同上,整棵樹一個語句寫完。public_id(ULID)由 adapter 逐場產好再傳進來 ——
+	// SQL 不生成 id(鐵則:對外只出現 public_id,而它的產生位置只有一個)。
+	// NULLIF(...,0):port 的 MatchSeat 用 0 表示「尚未確定」(等上一輪),
+	// 資料庫存 NULL。0 不是合法的 player id,這個約定在 bracket 套件已經成立。
+	// status 刻意不寫,吃 DEFAULT 'pending':schemas/20 的 ready 定義是
+	// 「雙方確定,**裁判已開盤**」,開盤是另一個動作。抽籤就把場次設成 ready,
+	// 等於讓下注與讓武在裁判還沒確認籤表時就開了。
+	// 五個 unnest 並排在同一個 SELECT list(PG10 起是 lockstep 展開,逐列對齊),
+	// 而不是 unnest(a,b,c,d,e) 的多引數形式 —— 後者 sqlc 的型別解析認不得。
+	// 長度不一致時短的那幾欄會被補 NULL 而不是報錯,所以五個陣列必須由
+	// adapter 在同一個迴圈裡逐場 append,不要分開組。
+	InsertMatches(ctx context.Context, arg InsertMatchesParams) (int64, error)
 	// excerpt 為 NULL 的兩種情況:頻道沒開 log_messages(那時根本不呼叫本查詢)、
 	// 作者 opt_out_logging(呼叫但 excerpt 傳 NULL)。full_length 照記 ——
 	// 它是長度不是內容,而且是「截斷長度夠不夠」的唯一檢討依據。
@@ -372,6 +612,18 @@ type Querier interface {
 	// 也就是同一個 refresh token 被用了第二次 —— 呼叫端據此觸發重用偵測。
 	InsertSession(ctx context.Context, arg InsertSessionParams) (InsertSessionRow, error)
 	InsertTokenEntry(ctx context.Context, arg InsertTokenEntryParams) (InsertTokenEntryRow, error)
+	// 報名第 3 步。兩道防線各司其職:
+	//   *  INSERT ... SELECT FROM tournaments WHERE phase = @require_phase
+	//      —— 階段條件進 WHERE(port 明文要求)。不成立就插不進去(no rows),
+	//      adapter 回 tournament.ErrWrongPhase。配合鎖序第 1 步的 FOR SHARE,
+	//      這個條件在整個 tx 期間都不會被抽換。
+	//   *  UNIQUE (tournament_id, fencer_id) —— 連點報名鈕由它擋,**不加冪等鍵**
+	//      (鐵則 9:一個概念一個權威位置,DB 約束比應用層的先查後寫可靠)。
+	//      撞鍵時 adapter 回 ErrAlreadyRegistered。
+	// 空字串一律用 NULLIF 轉成 NULL:這幾欄是「有沒有填」的語意,
+	// 空字串與 NULL 兩種表示法並存的話,之後每個讀取端都要各判一次。
+	// ladder_score 同理(0 分與沒填在評段參考上是同一件事,port 也把負數歸零)。
+	InsertTournamentPlayer(ctx context.Context, arg InsertTournamentPlayerParams) (InsertTournamentPlayerRow, error)
 	InsertVoiceSession(ctx context.Context, arg InsertVoiceSessionParams) error
 	InsertXpEvent(ctx context.Context, arg InsertXpEventParams) (InsertXpEventRow, error)
 	// 排程器健康:各 job 最近一次「成功」執行的時間(schemas/13 的 job.run)。
@@ -386,12 +638,43 @@ type Querier interface {
 	// 排行榜。ORDER BY user_xp.xp 走既有索引,不必掃 xp_events ——
 	// XP 不進帳本的理由之一就是這個(grill 2026-08-24 Q3)。
 	LeaderboardByXP(ctx context.Context, arg LeaderboardByXPParams) ([]LeaderboardByXPRow, error)
+	// 讀這些注單的**全部**腿(含已判定的)。
+	//
+	// 為什麼不能只讀 pending:注單的狀態是所有腿的合成(全 won 才 won、任一 lost 即 lost、
+	// 全 void 才 void),只看這一場的腿會把串關的另一腿當成不存在,一張還在等的注單
+	// 會被判成全贏。
+	//
+	// 一併 join 出展示欄位(match_public_id / round / slot / 該方的顯示名):
+	// ListMyBets 與結算共用這一支,結算路徑用不到那幾欄但也不吃虧(同一批列已經在手上),
+	// 分成兩支查詢才是重複。對外只出現 public_id,內部 id 不會離開伺服器。
+	LegsByBetIDs(ctx context.Context, betIds []int64) ([]LegsByBetIDsRow, error)
 	ListActiveSessionIDs(ctx context.Context, userID int64) ([]int64, error)
 	ListAdminAuditByActor(ctx context.Context, arg ListAdminAuditByActorParams) ([]PlatformAdminAuditLog, error)
 	ListChannelPurposes(ctx context.Context) ([]ListChannelPurposesRow, error)
 	ListCommunities(ctx context.Context) ([]ListCommunitiesRow, error)
 	ListCurrentConfigs(ctx context.Context) ([]ListCurrentConfigsRow, error)
+	// 可進抽籤者:status='active' 且已評段。
+	// ORDER BY tp.id 是**抽籤可重現性的一部分**,不是排版偏好:同一個種子要抽出
+	// 位元相同的對戰表,前提是洗牌的輸入順序固定。沒有 ORDER BY 時 Postgres
+	// 可以合法地換一個執行計畫、換一個回傳順序,那一刻「拿舊種子重跑驗證」就失效了。
+	ListDrawablePlayers(ctx context.Context, tournamentID int64) ([]ListDrawablePlayersRow, error)
 	ListEntriesByUser(ctx context.Context, arg ListEntriesByUserParams) ([]PlatformTokenEntry, error)
+	// ── 讓武項目 ────────────────────────────────────────────────────
+	// 排序即前端的呈現順序:先分類,類內依 sort_order,最後以 id 收尾 ——
+	// sort_order 允許重複,沒有第三個鍵的話同分項目的順序會隨執行計畫變動,
+	// 選購頁每次重整就換一次位置。走 handicap_items_tournament_idx。
+	ListHandicapItems(ctx context.Context, tournamentID int64) ([]ListHandicapItemsRow, error)
+	// ── 讓武選擇 ────────────────────────────────────────────────────
+	// 只回**未作廢**的:退掉的項目對餘額與公開清單都不存在,
+	// 讓呼叫端每次自己補 WHERE NOT voided 遲早會漏一處。
+	//
+	// 依 created_at 排序 = 購買順序,同時以 id 收尾:created_at 不唯一,
+	// 同一次連點會落在同一個微秒,沒有第二個鍵清單順序就不穩定。
+	//
+	// JOIN handicap_items 帶回名稱與分類快照,前端顯示一張清單不必逐項回查;
+	// 但 cost 一律取 s.cost(購買當下的價格快照),項目改價不影響已成立的選擇。
+	// 順帶帶回 match 的 public_id,免得同一個 Selection 型別在不同查詢路徑有不同的完整度。
+	ListHandicapSelections(ctx context.Context, arg ListHandicapSelectionsParams) ([]ListHandicapSelectionsRow, error)
 	// 已下架的商品照樣回名稱:公告講的是「當時買了什麼」,
 	// 那件事不會因為商品下架就不算數。
 	ListItemNames(ctx context.Context, publicIds []string) ([]ListItemNamesRow, error)
@@ -491,6 +774,21 @@ type Querier interface {
 	// scope 一律由 currencies 現查,不由呼叫端傳:它必須等於 currencies.scope
 	// (複合外鍵擋著),讓呼叫端傳就是給了一個唯一的錯法。
 	LockBalanceForUpdate(ctx context.Context, arg LockBalanceForUpdateParams) (int64, error)
+	// 依 id **升冪**鎖住這些注單列。
+	//
+	// 為什麼還要這把鎖:advisory lock 只擋得住「同一場被結算兩次」。一張串關的兩腿
+	// 分屬 A、B 兩場時,A 與 B 同時結算會各自持有**不同**的 advisory lock,誰也擋不住誰,
+	// 兩邊都看不到對方剛標好的腿,於是兩邊都判定「還有 pending」——
+	// 結果是一張全贏的注單永遠停在 open,使用者的錢就這樣卡住。
+	// 注單列鎖讓第二個 tx 等到第一個 commit 之後才重讀腿,那時它看得到另一腿已經 won。
+	//
+	// 升冪是全域的防死鎖慣例(與 user_id 升冪同一條規則):兩場比賽的結算若以相反順序
+	// 鎖同兩張注單就是死鎖。呼叫端已排好序,這裡的 ORDER BY 是 DB 側的保證 ——
+	// LockRows 節點在 Sort 之上,鎖就是照輸出順序取的,不會因為選到 bitmap scan 而亂序。
+	//
+	// :exec 是刻意的:回傳的 id 沒有用處(呼叫端接著會用 BetsByIDs 重讀完整注單),
+	// 這一句存在的唯一目的就是取鎖。
+	LockBetsForSettle(ctx context.Context, betIds []int64) error
 	// 對話 chunk 聚合(schemas/12-ai-corpus.md)。
 	// 設計核心:不對單則訊息做 embedding,合併成對話 chunk 才有檢索價值(grill Q16)。
 	//
@@ -532,9 +830,118 @@ type Querier interface {
 	// **FOR UPDATE**:有限獎池的 remaining 要在同一個 transaction 裡讀了再扣,
 	// 否則兩個人同時抽最後一件,兩個人都會拿到。
 	LockLootBoxItems(ctx context.Context, boxID int64) ([]LockLootBoxItemsRow, error)
+	// 讓武 BP query(schemas/20-activity-tournament.md,migrations/activity/00002 + 00004)。
+	//
+	// BP 不走 Ledger、不需冪等鍵:它每輪重發、沒花完即作廢、不可交易、不可累積,
+	// 四個性質沒一個符合貨幣(理由寫在 00002_handicap.sql 的檔頭)。因此這裡是
+	// activity schema 內部的純 CRUD,沒有任何 token_entries 的影子。
+	//
+	// 但「不是錢」不代表可以亂:BP 超支會直接毀掉一場比賽的公正性,所以這組查詢
+	// 有兩道防線 ——
+	//   1. 寫入路徑一律先鎖場次列(FOR UPDATE OF m),以 matches 那一列為序列化點;
+	//   2. spent 是覆寫而非增量,權威永遠是 RecalcMatchBudgetSpent 的 SUM。
+	//
+	// 命名一律 *Handicap* / *MatchBudget* 前綴:生成的 db package 與 platform 的查詢
+	// 同居一個命名空間,GetItem / ListItems 這種名字撞得到。
+	// ── 場次 ────────────────────────────────────────────────────────
+	// 整個 handicap package 的**序列化點**。
+	//
+	// 選購、退選、封盤三條寫入路徑的第一步都是這一句,所以它們對同一場比賽彼此互斥:
+	// 連點兩次買同一項不會同時通過餘額檢查(第二個請求會等到第一個 commit 之後才讀到
+	// 新的 spent),一邊買一邊封盤也不會出現「檢查時沒封盤、寫入時已封盤」的縫隙。
+	//
+	// FOR UPDATE OF m 是必要的寫法,不是精簡:
+	//   * p1/p2 走 LEFT JOIN(對手未定時為 NULL),Postgres 禁止對外連接的可空側加鎖;
+	//   * 賽事與選手列是共享讀的參考資料,鎖了只會讓不同場次互相卡住。
+	//
+	// per_rank_gap 取自 tournaments.config;缺鍵時回 0,由 bp 套件退回預設值 8
+	// (預設值的權威在 bp.DefaultPerRankGap,不在這裡再寫一份)。
+	LockMatchForHandicap(ctx context.Context, matchPublicID string) (LockMatchForHandicapRow, error)
+	// 同一場比賽的結算/退款互斥(ledger-invariants 第四條指定的形式)。
+	//
+	// 為什麼是 advisory 而不是 matches 的列鎖:結算不修改 matches(勝負是賽事服務寫的),
+	// 為了互斥去鎖一列沒有要改的資料,會跟「判定勝負」那條路徑的寫入鎖互相糾纏。
+	// advisory lock 是純粹的互斥語意,且隨 tx 結束自動釋放 —— 不需要也不該手動解鎖。
+	//
+	// 型別:hashtext() 回 int4,所以走 pg_advisory_xact_lock(int4, int4) 這個簽名,
+	// 兩個參數的型別都對得上,namespace 與 match_id 各佔一半、互不干擾。
+	// 單參數的 (int8) 版本得自己把 namespace 與 id 塞進同一個 64 bit 整數,
+	// match_id 一樣只剩 32 bit 可用,卻多一層位移運算 —— 沒有換到任何東西。
+	//
+	// ::int 的範圍檢查是刻意的:match_id 真的超過 2^31 時會拋 22003 當場失敗,
+	// 而不是悄悄截斷成別場的 key、讓兩場比賽共用同一把鎖(或更糟:漏鎖)。
+	// 參數先宣告成 bigint 再收成 int,是為了讓生成的 Go 參數是 int64,與埠的簽名一致。
+	LockMatchForSettle(ctx context.Context, matchID int64) error
+	// 封盤。status 一起改成 'locked' 不是多管閒事,是 matches_locked_at_check 逼出來的:
+	// handicap_locked_at 非 NULL 時 status 必須是 locked/live/done,只改時間戳會被 DB 擋掉。
+	//
+	// handicap_locked_at IS NULL 是**封盤不可逆**的 DB 側保證:重複封盤影響 0 列,
+	// 呼叫端據此回 ErrAlreadyLocked。默默成功會讓 Discord 公告每呼叫一次就再發一次。
+	LockMatchHandicaps(ctx context.Context, arg LockMatchHandicapsParams) (int64, error)
 	// FOR UPDATE OF r:同一工單的 approve / reject / cancel 串行化,
 	// 後到者看到非 pending 即拒絕(狀態機單向)。
 	LockRedemptionForHandle(ctx context.Context, id int64) (LockRedemptionForHandleRow, error)
+	// 鎖序第一步(裁判破壞性操作版)。抽籤、退回階段、交換籤位三者都會同時動
+	// tournament_players 與 matches,而它們動的順序天生相反(重抽是先刪 matches
+	// 再寫 seed_no,交換是先寫 seed_no 再改 matches)。與其為每一條路徑推敲一遍
+	// 鎖序,不如在入口就讓它們對同一屆賽事互斥 —— 這三個動作一屆只會發生幾次。
+	LockTournamentExclusive(ctx context.Context, tournamentID int64) (LockTournamentExclusiveRow, error)
+	// 鎖序第一步(一般寫入版)。FOR SHARE 不互斥,所以並發報名不會被彼此卡住,
+	// 但它與 UpdateTournamentPhase 的 UPDATE 互斥 —— 於是「service 讀到 signup、
+	// 寫入時裁判剛好封閉報名」這個時間差在 tx 期間被消掉。
+	// 一併回傳 phase:adapter 可以在鎖後重讀一次真值,不必相信鎖前那次讀取。
+	LockTournamentShared(ctx context.Context, tournamentID int64) (LockTournamentSharedRow, error)
+	// 觀眾投票與下注 query(schemas/21-activity-betting.md,migrations/activity/00003 + 00005)。
+	// 呼叫端是 internal/core/activity/betting 的 Repository[TX] 埠,每一支都在該埠的 tx 裡跑。
+	//
+	// ── 這裡全部是真錢 ──────────────────────────────────────────────
+	//
+	// 動錢一律經 Ledger(bettingpg 用 ApplyInTx 把帳本寫入掛進同一個 tx),所以本檔
+	// **沒有、也不該有**任何碰 platform.token_entries / platform.user_balances 的敘述。
+	// 注單側只存分錄 id(ledger_stake/refund/payout_entry_id),那是稽核鏈的一半,
+	// 不是餘額的第二個權威。
+	//
+	// 賠率與金額全程整數:odds_milli 是賠率 ×1000(BIGINT)、vig_bps 是萬分之一。
+	// 本檔沒有一個 float / numeric 運算 —— 誤差會被串關連乘放大進派彩金額,
+	// 而派彩是真錢(ledger-invariants 第七條的直接延伸)。
+	//
+	// ── 沿用既有 query,不重寫(專案規則 9)──────────────────────
+	//
+	//   冪等鍵  ledger.sql 的 GetIdempotencyKey / InsertIdempotencyKey / SetIdempotencyResponse
+	//           → 對應埠的 GetIdempotency / InsertIdempotency / SaveIdempotencyResponse。
+	//           platform.idempotency_keys 是全系統唯一的冪等鍵表,活動層不另開一張。
+	//   outbox  ledger.sql 的 InsertOutboxEvent → 對應埠的 AppendEvents(adapter 逐筆呼叫,
+	//           與 reaper.sql 同一個做法)。領域變更與事件同 tx 由呼叫端的 InTx 保證。
+	//
+	// ── 命名 ────────────────────────────────────────────────────────
+	//
+	// 生成的 db package 與 platform 的查詢同居一個命名空間(同 activity_handicap.sql 的理由),
+	// 所以泛用名一律加 Betting / Bet / Vote 前綴,避免與日後的 tournament.sql 撞名。
+	//
+	// ── 鎖序 ────────────────────────────────────────────────────────
+	//
+	//   platform.users(LockUserForBet)
+	//     → activity.matches 的 advisory lock(LockMatchForSettle)
+	//     → activity.bets 列鎖(LockBetsForSettle,**id 升冪**)
+	//     → platform.user_balances(由 Ledger 取,user_id 升冪)
+	//
+	// 與 shoppg / marketpg / dailypg 同向(users 先、balances 最後),
+	// 所以下注與購買/成交/簽到之間結構上不可能互鎖。
+	// ══ 鎖 ══════════════════════════════════════════════════════════
+	// 同一使用者的下注以 users 列鎖串行化。
+	//
+	// 為什麼非鎖不可:下注沒有任何 UNIQUE 約束擋得住連點(同一人對同一場下兩注是合法的),
+	// 冪等鍵是唯一權威 —— 而 READ COMMITTED 下「先查鍵再插鍵」的兩個併發請求會同時
+	// 查不到鍵、同時往下走,兩邊各扣一次款。這把鎖讓第二個請求等到第一個 commit 之後
+	// 才做重放判定,那時它看得到鍵與上一次的 response。
+	//
+	// deleted_at IS NULL 一併驗:軟刪除的帳號不該還能下注,而且查無列時呼叫端直接失敗,
+	// 不必再多一次往返。
+	//
+	// SQL 與 shop.sql 的 LockUserForShop / market.sql 的 LockUserForTrade 同形 ——
+	// 鎖的是同一列。四支同形 query 是既有慣例的延續(各自的註解說明各自的序列化理由),
+	// 收斂成單一 LockUserRow 要一次改動四個 feature,不在本檔範圍。
+	LockUserForBet(ctx context.Context, userID int64) (int64, error)
 	// 串行化同一使用者的併發 Claim:跨當地午夜(或併發改時區)時兩個 tx 可能算出
 	// 不同 claim_date,單靠 PK 擋不住(streak 誤算、20h 閘門可繞過)。
 	// 先鎖 users 列,之後的冷卻/streak 讀取全在鎖後;PK 仍是防連點的最終防線。
@@ -564,6 +971,12 @@ type Querier interface {
 	LockUserXp(ctx context.Context, arg LockUserXpParams) (LockUserXpRow, error)
 	MaintenanceUnlock(ctx context.Context, jobName string) error
 	MarkGiveawayWinners(ctx context.Context, arg MarkGiveawayWinnersParams) (int64, error)
+	// voided 之外一律不動:退費只是 BP 內部的事(標記 + 覆寫 spent),不經 Ledger,
+	// 也不刪列 —— 買過又退掉是裁判事後要看得到的事實。
+	//
+	// AND NOT voided 讓重複退選影響 0 列。呼叫端已在場次鎖下檢查過一次,
+	// 這條是同一個判斷在 DB 側的備份,不是它的替代品。
+	MarkHandicapSelectionVoided(ctx context.Context, id int64) (int64, error)
 	// 刪除事件同時在 message_logs 打上 deleted_at(欄位本來就是為此存在)。
 	// 沒有那一列(頻道沒開白名單)時什麼都不做。
 	MarkMessageDeleted(ctx context.Context, arg MarkMessageDeletedParams) error
@@ -582,6 +995,17 @@ type Querier interface {
 	// EvalPlanQual),額度用完就是 0 rows —— 呼叫端據此回 ErrSupplyExhausted。
 	// max_supply IS NULL = 不限量,仍然遞增 minted_count(發行量要可查)。
 	MintDefinitionSupply(ctx context.Context, id int64) (MintDefinitionSupplyRow, error)
+	// **只查請求者自己的票。** user_id 是必填參數,不是可選過濾條件 ——
+	// 沒有它就變成「列出這些場次的所有投票」,那正是 VoteTalliesByMatch 註解裡
+	// 不能存在的那支查詢。要看別人投給誰,這裡沒有路。
+	MyVotesByMatch(ctx context.Context, arg MyVotesByMatchParams) ([]MyVotesByMatchRow, error)
+	// 同上,只列未結算的。
+	//
+	// 分成獨立一支而不是在 BetsByUser 加一個 open_only 布林參數,是為了 bets_open_idx ——
+	// 那是 WHERE status = 'open' 的部分索引,只有把述詞寫成字面值,planner 才用得上它。
+	// 寫成 (NOT $3 OR status = 'open') 的話,prepared statement 的通用計畫看不到布林的值,
+	// 永遠只能退回全表過濾,而已結算的注單會愈積愈多。
+	OpenBetsByUser(ctx context.Context, arg OpenBetsByUserParams) ([]ActivityBet, error)
 	// 維運監控指標(schemas/14「監控與告警」)。每支查詢都是單一 SQL,
 	// 目的是讓 HTTP handler 或排程 job 都能便宜地叫,不做應用層彙總。
 	//
@@ -593,12 +1017,45 @@ type Querier interface {
 	// 一次掃描三個數字——分三句查會在三個時點看到三份不一致的快照。
 	// 沒有 pending 時年齡回 0(NULL 會逼呼叫端處理一個沒有意義的空值)。
 	OutboxBacklog(ctx context.Context) (OutboxBacklogRow, error)
+	// ══ 結算 ════════════════════════════════════════════════════════
+	// 撈出押到這場、還沒判定的腿。
+	//
+	// result = 'pending' 寫成字面值(而不是參數)是為了對上 bet_legs_match_result_idx
+	// 的部分索引述詞 WHERE result = 'pending' —— 已判定的腿會愈積愈多,
+	// 走不到那條索引的話每次結算都得掃整張表。
+	//
+	// ORDER BY bet_id, id:呼叫端要據此推出「要鎖哪些注單」,順序不穩定的話
+	// 同一批資料在不同執行計畫下會得到不同的取鎖順序,而取鎖順序是防死鎖的全部。
+	PendingLegsByMatch(ctx context.Context, matchID int64) ([]ActivityBetLeg, error)
 	// 隨機取 N 位。random() 在這裡夠用:抽獎的公平性由「誰都不能改參加名單」
 	// 保證(UNIQUE + append),不是由亂數品質保證;而且結果會連同 seed 進 chance_draws。
 	PickGiveawayWinners(ctx context.Context, arg PickGiveawayWinnersParams) ([]PickGiveawayWinnersRow, error)
 	// 投影重算:xp ← SUM(events)、last_xp_at ← MAX(created_at),整個投影可從事實重建。
 	// 呼叫前必須已 LockUserXp,否則與並行 Award 有覆寫競態(先算 SUM、後拿鎖會蓋掉新事件)
 	RebuildUserXp(ctx context.Context, arg RebuildUserXpParams) (int64, error)
+	// ═══ 衍生資料重算(schemas/26)════════════════════════════════
+	// fencers 的四個統計欄位全是衍生資料,**必須可從事實表重算**(全域慣例)。
+	// 冗餘存放的唯一理由是報名頁與生涯頁都要即時讀,每次 JOIN 統計不划算。
+	//
+	// 這支刻意把「存的值」與「算出來的值」放在同一列回傳:對帳測試要的就是這個比較,
+	// 分成兩支查詢的話,兩次查詢之間有人報名就會產生假的不一致。
+	//
+	// 口徑:
+	//   tournaments_played  報過名就算一屆(不論是否出賽)
+	//   wins                winner_player_id 指到自己的場次數
+	//   losses              自己有上場、已分勝負、而勝者不是自己 ——
+	//                       棄賽造成的 walkover 也算一敗(戰績要誠實反映結果,
+	//                       生涯頁靠 result_kind 區分顯示)
+	//   last_rank_level     最近一屆有評段的那一屆的值(依 tournaments.created_at)
+	// IN (m.p1_player_id, m.p2_player_id) 對 NULL 是安全的:另一邊是 NULL 時,
+	// 只要有一邊相等結果就是 TRUE;都不等則是 NULL,不會被 WHERE 當成 TRUE。
+	RecalcFencerStats(ctx context.Context, fencerID int64) (RecalcFencerStatsRow, error)
+	// spent 的權威算式。service 每次寫入前拿它與 match_budgets.spent 核對,
+	// 對不上就整個動作失敗(ErrBudgetInconsistent)而不自動修正 ——
+	// 衍生資料對不上代表寫入路徑有 bug,繼續算下去只會把錯誤擴散到下一次餘額檢查。
+	// 這是 schemas/20 待確認 ② 要求的那條驗證。述詞與 handicap_selections_match_player_idx
+	// 的部分索引條件(WHERE NOT voided)同形,走得到那條索引。
+	RecalcMatchBudgetSpent(ctx context.Context, arg RecalcMatchBudgetSpentParams) (int64, error)
 	// session 異常:近期因重用偵測而撤銷的數量。已輪替的 token 再被使用 = token 被竊
 	// (schemas/02 增補 F),這個數字從 0 變正就是安全事件,不是效能指標。
 	RecentSessionReuse(ctx context.Context, windowHours int32) (int64, error)
@@ -669,8 +1126,40 @@ type Querier interface {
 	// 輪替鏈:從任一列沿 rotated_from 往上(被取代者)與往下(取代者)展開整條。
 	// 複合 FK 保證整條鏈同屬一個使用者,不可能撤到別人的裝置。升冪回傳。
 	SessionChainIDs(ctx context.Context, sessionID int64) ([]int64, error)
+	// 補上扣款分錄 id,完成稽核鏈的另一半(注單 ↔ 帳本雙向可查)。
+	//
+	// AND ledger_stake_entry_id IS NULL 是**不可覆寫**的 DB 側保證:分錄 id 一旦寫下就是
+	// 歷史的一部分,改掉它等於讓一筆扣款從帳本上「換了一張注單」。同 tx 內剛建的注單
+	// 必定是 NULL,所以影響 0 列代表狀態矛盾(ErrLedgerStateConflict),不是可以忽略的巧合。
+	//
+	// ::bigint 明寫是為了讓生成的參數是 int64 而不是 *int64:欄位可為 NULL,但這支
+	// 查詢的參數不可以 —— 「補上分錄 id」傳 NULL 是沒有意義的呼叫,不該在型別上存在。
+	SetBetStakeEntry(ctx context.Context, arg SetBetStakeEntryParams) (int64, error)
 	SetChannelPurpose(ctx context.Context, arg SetChannelPurposeParams) (SetChannelPurposeRow, error)
 	SetIdempotencyResponse(ctx context.Context, arg SetIdempotencyResponseParams) error
+	// **覆寫,不是增量**。權威值永遠是 RecalcMatchBudgetSpent 的 SUM;
+	// 用 spent = spent + cost 的話,任何一次漏算都會永遠留在資料裡,而且無法事後分辨。
+	//
+	// match_budgets_spent_check(0 <= spent <= budget)是超支的最後一道保險:
+	// 應用層已經擋過,但呼叫順序一旦有 bug,DB 會當場擋下來,而不是讓比賽帶著錯的 BP 開打。
+	// :execrows 讓 adapter 分得出「預算列不存在」(0 列)與「寫成功」。
+	SetMatchBudgetSpent(ctx context.Context, arg SetMatchBudgetSpentParams) (int64, error)
+	// ═══ 評段 ═══════════════════════════════════════════════════
+	// 階段守門(只在 ranking / ranked 開放)在 service,不在這裡:那是狀態機的規則,
+	// 而且 ErrRanksLocked 要帶「先退回 ranked 再重抽」的補救說明,SQL 給不出來。
+	// 這裡用 CTE 把 UPDATE ... RETURNING 再接上 fencers,是為了讓回傳的形狀與
+	// GetPlayerByPublicID 一致 —— 呼叫端要的是「更新後的 Player」,而 Player 含 game_id。
+	// 分成 update + 再 select 兩次的話,中間那個縫隙剛好是別人也在改同一列的時候。
+	SetPlayerRank(ctx context.Context, arg SetPlayerRankParams) (SetPlayerRankRow, error)
+	// 交換要呼叫這支**三次**,不是一次 UPDATE ... CASE:
+	//   1. SetPlayerSeed(A, NULL)     騰出空位
+	//   2. SetPlayerSeed(B, seedA)
+	//   3. SetPlayerSeed(A, seedB)
+	// UNIQUE (tournament_id, seed_no) 不是 DEFERRABLE,Postgres 在 UPDATE 期間
+	// 逐列檢查,所以單一語句直接對調必然在中途撞鍵。CTE 也救不了 ——
+	// 同一語句裡對同一列做兩次 UPDATE 的行為是未定義的。
+	// 三步之間的中間狀態只存在於同一個 tx 內,外面看不到。
+	SetPlayerSeed(ctx context.Context, arg SetPlayerSeedParams) (int64, error)
 	// ── 我的檔案(ProfileStore)────────────────────────────────────────────
 	// 時區字串的合法性檢查(pg_timezone_names)**不在這個檔案**:sqlc 的內建
 	// catalog 沒有 pg_timezone_names 這個系統檢視,寫在這裡 sqlc generate 直接失敗
@@ -687,6 +1176,20 @@ type Querier interface {
 	// daily_cap 判斷:UTC 當日該 user 該 community 該 source 的總和(schemas/01 A)。
 	// 呼叫前必須已 LockUserXp,同 user 的併發入帳已串行化,SUM 不會低估
 	SumXpTodayBySource(ctx context.Context, arg SumXpTodayBySourceParams) (int64, error)
+	// 交換籤位的另一半,**與 seed_no 的互換同一個 tx**。
+	// 只改籤號不改對戰表,兩張表就會互相矛盾,而矛盾的那一刻沒有任何約束會報錯 ——
+	// 只是對戰表上的名字跟籤位表對不起來,等到有人發現通常已經開打了。
+	// CASE 對調在 matches 這裡是安全的:這三欄沒有 UNIQUE,而且 A、B 同場時
+	// (p1=A, p2=B → p1=B, p2=A)依然滿足 matches_distinct_players_check。
+	// winner_player_id 一併換是為了不留下例外:drawing 階段不該有勝者,
+	// 但「這欄有值時會怎樣」不該取決於呼叫端記不記得這件事。
+	SwapPlayersInMatches(ctx context.Context, arg SwapPlayersInMatchesParams) (int64, error)
+	// 評段後回寫跨屆快照(fencers.last_rank_level 是衍生資料的增量更新路徑)。
+	// **跑在 SetPlayerRank 之後、同一個 tx**(鎖序 tournament_players → fencers)。
+	// FROM tournament_players 只是用來找 fencer_id,不對它取列鎖。
+	// 這支刻意不判斷「這屆是不是最近一屆」:那個判斷就是 RecalcFencerStats 本身,
+	// 在這裡再寫一次等於同一個概念兩個權威。真要修正,對帳跑 Recalc + ApplyFencerStats。
+	TouchFencerLastRank(ctx context.Context, arg TouchFencerLastRankParams) (int64, error)
 	TouchLoginUser(ctx context.Context, id int64) error
 	TouchUserLastSeen(ctx context.Context, id int64) error
 	// 成交換手:owner 換人 + 清鎖 + 更新取得脈絡,單一敘述。
@@ -701,14 +1204,54 @@ type Querier interface {
 	UndeployAllPets(ctx context.Context, ownerID int64) error
 	// 取消掛單時解鎖;只解本掛單放的鎖,不會誤解別人的。
 	UnlockItemInstance(ctx context.Context, arg UnlockItemInstanceParams) (int64, error)
+	// 套用結算/退款結果。
+	//
+	// AND status = 'open' 是**不重複派彩**的 DB 側權威:service 已經跳過非 open 的注單,
+	// 但那個判斷與這次寫入之間隔著整條結算流程,而中間動的是錢。影響 0 列 = 這張注單
+	// 已經被別人結算過,adapter 據此失敗出聲,不要回成功但錢不對。
+	//
+	// settled_at 不由呼叫端傳:bets_settled_at_check 要求 (status='open') = (settled_at IS NULL),
+	// 所以時間只能由 status 推出來 —— 留在 open(串關還有其他場次沒打)就維持 NULL,
+	// 離開 open 就用 DB 時鐘。core 不該有第二個時鐘。
+	//
+	// potential_payout 非 NULL = 有腿因棄賽 void 而重算過,此時 payout_recalculated
+	// **必須**同時為 true:對帳時要看得出「這筆金額為什麼跟原始承諾不同」。
+	// 兩者綁在同一句裡設定,就沒有「只更新金額忘了設旗標」的寫法存在。
+	// 用 OR 而不是直接賦值,是因為旗標一旦為真就永遠為真(第二腿棄賽不會把它洗回 false)。
+	//
+	// 三個 ledger_*_entry_id 一律 COALESCE 保留舊值:每張注單最多派彩一次、退款一次,
+	// 傳 NULL 代表「這次不是這種金流」,不是「清掉那筆稽核紀錄」。
+	UpdateBet(ctx context.Context, arg UpdateBetParams) (int64, error)
 	UpdateIdentityTokens(ctx context.Context, arg UpdateIdentityTokensParams) error
+	// 把指定的腿標成同一個結果(won / lost / void)。
+	//
+	// AND result = 'pending' 是重跑保護:已判定的腿不可再被改寫。少了它,
+	// 對同一場重複呼叫結算會把 won 的腿刷成別的值,而注單的派彩早就依 won 發出去了 ——
+	// 那是帳本對不上的起點。影響列數回給 adapter 核對。
+	//
+	// leg_ids 為空陣列時 WHERE id = ANY('{}') 不匹配任何列,自然是 0 列、不做事,
+	// 呼叫端不需要額外判斷(埠的「legIDs 為空時不做事」就是這個行為)。
+	UpdateLegResults(ctx context.Context, arg UpdateLegResultsParams) (int64, error)
 	// 呼叫前必須已鎖住掛單列;WHERE status='open' 是狀態機單向的最後防線。
 	UpdateListingStatus(ctx context.Context, arg UpdateListingStatusParams) (int64, error)
 	// 既有綁定重新登入:更新 provider 側的顯示名與憑證(內部 users 的資料不覆蓋——
 	// display_name 之後可由使用者自訂,provider 的名字權威在 identities.username)。
 	UpdateLoginIdentity(ctx context.Context, arg UpdateLoginIdentityParams) error
+	// ═══ 身分維護(通行碼、綁定)═════════════════════════════════
+	// 「舊碼立即失效」不需要撤銷清單 —— passcode_hash 被覆寫的那一刻,
+	// 舊碼就再也比對不過。issued_at 同步更新,只是給裁判看的痕跡。
+	// :execrows 讓 adapter 分得出「查無此選手」(0 列),那要回 ErrPlayerNotFound。
+	// 呼叫端必須另外呼叫 InsertAdminAudit(同一個 tx),而且
+	// **明碼與雜湊都絕不可進稽核紀錄**。
+	UpdatePlayerPasscode(ctx context.Context, arg UpdatePlayerPasscodeParams) (int64, error)
 	// 呼叫前必須已 LockRedemptionForHandle 且確認 status='pending'。
 	UpdateRedemptionStatus(ctx context.Context, arg UpdateRedemptionStatusParams) (PlatformRedemption, error)
+	// 樂觀鎖:WHERE phase = @from_phase。影響 0 列 = 有人搶先改了,adapter 回
+	// ErrPhaseConflict。用 :execrows 而不是 :exec,就是為了讓「0 列」這件事
+	// 有辦法被看見 —— 兩個裁判同時按「進入下一階段」時,輸的那個必須知道
+	// 自己什麼都沒做到,而不是收到一個成功然後以為賽事被自己推進了兩階。
+	// RollbackToRanked 也用這一支(from='drawing', to='ranked')。
+	UpdateTournamentPhase(ctx context.Context, arg UpdateTournamentPhaseParams) (int64, error)
 	UpdateUserTimezone(ctx context.Context, arg UpdateUserTimezoneParams) (UpdateUserTimezoneRow, error)
 	UpsertDailyState(ctx context.Context, arg UpsertDailyStateParams) error
 	// 這裡用 upsert 而不是「先查再建」,是因為重跑的語意不同:再跑一次
@@ -729,6 +1272,16 @@ type Querier interface {
 	// 後到的那個看到的是前一個已 commit 的值(read committed 下 DO UPDATE
 	// 會重讀最新版本),不會兩邊各自把對方的欄位覆蓋掉。
 	UpsertUserPrivacy(ctx context.Context, arg UpsertUserPrivacyParams) (UpsertUserPrivacyRow, error)
+	// 一場一票,改票即覆寫。
+	//
+	// 權威是 votes_match_user_uq (match_id, user_id) 這條 UNIQUE,不是應用層的
+	// 「先查再決定 insert 還是 update」—— 那個寫法在併發連點下會兩邊都查不到、
+	// 兩邊都 insert,第二筆撞鍵報錯,使用者看到的是「投票失敗」。
+	// ON CONFLICT DO UPDATE 讓連點變成冪等:最後一次的 side 勝出。
+	//
+	// 改票不新增列:votes 是「當下的票」,不是投票史。要看變更時間有 updated_at,
+	// 而賠率只認當下 —— 留一串舊票只會讓 count 把同一個人算好幾次。
+	UpsertVote(ctx context.Context, arg UpsertVoteParams) error
 	// 管理端授權查詢(schemas/03-authz.md)。權限字串的權威在 Go
 	// (core/platform/authz),這裡只問「這個人現在有沒有這個權限」。
 	// 單一查詢完成三件事,因為它在每個管理請求的路徑上,不能 N+1:
@@ -747,6 +1300,16 @@ type Querier interface {
 	// 不會因為多列而重複。停權與軟刪除放在同一句(而不是先查再判)是為了
 	// 讓「檢查」與「授權」不可能被拆開漏掉其中一步。
 	UserHasPermission(ctx context.Context, arg UserHasPermissionParams) (*bool, error)
+	// ══ 投票 ════════════════════════════════════════════════════════
+	// 數票:每場每邊各幾票。**只回票數,永不回傳誰投給誰。**
+	//
+	// 這不是效能考量也不是隱私加分項:票數直接推導賠率,公開投票人等於公開可操縱的標的
+	// (誰灌了票、該去說服誰改票)。所以這支查詢在型別上就沒有 user_id 可以洩漏,
+	// 而且整份檔案裡不存在「查別人投給誰」的第二支。
+	//
+	// 沒人投票的場次不會有列 —— 呼叫端 map 查不到即零票,零票時平滑參數會給出兩邊
+	// 相同的賠率,不需要在 SQL 補空列。走 votes_match_side_idx。
+	VoteTalliesByMatch(ctx context.Context, matchIds []int64) ([]VoteTalliesByMatchRow, error)
 }
 
 var _ Querier = (*Queries)(nil)

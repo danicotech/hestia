@@ -176,7 +176,14 @@ type UpdatePasscodeParams struct {
 	TournamentID int64
 	PlayerID     int64
 	PasscodeHash string
-	// ActorUserID 是執行的裁判;選手自助重取時為 0。
+	// ActorUserID 是執行的裁判,**必為非 0**。
+	//
+	// 沒有「選手自助重取」這條路。遊戲ID 是公開資訊(對戰表上就有),
+	// 自助重取等於「輸入任何人的遊戲ID 就能換掉他的通行碼」,
+	// 而原持有人只會以為自己抄錯了。
+	//
+	// 這也是 adapter 的前提:admin_audit_logs.actor_user_id 是 NOT NULL
+	// 且 FK 到 platform.users,塞 0 進去會讓整筆 transaction 失敗。
 	ActorUserID int64
 	Reason      string
 }

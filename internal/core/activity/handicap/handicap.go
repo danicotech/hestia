@@ -100,9 +100,11 @@ const maxTargetNoteRunes = 200
 type Item struct {
 	ID           int64
 	TournamentID int64
-	// Ref 是對外識別字串。**handicap_items 目前沒有 public_id 欄位**,
-	// adapter 先以十進位 id 填入(與 token_entries 的 entry_ref 同一個先例:
-	// 契約型別是字串,日後補上 ULID 欄位不破契約)。見 package 回報的待決事項。
+	// Ref 是對外識別字串,即 handicap_items.public_id(ULID,migration 00004 補上)。
+	//
+	// 沒有沿用 token_entries.entry_ref 那個「以十進位 id 當 ref」的先例:
+	// 那個例外的成立條件是「最大的表 + 分區表無法由 DB 保證全域唯一」,
+	// handicap_items 逐屆 34 列又不分區,兩個條件都不符合。
 	Ref         string
 	Category    Category
 	Name        string

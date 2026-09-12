@@ -347,6 +347,60 @@ func TestRoundLabelDependsOnSize(t *testing.T) {
 	}
 }
 
+// TestShapeMatchesBuild 確認「只有形狀」的表與真的建出來的表,晉級行為完全一致。
+//
+// Shape 存在的理由就是讓呼叫端不必自己湊 Bracket。若它湊出來的形狀與 Build
+// 的不同,那些呼叫端會把勝者送到錯的場次 —— 而那種錯在對戰表上看起來完全正常。
+func TestShapeMatchesBuild(t *testing.T) {
+	t.Parallel()
+
+	for _, n := range []int{2, 3, 5, 8, 11, 16, 23, 32} {
+		t.Run(name(n), func(t *testing.T) {
+			t.Parallel()
+
+			built, err := Build(players(n), newRand(uint64(n)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			shaped := Shape(built.TotalRounds)
+			if shaped == nil {
+				t.Fatalf("%d 人共 %d 輪,Shape 不該回 nil", n, built.TotalRounds)
+			}
+			if shaped.Size != built.Size || shaped.TotalRounds != built.TotalRounds {
+				t.Fatalf("形狀不符:Shape{Size:%d, Rounds:%d} vs Build{Size:%d, Rounds:%d}",
+					shaped.Size, shaped.TotalRounds, built.Size, built.TotalRounds)
+			}
+
+			for round := 1; round <= built.TotalRounds; round++ {
+				for slot := range built.Size >> round {
+					wr, ws, wp1, wok := built.Advance(round, slot)
+					gr, gs, gp1, gok := shaped.Advance(round, slot)
+					if wr != gr || ws != gs || wp1 != gp1 || wok != gok {
+						t.Errorf("Advance(%d,%d) 不一致:built=(%d,%d,%v,%v) shaped=(%d,%d,%v,%v)",
+							round, slot, wr, ws, wp1, wok, gr, gs, gp1, gok)
+					}
+					if built.RoundLabel(round) != shaped.RoundLabel(round) {
+						t.Errorf("第 %d 輪名稱不一致:%q vs %q",
+							round, built.RoundLabel(round), shaped.RoundLabel(round))
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestShapeRejectsEmpty(t *testing.T) {
+	t.Parallel()
+
+	// 零輪的賽事沒有任何場次,問晉級是呼叫端的 bug —— 回 nil 讓它當場炸,
+	// 比回一個 Size=1 的空表讓錯誤往下游飄好。
+	for _, n := range []int{0, -1, -8} {
+		if got := Shape(n); got != nil {
+			t.Errorf("Shape(%d) = %+v, 要 nil", n, got)
+		}
+	}
+}
+
 func name(n int) string {
 	return string(rune('0'+n/10)) + string(rune('0'+n%10)) + "人"
 }

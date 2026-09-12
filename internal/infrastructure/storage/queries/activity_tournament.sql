@@ -1,0 +1,481 @@
+-- 《百業試鋒》賽事核心 query(schemas/20 + schemas/26)。
+-- 對應 port:internal/core/activity/tournament.Repo 與 internal/core/activity/signup.Repo。
+-- 涵蓋 activity.tournaments / fencers / tournament_players / matches 四張表。
+--
+-- ── 稽核 ──────────────────────────────────────────────────────
+-- 破壞性操作(推進階段、抽籤、交換籤位、改段位、換發通行碼)必須寫
+-- platform.admin_audit_logs,**且與資料變更同一個 transaction**。
+-- 這裡**不另寫 insert** —— queries/audit.sql 的 InsertAdminAudit 就是那個權威位置
+-- (鐵則 9)。adapter 在同一個 tx 裡呼叫它即可。
+--
+-- ── 鎖序(activity 這一側的約定,全檔一致)──────────────────────
+-- 1. 任何要寫 activity 子表的 transaction,**第一步先取賽事列的鎖**:
+--      LockTournamentShared    一般寫入(報名、綁定、換通行碼、評段)
+--      LockTournamentExclusive 裁判破壞性操作(抽籤、退回階段、交換籤位)
+--    共享鎖彼此不互斥(報名可以並發),但會擋住 UpdateTournamentPhase ——
+--    這正是「RequirePhase 檢查通過之後,階段不會在腳下被換掉」的來源。
+--    獨佔鎖讓「重抽 / 交換籤位 / 退回階段」三者對同一屆賽事完全串行化;
+--    它們都是低頻手動操作,用一列鎖換掉所有交錯情境很划算。
+-- 2. 取得賽事列的鎖之後,一律依 tournament_players → fencers → matches 的順序寫。
+--    fencers 排在 tournament_players **之後**是因為 SetPlayerRank 必然是
+--    「先寫本屆段位、再回寫跨屆快照」;報名雖然要先讀/建 fencer,但那一步只會
+--    鎖到自己剛插入的新列(或等待並發的同 game_id 插入),不持有任何其他鎖。
+-- 3. matches 只有第 1 條裡的獨佔那一組會寫,所以它不可能與 1/2 形成環。
+--    重抽開頭的 DeleteTournamentMatches 雖然在 tournament_players 之前動,
+--    但 DELETE 子表不對父表取鎖,同樣構不成環。
+-- 4. 跨 schema(報名獎金走 Ledger.ApplyInTx)時,activity 的鎖永遠先取、
+--    platform 的鎖後取(users → user_balances,與 shop/daily 同向)。
+--
+-- ── passcode_hash 的流向 ───────────────────────────────────────
+-- 只有 GetCredentialByGameID 會 SELECT passcode_hash。其餘回傳選手的 query
+-- 一律列舉欄位、刻意漏掉它 —— tournament.Player 結構本身也沒有這個欄位,
+-- 一個查都沒查出來的值,不可能被誰不小心序列化到對戰表 API 上。
+
+-- ═══ 賽事(tournaments)═══════════════════════════════════════
+
+-- name: GetTournamentBySlug :one
+-- slug 在網址列上,不是秘密;查無回 ErrTournamentNotFound 由 adapter 轉。
+SELECT id, public_id, slug, name, community_id, phase, config, signup_bonus,
+       created_at, updated_at
+FROM activity.tournaments
+WHERE slug = sqlc.arg(slug)::text;
+
+-- name: LockTournamentShared :one
+-- 鎖序第一步(一般寫入版)。FOR SHARE 不互斥,所以並發報名不會被彼此卡住,
+-- 但它與 UpdateTournamentPhase 的 UPDATE 互斥 —— 於是「service 讀到 signup、
+-- 寫入時裁判剛好封閉報名」這個時間差在 tx 期間被消掉。
+-- 一併回傳 phase:adapter 可以在鎖後重讀一次真值,不必相信鎖前那次讀取。
+SELECT id, phase FROM activity.tournaments
+WHERE id = sqlc.arg(tournament_id)::bigint
+FOR SHARE;
+
+-- name: LockTournamentExclusive :one
+-- 鎖序第一步(裁判破壞性操作版)。抽籤、退回階段、交換籤位三者都會同時動
+-- tournament_players 與 matches,而它們動的順序天生相反(重抽是先刪 matches
+-- 再寫 seed_no,交換是先寫 seed_no 再改 matches)。與其為每一條路徑推敲一遍
+-- 鎖序,不如在入口就讓它們對同一屆賽事互斥 —— 這三個動作一屆只會發生幾次。
+SELECT id, phase FROM activity.tournaments
+WHERE id = sqlc.arg(tournament_id)::bigint
+FOR UPDATE;
+
+-- name: UpdateTournamentPhase :execrows
+-- 樂觀鎖:WHERE phase = @from_phase。影響 0 列 = 有人搶先改了,adapter 回
+-- ErrPhaseConflict。用 :execrows 而不是 :exec,就是為了讓「0 列」這件事
+-- 有辦法被看見 —— 兩個裁判同時按「進入下一階段」時,輸的那個必須知道
+-- 自己什麼都沒做到,而不是收到一個成功然後以為賽事被自己推進了兩階。
+-- RollbackToRanked 也用這一支(from='drawing', to='ranked')。
+UPDATE activity.tournaments
+SET phase = sqlc.arg(to_phase)::text, updated_at = now()
+WHERE id = sqlc.arg(tournament_id)::bigint
+  AND phase = sqlc.arg(from_phase)::text;
+
+-- ═══ 選手讀取(tournament_players)════════════════════════════
+
+-- name: GetPlayerByPublicID :one
+-- tournament_id 進 WHERE 而不是只用 public_id:public_id 全域唯一,但
+-- 「A 屆的選手 public_id 拿去 B 屆的路徑上操作」必須查不到,否則裁判權限
+-- 的範圍就從一屆變成全部。JOIN fencers 帶出 game_id(自然鍵,對戰表要顯示)。
+SELECT tp.id, tp.public_id, tp.tournament_id, tp.fencer_id, tp.user_id,
+       tp.display_name, tp.discord_name,
+       tp.rank_level, tp.ranked_at, tp.ranked_by,
+       tp.self_rated_level, tp.ladder_rank, tp.ladder_score,
+       tp.arts_note, tp.availability_note,
+       tp.seed_no, tp.status, tp.created_at, tp.updated_at,
+       f.game_id
+FROM activity.tournament_players tp
+JOIN activity.fencers f ON f.id = tp.fencer_id
+WHERE tp.tournament_id = sqlc.arg(tournament_id)::bigint
+  AND tp.public_id = sqlc.arg(public_id)::text;
+
+-- name: GetCredentialByGameID :one
+-- **全檔唯一會讀出 passcode_hash 的地方**。選手與雜湊同一列一次讀出,
+-- 不拆成兩支:拆了就會讀兩次同一張表,中間有機會讀到不一致的狀態
+-- (裁判剛好在這一瞬重新產生通行碼)。
+-- 查無此 game_id 與通行碼錯誤在上層是同一個錯誤,這裡不做任何區分。
+SELECT tp.id, tp.public_id, tp.tournament_id, tp.fencer_id, tp.user_id,
+       tp.display_name, tp.discord_name,
+       tp.rank_level, tp.ranked_at, tp.ranked_by,
+       tp.self_rated_level, tp.ladder_rank, tp.ladder_score,
+       tp.arts_note, tp.availability_note,
+       tp.seed_no, tp.status, tp.created_at, tp.updated_at,
+       f.game_id,
+       tp.passcode_hash, tp.passcode_issued_at
+FROM activity.tournament_players tp
+JOIN activity.fencers f ON f.id = tp.fencer_id
+WHERE tp.tournament_id = sqlc.arg(tournament_id)::bigint
+  AND f.game_id = sqlc.arg(game_id)::text;
+
+-- name: ListDrawablePlayers :many
+-- 可進抽籤者:status='active' 且已評段。
+-- ORDER BY tp.id 是**抽籤可重現性的一部分**,不是排版偏好:同一個種子要抽出
+-- 位元相同的對戰表,前提是洗牌的輸入順序固定。沒有 ORDER BY 時 Postgres
+-- 可以合法地換一個執行計畫、換一個回傳順序,那一刻「拿舊種子重跑驗證」就失效了。
+SELECT tp.id, tp.public_id, tp.tournament_id, tp.fencer_id, tp.user_id,
+       tp.display_name, tp.discord_name,
+       tp.rank_level, tp.ranked_at, tp.ranked_by,
+       tp.self_rated_level, tp.ladder_rank, tp.ladder_score,
+       tp.arts_note, tp.availability_note,
+       tp.seed_no, tp.status, tp.created_at, tp.updated_at,
+       f.game_id
+FROM activity.tournament_players tp
+JOIN activity.fencers f ON f.id = tp.fencer_id
+WHERE tp.tournament_id = sqlc.arg(tournament_id)::bigint
+  AND tp.status = 'active'
+  AND tp.rank_level IS NOT NULL
+ORDER BY tp.id;
+
+-- name: CountUnrankedActivePlayers :one
+-- 抽籤的守門條件,回 0 才能抽。只算 active:棄賽者本來就不進抽籤,
+-- 把他們算進來會讓裁判被一個永遠評不完的數字擋住。
+SELECT count(*)::bigint AS unranked
+FROM activity.tournament_players
+WHERE tournament_id = sqlc.arg(tournament_id)::bigint
+  AND status = 'active'
+  AND rank_level IS NULL;
+
+-- ═══ 報名(CreateRegistration 的四個步驟)════════════════════
+
+-- name: GetFencerByGameID :one
+-- 報名第 1 步。不加 FOR UPDATE:這裡只是要判斷「是不是回鍋選手」,
+-- 真正的權威是 UNIQUE (game_id),而拿不到列的那一邊會走 InsertFencerIfAbsent。
+SELECT id, public_id, game_id, user_id, discord_name,
+       last_rank_level, last_ranked_at, tournaments_played, wins, losses,
+       created_at, updated_at
+FROM activity.fencers
+WHERE game_id = sqlc.arg(game_id)::text;
+
+-- name: InsertFencerIfAbsent :one
+-- 報名第 1 步(建列)。ON CONFLICT DO NOTHING 而不是 DO UPDATE:
+-- 並發時兩個請求都查不到、都想建,撞鍵的那一邊要回頭重讀既有列繼續走完報名,
+-- 而不是把錯誤丟給使用者 —— 使用者只是按了報名,他沒有做錯任何事。
+-- DO NOTHING 時不回傳列(no rows),adapter 就是靠這個訊號決定重讀。
+-- discord_name 這裡不寫:它由 BumpFencerOnRegistration 統一更新(一個概念一個位置)。
+INSERT INTO activity.fencers (public_id, game_id)
+VALUES (sqlc.arg(public_id)::text, sqlc.arg(game_id)::text)
+ON CONFLICT (game_id) DO NOTHING
+RETURNING id, public_id, game_id, user_id, discord_name,
+          last_rank_level, last_ranked_at, tournaments_played, wins, losses,
+          created_at, updated_at;
+
+-- name: InsertTournamentPlayer :one
+-- 報名第 3 步。兩道防線各司其職:
+--   *  INSERT ... SELECT FROM tournaments WHERE phase = @require_phase
+--      —— 階段條件進 WHERE(port 明文要求)。不成立就插不進去(no rows),
+--      adapter 回 tournament.ErrWrongPhase。配合鎖序第 1 步的 FOR SHARE,
+--      這個條件在整個 tx 期間都不會被抽換。
+--   *  UNIQUE (tournament_id, fencer_id) —— 連點報名鈕由它擋,**不加冪等鍵**
+--      (鐵則 9:一個概念一個權威位置,DB 約束比應用層的先查後寫可靠)。
+--      撞鍵時 adapter 回 ErrAlreadyRegistered。
+-- 空字串一律用 NULLIF 轉成 NULL:這幾欄是「有沒有填」的語意,
+-- 空字串與 NULL 兩種表示法並存的話,之後每個讀取端都要各判一次。
+-- ladder_score 同理(0 分與沒填在評段參考上是同一件事,port 也把負數歸零)。
+INSERT INTO activity.tournament_players (
+  public_id, tournament_id, fencer_id, display_name, discord_name, passcode_hash,
+  self_rated_level, ladder_rank, ladder_score, arts_note, availability_note
+)
+SELECT sqlc.arg(public_id)::text,
+       t.id,
+       sqlc.arg(fencer_id)::bigint,
+       sqlc.arg(display_name)::text,
+       sqlc.arg(discord_name)::text,
+       sqlc.arg(passcode_hash)::text,
+       NULLIF(sqlc.arg(self_rated_level)::smallint, 0),
+       NULLIF(sqlc.arg(ladder_rank)::text, ''),
+       NULLIF(sqlc.arg(ladder_score)::int, 0),
+       NULLIF(sqlc.arg(arts_note)::text, ''),
+       NULLIF(sqlc.arg(availability_note)::text, '')
+FROM activity.tournaments t
+WHERE t.id = sqlc.arg(tournament_id)::bigint
+  AND t.phase = sqlc.arg(require_phase)::text
+RETURNING id, public_id, tournament_id, fencer_id, user_id,
+          display_name, discord_name,
+          rank_level, ranked_at, ranked_by,
+          self_rated_level, ladder_rank, ladder_score,
+          arts_note, availability_note,
+          seed_no, status, created_at, updated_at;
+
+-- name: BumpFencerOnRegistration :one
+-- 報名第 4 步。**必須排在第 3 步之後**(鎖序第 2 條):tournament_players
+-- 插入成功才代表這一屆真的多參加了一次,順序反過來的話,撞 UNIQUE 被 rollback
+-- 的那一筆會在 rollback 前先卡住別人的 fencer 列。
+-- tournaments_played 用 +1 的增量寫法而不是先讀後寫:增量在 SQL 裡是原子的,
+-- 不需要為它多一道列鎖。真值隨時可用 RecalcFencerStats 對帳。
+-- discord_name 覆寫成最近一次報名填的(schemas/26),空字串不覆寫舊值。
+UPDATE activity.fencers
+SET discord_name = COALESCE(NULLIF(sqlc.arg(discord_name)::text, ''), discord_name),
+    tournaments_played = tournaments_played + 1,
+    updated_at = now()
+WHERE id = sqlc.arg(fencer_id)::bigint
+RETURNING id, public_id, game_id, user_id, discord_name,
+          last_rank_level, last_ranked_at, tournaments_played, wins, losses,
+          created_at, updated_at;
+
+-- ═══ 身分維護(通行碼、綁定)═════════════════════════════════
+
+-- name: UpdatePlayerPasscode :execrows
+-- 「舊碼立即失效」不需要撤銷清單 —— passcode_hash 被覆寫的那一刻,
+-- 舊碼就再也比對不過。issued_at 同步更新,只是給裁判看的痕跡。
+-- :execrows 讓 adapter 分得出「查無此選手」(0 列),那要回 ErrPlayerNotFound。
+-- 呼叫端必須另外呼叫 InsertAdminAudit(同一個 tx),而且
+-- **明碼與雜湊都絕不可進稽核紀錄**。
+UPDATE activity.tournament_players
+SET passcode_hash = sqlc.arg(passcode_hash)::text,
+    passcode_issued_at = now(),
+    updated_at = now()
+WHERE id = sqlc.arg(player_id)::bigint
+  AND tournament_id = sqlc.arg(tournament_id)::bigint;
+
+-- name: BindPlayerUser :one
+-- 綁定的第一支(依鎖序 tournament_players 先於 fencers)。
+-- WHERE 帶 (user_id IS NULL OR user_id = @user_id):重複綁同一個帳號是冪等的
+-- 成功,綁到**不同**帳號則影響 0 列(no rows)→ adapter 回 ErrAlreadyBound。
+-- 改綁收款人要裁判介入並留稽核,不能靠這支 API 悄悄換掉。
+WITH upd AS (
+  UPDATE activity.tournament_players
+  SET user_id = sqlc.arg(user_id)::bigint, updated_at = now()
+  WHERE id = sqlc.arg(player_id)::bigint
+    AND tournament_id = sqlc.arg(tournament_id)::bigint
+    AND (user_id IS NULL OR user_id = sqlc.arg(user_id)::bigint)
+  RETURNING id, public_id, tournament_id, fencer_id, user_id,
+            display_name, discord_name,
+            rank_level, ranked_at, ranked_by,
+            self_rated_level, ladder_rank, ladder_score,
+            arts_note, availability_note,
+            seed_no, status, created_at, updated_at
+)
+SELECT upd.*, f.game_id
+FROM upd
+JOIN activity.fencers f ON f.id = upd.fencer_id;
+
+-- name: BindFencerUser :execrows
+-- 綁定的第二支,**跑在 BindPlayerUser 之後**(鎖序)。反過來會與 SetPlayerRank
+-- (tournament_players → fencers)形成環:裁判正在評某人的段、那個人同時在綁帳號。
+-- 兩種失敗分得出來:
+--   影響 0 列        → 這位 fencer 已綁在別的帳號上(ErrAlreadyBound)
+--   撞 fencers_user_id_uq → 這個帳號已綁在別位 fencer 身上(ErrUserAlreadyBound)
+-- 兩處都寫是必要的:只寫一處的話,領獎時查哪一張表會得到不同答案。
+UPDATE activity.fencers
+SET user_id = sqlc.arg(user_id)::bigint, updated_at = now()
+WHERE id = sqlc.arg(fencer_id)::bigint
+  AND (user_id IS NULL OR user_id = sqlc.arg(user_id)::bigint);
+
+-- ═══ 評段 ═══════════════════════════════════════════════════
+
+-- name: SetPlayerRank :one
+-- 階段守門(只在 ranking / ranked 開放)在 service,不在這裡:那是狀態機的規則,
+-- 而且 ErrRanksLocked 要帶「先退回 ranked 再重抽」的補救說明,SQL 給不出來。
+-- 這裡用 CTE 把 UPDATE ... RETURNING 再接上 fencers,是為了讓回傳的形狀與
+-- GetPlayerByPublicID 一致 —— 呼叫端要的是「更新後的 Player」,而 Player 含 game_id。
+-- 分成 update + 再 select 兩次的話,中間那個縫隙剛好是別人也在改同一列的時候。
+WITH upd AS (
+  UPDATE activity.tournament_players
+  SET rank_level = sqlc.arg(rank_level)::smallint,
+      ranked_at = now(),
+      ranked_by = sqlc.arg(ranked_by)::bigint,
+      updated_at = now()
+  WHERE id = sqlc.arg(player_id)::bigint
+    AND tournament_id = sqlc.arg(tournament_id)::bigint
+  RETURNING id, public_id, tournament_id, fencer_id, user_id,
+            display_name, discord_name,
+            rank_level, ranked_at, ranked_by,
+            self_rated_level, ladder_rank, ladder_score,
+            arts_note, availability_note,
+            seed_no, status, created_at, updated_at
+)
+SELECT upd.*, f.game_id
+FROM upd
+JOIN activity.fencers f ON f.id = upd.fencer_id;
+
+-- name: TouchFencerLastRank :execrows
+-- 評段後回寫跨屆快照(fencers.last_rank_level 是衍生資料的增量更新路徑)。
+-- **跑在 SetPlayerRank 之後、同一個 tx**(鎖序 tournament_players → fencers)。
+-- FROM tournament_players 只是用來找 fencer_id,不對它取列鎖。
+-- 這支刻意不判斷「這屆是不是最近一屆」:那個判斷就是 RecalcFencerStats 本身,
+-- 在這裡再寫一次等於同一個概念兩個權威。真要修正,對帳跑 Recalc + ApplyFencerStats。
+UPDATE activity.fencers f
+SET last_rank_level = sqlc.arg(rank_level)::smallint,
+    last_ranked_at = now(),
+    updated_at = now()
+FROM activity.tournament_players tp
+WHERE tp.id = sqlc.arg(player_id)::bigint
+  AND f.id = tp.fencer_id;
+
+-- ═══ 抽籤(ReplaceDraw / RollbackToRanked)════════════════════
+
+-- name: DeleteTournamentMatches :exec
+-- 重抽與退回階段的第一步。必須真的刪掉而不是標記作廢:
+-- UNIQUE (tournament_id, round, slot) 會在下一次寫入時撞上舊列。
+-- handicap / bets 對 matches 有 FK,所以「已經有人下過注的對戰表」會在這裡
+-- 被資料庫擋下來 —— 那正是我們要的:drawing 階段本來就不該有注單,
+-- 真撞上了代表流程出了更大的問題,寧可整筆 rollback 也不要悄悄刪掉別人的注。
+DELETE FROM activity.matches
+WHERE tournament_id = sqlc.arg(tournament_id)::bigint;
+
+-- name: ClearTournamentSeeds :exec
+-- 重抽與退回階段的第二步。先全部清成 NULL 再重寫,是因為
+-- UNIQUE (tournament_id, seed_no) 是立即檢查的:不清乾淨就重寫,
+-- 新舊籤位會在中途撞上(而且是撞在第幾列取決於寫入順序,難以重現)。
+-- NULL 不受 UNIQUE 限制,正是「未抽」要的語意。
+UPDATE activity.tournament_players
+SET seed_no = NULL, updated_at = now()
+WHERE tournament_id = sqlc.arg(tournament_id)::bigint
+  AND seed_no IS NOT NULL;
+
+-- name: AssignSeeds :execrows
+-- 一次抽籤動輒數十位選手。用 unnest 兩個陣列做一次 UPDATE,而不是迴圈單筆:
+-- 少掉 N 次 round-trip 只是順帶的好處,真正的理由是**整批在一個語句裡**,
+-- 不會出現「寫到第 17 位時失敗、前 16 位已經有籤位」這種中途狀態。
+-- :execrows 讓 adapter 能驗證影響列數 == len(Seats);對不上代表有 player_id
+-- 不屬於這屆(或已被刪),那時候整筆 rollback 比寫進去一半安全。
+UPDATE activity.tournament_players tp
+SET seed_no = s.seed_no, updated_at = now()
+FROM (
+  SELECT unnest(sqlc.arg(player_ids)::bigint[]) AS player_id,
+         unnest(sqlc.arg(seed_nos)::int[])      AS seed_no
+) s
+WHERE tp.id = s.player_id
+  AND tp.tournament_id = sqlc.arg(tournament_id)::bigint;
+
+-- name: InsertMatches :execrows
+-- 同上,整棵樹一個語句寫完。public_id(ULID)由 adapter 逐場產好再傳進來 ——
+-- SQL 不生成 id(鐵則:對外只出現 public_id,而它的產生位置只有一個)。
+-- NULLIF(...,0):port 的 MatchSeat 用 0 表示「尚未確定」(等上一輪),
+-- 資料庫存 NULL。0 不是合法的 player id,這個約定在 bracket 套件已經成立。
+-- status 刻意不寫,吃 DEFAULT 'pending':schemas/20 的 ready 定義是
+-- 「雙方確定,**裁判已開盤**」,開盤是另一個動作。抽籤就把場次設成 ready,
+-- 等於讓下注與讓武在裁判還沒確認籤表時就開了。
+-- 五個 unnest 並排在同一個 SELECT list(PG10 起是 lockstep 展開,逐列對齊),
+-- 而不是 unnest(a,b,c,d,e) 的多引數形式 —— 後者 sqlc 的型別解析認不得。
+-- 長度不一致時短的那幾欄會被補 NULL 而不是報錯,所以五個陣列必須由
+-- adapter 在同一個迴圈裡逐場 append,不要分開組。
+INSERT INTO activity.matches (public_id, tournament_id, round, slot, p1_player_id, p2_player_id)
+SELECT m.public_id,
+       sqlc.arg(tournament_id)::bigint,
+       m.round,
+       m.slot,
+       NULLIF(m.p1, 0),
+       NULLIF(m.p2, 0)
+FROM (
+  SELECT unnest(sqlc.arg(public_ids)::text[])       AS public_id,
+         unnest(sqlc.arg(rounds)::int[])            AS round,
+         unnest(sqlc.arg(slots)::int[])             AS slot,
+         unnest(sqlc.arg(p1_player_ids)::bigint[])  AS p1,
+         unnest(sqlc.arg(p2_player_ids)::bigint[])  AS p2
+) m;
+
+-- ═══ 交換籤位(SwapSeeds)════════════════════════════════════
+
+-- name: GetPlayerSeedForUpdate :one
+-- 交換前在 tx 內重讀真值。service 那次讀取發生在取鎖之前,不能用來當寫入依據
+-- (雖然 LockTournamentExclusive 已經讓交換彼此串行化,但「以鎖後讀到的值為準」
+--  是一條不該有例外的規矩)。seed_no 為 NULL → adapter 回 ErrPlayerNotSeeded。
+SELECT id, seed_no
+FROM activity.tournament_players
+WHERE id = sqlc.arg(player_id)::bigint
+  AND tournament_id = sqlc.arg(tournament_id)::bigint
+FOR UPDATE;
+
+-- name: SetPlayerSeed :execrows
+-- 交換要呼叫這支**三次**,不是一次 UPDATE ... CASE:
+--   1. SetPlayerSeed(A, NULL)     騰出空位
+--   2. SetPlayerSeed(B, seedA)
+--   3. SetPlayerSeed(A, seedB)
+-- UNIQUE (tournament_id, seed_no) 不是 DEFERRABLE,Postgres 在 UPDATE 期間
+-- 逐列檢查,所以單一語句直接對調必然在中途撞鍵。CTE 也救不了 ——
+-- 同一語句裡對同一列做兩次 UPDATE 的行為是未定義的。
+-- 三步之間的中間狀態只存在於同一個 tx 內,外面看不到。
+UPDATE activity.tournament_players
+SET seed_no = sqlc.narg(seed_no)::int, updated_at = now()
+WHERE id = sqlc.arg(player_id)::bigint
+  AND tournament_id = sqlc.arg(tournament_id)::bigint;
+
+-- name: SwapPlayersInMatches :execrows
+-- 交換籤位的另一半,**與 seed_no 的互換同一個 tx**。
+-- 只改籤號不改對戰表,兩張表就會互相矛盾,而矛盾的那一刻沒有任何約束會報錯 ——
+-- 只是對戰表上的名字跟籤位表對不起來,等到有人發現通常已經開打了。
+-- CASE 對調在 matches 這裡是安全的:這三欄沒有 UNIQUE,而且 A、B 同場時
+-- (p1=A, p2=B → p1=B, p2=A)依然滿足 matches_distinct_players_check。
+-- winner_player_id 一併換是為了不留下例外:drawing 階段不該有勝者,
+-- 但「這欄有值時會怎樣」不該取決於呼叫端記不記得這件事。
+UPDATE activity.matches
+SET p1_player_id = CASE p1_player_id
+                     WHEN sqlc.arg(player_a)::bigint THEN sqlc.arg(player_b)::bigint
+                     WHEN sqlc.arg(player_b)::bigint THEN sqlc.arg(player_a)::bigint
+                     ELSE p1_player_id END,
+    p2_player_id = CASE p2_player_id
+                     WHEN sqlc.arg(player_a)::bigint THEN sqlc.arg(player_b)::bigint
+                     WHEN sqlc.arg(player_b)::bigint THEN sqlc.arg(player_a)::bigint
+                     ELSE p2_player_id END,
+    winner_player_id = CASE winner_player_id
+                     WHEN sqlc.arg(player_a)::bigint THEN sqlc.arg(player_b)::bigint
+                     WHEN sqlc.arg(player_b)::bigint THEN sqlc.arg(player_a)::bigint
+                     ELSE winner_player_id END,
+    updated_at = now()
+WHERE tournament_id = sqlc.arg(tournament_id)::bigint
+  AND (p1_player_id IN (sqlc.arg(player_a)::bigint, sqlc.arg(player_b)::bigint)
+    OR p2_player_id IN (sqlc.arg(player_a)::bigint, sqlc.arg(player_b)::bigint)
+    OR winner_player_id IN (sqlc.arg(player_a)::bigint, sqlc.arg(player_b)::bigint));
+
+-- ═══ 衍生資料重算(schemas/26)════════════════════════════════
+
+-- name: RecalcFencerStats :one
+-- fencers 的四個統計欄位全是衍生資料,**必須可從事實表重算**(全域慣例)。
+-- 冗餘存放的唯一理由是報名頁與生涯頁都要即時讀,每次 JOIN 統計不划算。
+--
+-- 這支刻意把「存的值」與「算出來的值」放在同一列回傳:對帳測試要的就是這個比較,
+-- 分成兩支查詢的話,兩次查詢之間有人報名就會產生假的不一致。
+--
+-- 口徑:
+--   tournaments_played  報過名就算一屆(不論是否出賽)
+--   wins                winner_player_id 指到自己的場次數
+--   losses              自己有上場、已分勝負、而勝者不是自己 ——
+--                       棄賽造成的 walkover 也算一敗(戰績要誠實反映結果,
+--                       生涯頁靠 result_kind 區分顯示)
+--   last_rank_level     最近一屆有評段的那一屆的值(依 tournaments.created_at)
+-- IN (m.p1_player_id, m.p2_player_id) 對 NULL 是安全的:另一邊是 NULL 時,
+-- 只要有一邊相等結果就是 TRUE;都不等則是 NULL,不會被 WHERE 當成 TRUE。
+SELECT f.id AS fencer_id,
+       f.tournaments_played AS stored_tournaments_played,
+       f.wins               AS stored_wins,
+       f.losses             AS stored_losses,
+       f.last_rank_level    AS stored_last_rank_level,
+       f.last_ranked_at     AS stored_last_ranked_at,
+       (SELECT count(DISTINCT tp.tournament_id)
+          FROM activity.tournament_players tp
+         WHERE tp.fencer_id = f.id)::int AS calc_tournaments_played,
+       (SELECT count(*)
+          FROM activity.matches m
+          JOIN activity.tournament_players tp ON tp.id = m.winner_player_id
+         WHERE tp.fencer_id = f.id)::int AS calc_wins,
+       (SELECT count(*)
+          FROM activity.matches m
+          JOIN activity.tournament_players tp
+            ON tp.id IN (m.p1_player_id, m.p2_player_id)
+         WHERE tp.fencer_id = f.id
+           AND m.winner_player_id IS NOT NULL
+           AND m.winner_player_id <> tp.id)::int AS calc_losses,
+       lr.rank_level AS calc_last_rank_level,
+       lr.ranked_at  AS calc_last_ranked_at
+FROM activity.fencers f
+LEFT JOIN LATERAL (
+  SELECT tp.rank_level, tp.ranked_at
+  FROM activity.tournament_players tp
+  JOIN activity.tournaments t ON t.id = tp.tournament_id
+  WHERE tp.fencer_id = f.id AND tp.rank_level IS NOT NULL
+  ORDER BY t.created_at DESC, t.id DESC
+  LIMIT 1
+) lr ON true
+WHERE f.id = sqlc.arg(fencer_id)::bigint;
+
+-- name: ApplyFencerStats :execrows
+-- 對帳修復:把 RecalcFencerStats 算出來的值寫回去。
+-- 刻意**不**在這支裡重寫一次統計 SQL —— 口徑只能有一個權威位置(鐵則 9),
+-- 兩份會慢慢長歪,而歪掉的那天沒有人看得出哪一份才對。
+UPDATE activity.fencers
+SET tournaments_played = sqlc.arg(tournaments_played)::int,
+    wins               = sqlc.arg(wins)::int,
+    losses             = sqlc.arg(losses)::int,
+    last_rank_level    = sqlc.narg(last_rank_level)::smallint,
+    last_ranked_at     = sqlc.narg(last_ranked_at)::timestamptz,
+    updated_at         = now()
+WHERE id = sqlc.arg(fencer_id)::bigint;

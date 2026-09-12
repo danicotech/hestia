@@ -157,12 +157,12 @@ func TestGetParsesConfig(t *testing.T) {
 	t.Parallel()
 
 	f := newFake(PhaseSignup, 0)
-	f.tournament.ConfigRaw = []byte(`{"bp_per_rank_gap":12,"max_stake":900}`)
+	f.tournament.ConfigRaw = []byte(`{"bp_per_rank_gap":12}`)
 	v, err := NewService(f).Get(context.Background(), testSlug)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v.Config.BPPerRankGap != 12 || v.Config.MaxStake != 900 {
+	if v.Config.BPPerRankGap != 12 {
 		t.Errorf("設定沒解析進來:%+v", v.Config)
 	}
 	if v.ConfigErr != nil {

@@ -140,6 +140,28 @@ func Build(playerIDs []int64, r *rand.Rand) (*Bracket, error) {
 	return b, nil
 }
 
+// Shape 建出「只有形狀、沒有選手」的對戰表。
+//
+// 存在的理由:晉級與輪次名稱只取決於樹的大小,不取決於誰在裡面。
+// 比賽結束時要問「勝者進哪一場」「這輪叫什麼」,呼叫端手上通常只有
+// 「這屆總共幾輪」(從 matches 的 MAX(round) 得知),沒有完整的 Bracket。
+//
+// 沒有這個建構子,呼叫端就得自己湊 &Bracket{Size: 1<<n, TotalRounds: n} ——
+// 那是在複製這裡的不變式(Size 必須是 2^TotalRounds),而複製出去的不變式
+// 不會跟著這裡一起改。
+//
+// totalRounds <= 0 回 nil:零輪的賽事沒有任何場次,問晉級是呼叫端的 bug。
+func Shape(totalRounds int) *Bracket {
+	if totalRounds <= 0 {
+		return nil
+	}
+	return &Bracket{
+		Size:        1 << totalRounds,
+		TotalRounds: totalRounds,
+		Seeds:       map[int64]int{},
+	}
+}
+
 // Advance 回報某場的勝者該進到哪裡。
 //
 // 回傳 ok = false 代表這是決賽,沒有下一場 —— 勝者即冠軍。

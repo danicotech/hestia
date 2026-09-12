@@ -21,8 +21,6 @@ const (
 	// DefaultBPPerRankGap 每差一段給多少 BP。與 bp.DefaultPerRankGap 同源,
 	// 不另外寫一個 8:同一個概念兩個字面值遲早會有一邊被改掉。
 	DefaultBPPerRankGap = bp.DefaultPerRankGap
-	// DefaultMaxStake 單注上限(平台代幣)。
-	DefaultMaxStake int64 = 500
 	// DefaultOddsSmoothing 是賠率的拉普拉斯平滑量,避免冷門方分母為 0。
 	DefaultOddsSmoothing int64 = 5
 	// DefaultVigBPS 是抽水,萬分之一為單位(800 = 8%)。
@@ -77,15 +75,24 @@ type RankInfo struct {
 }
 
 // Config 是 tournaments.config 解析後的形態。
+//
+// # 這裡刻意沒有 MaxStake
+//
+// 單注上限的權威是 **platform.economy_configs 的 max_stake**(schemas/21:
+// 「MAX_STAKE=500(platform 的 max_stake)」),migration 00014 已經 seed 進去。
+//
+// 它是平台層的風險控制,不是逐屆的玩法旋鈕 —— 逐屆可調的是讓武與賠率
+// (BP 級距、抽水、賠率上下限、串關封頂),那些才在這裡。
+//
+// 曾經兩邊都有過。症狀是「同一顆按鈕在不同賽事有不同上限,而沒有人說得出
+// 為什麼」—— 兩個權威位置一定會漂移,而漂移時沒有哪一邊看起來是錯的。
 type Config struct {
 	// BPPerRankGap 每差一段給多少 BP。恆為正數。
 	BPPerRankGap int64
 	// Ranks 是四個段位的顯示資料,依 level 由低至高排序,長度恆為 4。
-	Ranks []RankInfo
-	Odds  OddsConfig
-	// MaxStake 單注上限。恆為正數。
-	MaxStake int64
-	Prizes   Prizes
+	Ranks  []RankInfo
+	Odds   OddsConfig
+	Prizes Prizes
 	// HandicapItemMaxQty 是單一讓武項目的重複購買上限。
 	// nil = **不限制**,這是 09-12 grill 的定案值。
 	// 預留這個旋鈕是為了日後實戰發現失衡時能逐屆設上限,不必改表。
@@ -125,7 +132,6 @@ func DefaultConfig() Config {
 			MaxOddsMilli:   DefaultMaxOddsMilli,
 			MaxParlayMilli: DefaultMaxParlayMilli,
 		},
-		MaxStake: DefaultMaxStake,
 	}
 }
 
@@ -162,7 +168,6 @@ type rawConfig struct {
 	BPPerRankGap       *int64     `json:"bp_per_rank_gap"`
 	Ranks              []rawRank  `json:"ranks"`
 	Odds               *rawOdds   `json:"odds"`
-	MaxStake           *int64     `json:"max_stake"`
 	Prizes             *rawPrizes `json:"prizes"`
 	HandicapItemMaxQty *int32     `json:"handicap_item_max_qty"`
 }
@@ -207,15 +212,6 @@ func ParseConfig(data []byte) (Config, error) {
 
 	if raw.Odds != nil {
 		cfg.Odds, problems = mergeOdds(cfg.Odds, raw.Odds, problems)
-	}
-
-	if raw.MaxStake != nil {
-		if *raw.MaxStake > 0 {
-			cfg.MaxStake = *raw.MaxStake
-		} else {
-			problems = append(problems, fmt.Errorf("max_stake 必須為正數,得到 %d,退回 %d",
-				*raw.MaxStake, DefaultMaxStake))
-		}
 	}
 
 	if raw.Prizes != nil {

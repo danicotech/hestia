@@ -23,9 +23,6 @@ func TestParseConfigEmptyUsesDefaults(t *testing.T) {
 		if len(cfg.Ranks) != 4 {
 			t.Fatalf("段位要有四段,得到 %d", len(cfg.Ranks))
 		}
-		if cfg.MaxStake != DefaultMaxStake {
-			t.Errorf("max_stake = %d, 要 %d", cfg.MaxStake, DefaultMaxStake)
-		}
 		if cfg.HandicapItemMaxQty != nil {
 			t.Error("handicap_item_max_qty 預設應為不限制(nil)")
 		}
@@ -52,7 +49,6 @@ func TestParseConfigFull(t *testing.T) {
 	    "max_odds_milli": 12000,
 	    "max_parlay_milli": 300000
 	  },
-	  "max_stake": 500,
 	  "prizes": {"champion": 5000, "runner_up": 3000, "third": 1000, "participation": 100},
 	  "handicap_item_max_qty": null
 	}`)
@@ -61,8 +57,8 @@ func TestParseConfigFull(t *testing.T) {
 	if err != nil {
 		t.Fatalf("合法設定不該回錯誤:%v", err)
 	}
-	if cfg.BPPerRankGap != 8 || cfg.MaxStake != 500 {
-		t.Errorf("bp_per_rank_gap=%d max_stake=%d", cfg.BPPerRankGap, cfg.MaxStake)
+	if cfg.BPPerRankGap != 8 {
+		t.Errorf("bp_per_rank_gap=%d", cfg.BPPerRankGap)
 	}
 	if cfg.Odds != (OddsConfig{Smoothing: 5, VigBPS: 800, MinOddsMilli: 1050, MaxOddsMilli: 12000, MaxParlayMilli: 300000}) {
 		t.Errorf("odds 讀錯:%+v", cfg.Odds)
@@ -111,7 +107,7 @@ func TestParseConfigBrokenJSONStillUsable(t *testing.T) {
 	if !errors.Is(err, ErrConfigMalformed) {
 		t.Errorf("壞 JSON 要回 ErrConfigMalformed,得到 %v", err)
 	}
-	if cfg.BPPerRankGap != DefaultBPPerRankGap || len(cfg.Ranks) != 4 || cfg.MaxStake != DefaultMaxStake {
+	if cfg.BPPerRankGap != DefaultBPPerRankGap || len(cfg.Ranks) != 4 {
 		t.Errorf("壞 JSON 之後設定必須仍然完整可用:%+v", cfg)
 	}
 }
@@ -253,12 +249,12 @@ func TestParseConfigHandicapItemMaxQty(t *testing.T) {
 func TestParseConfigReportsEveryProblem(t *testing.T) {
 	t.Parallel()
 
-	_, err := ParseConfig([]byte(`{"bp_per_rank_gap":-1,"max_stake":0,"prizes":{"third":-5}}`))
+	_, err := ParseConfig([]byte(`{"bp_per_rank_gap":-1,"handicap_item_max_qty":0,"prizes":{"third":-5}}`))
 	if err == nil {
 		t.Fatal("應該回錯誤")
 	}
 	msg := err.Error()
-	for _, want := range []string{"bp_per_rank_gap", "max_stake", "prizes.third"} {
+	for _, want := range []string{"bp_per_rank_gap", "handicap_item_max_qty", "prizes.third"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("錯誤訊息應提到 %s:%v", want, err)
 		}
