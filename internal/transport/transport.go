@@ -309,9 +309,10 @@ func New(deps Deps) (*Server, error) {
 
 	// 稽核在最外層才看得到前綴外的探測流量;順序不能反,
 	// 理由見 auditHTTP 與 mountAt 的說明。
-	// 由外而內:稽核 → /login 暫時轉址(在前綴之外)→ 剝前綴 → connect mux。
+	// 由外而內:稽核 → 剝前綴 → connect mux。
+	// (/login 的暫時轉址已經由 theatron 接手 —— 網址不變,實作換人。)
 	return &Server{
-		handler: auditHTTP(withLoginShim(basePath, mountAt(basePath, mux)), queue, log, basePath),
+		handler: auditHTTP(mountAt(basePath, mux), queue, log, basePath),
 		audit:   queue,
 	}, nil
 }
