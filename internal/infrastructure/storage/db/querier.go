@@ -337,9 +337,42 @@ type Querier interface {
 	// 回來要看得到它寫下的 status='locked' 與 handicap_locked_at。
 	// 再加一次 FOR UPDATE 在同一個 tx 裡沒有任何效果,只會多一次寫 xmax 的代價。
 	GetMatchForJudge(ctx context.Context, matchPublicID string) (GetMatchForJudgeRow, error)
+	// 以**內部 id** 無鎖重讀,欄位與 GetMatchForJudge 逐字相同。
+	//
+	// 為什麼需要這一支:狀態轉移的參數只帶內部 id,而轉移影響 0 列時必須分得出
+	// 「查無此場次」與「狀態已經被別人改了」—— 兩者對裁判的意思完全不同。
+	// 沒有這支的話,adapter 得自己維護一份 tx 內的 id → public_id 對照表,
+	// 那是把 DB 查得到的事實搬進記憶體再維護一次(規則 9)。
+	GetMatchForJudgeByID(ctx context.Context, id int64) (GetMatchForJudgeByIDRow, error)
 	// 查無列 = 從未設定 = false(不退出)。
 	GetOptOutLogging(ctx context.Context, userID int64) (bool, error)
 	GetPetByPublicID(ctx context.Context, publicID string) (GetPetByPublicIDRow, error)
+	// 以**內部 id** 查選手,欄位與 GetPlayerByPublicID 逐字相同。
+	//
+	// 為什麼需要這一支:有兩處只拿得到內部 id,而不接受「猜」。
+	//
+	//   1. 改段位的稽核要記 before 值。改段位是異議流程的結果 —— 「原本評幾段、
+	//      後來改成幾段」正是日後有人不服氣時唯一查得到的東西,記不出來等於沒記。
+	//   2. 綁定平台帳號回 0 列時,要分得出「查無此選手」與「已綁別的帳號」。
+	//      兩者對使用者的意思完全不同:前者是拿錯 id,後者要他先解綁。
+	//
+	// tournament_id 同樣進 WHERE(理由見 GetPlayerByPublicID):裁判權限的範圍是一屆,
+	// 不是全部。
+	//
+	// **FOR UPDATE 不是可選的。** 兩個用途都是「讀了要寫」,而 SetPlayerRank 只握著
+	// 賽事列的 FOR SHARE —— 兩位裁判可以並發評同一個人。不鎖的話,READ COMMITTED 下
+	// 兩邊都讀到同一個舊值,兩筆稽核的 before 就都記成那個值,稽核鏈當場斷掉。
+	//
+	// 這個錯只在併發時發生:序列化跑完全正常,所有既有測試照樣綠。
+	// 而它壞掉的時機,恰好是最需要稽核的時機(有人對段位吵起來、兩位裁判同時動手)。
+	// 實測 -count=5 有四輪重現。
+	//
+	// 只鎖 tp:fencers 那側是 JOIN 進來拿 game_id 的,不需要鎖,
+	// 而且鎖序(賽事 → tournament_players → fencers)也不允許在這裡先鎖 fencers。
+	//
+	// 欄位順序必須與 GetPlayerByPublicID 一致 —— adapter 靠 Go 的結構轉換共用同一份
+	// 映射,不一致會編不過,而那正是我們要的:錯位在編譯期爆,不是執行期靜靜接錯欄位。
+	GetPlayerByID(ctx context.Context, arg GetPlayerByIDParams) (GetPlayerByIDRow, error)
 	// ═══ 選手讀取(tournament_players)════════════════════════════
 	// tournament_id 進 WHERE 而不是只用 public_id:public_id 全域唯一,但
 	// 「A 屆的選手 public_id 拿去 B 屆的路徑上操作」必須查不到,否則裁判權限
@@ -1241,12 +1274,6 @@ type Querier interface {
 	// IN (m.p1_player_id, m.p2_player_id) 對 NULL 是安全的:另一邊是 NULL 時,
 	// 只要有一邊相等結果就是 TRUE;都不等則是 NULL,不會被 WHERE 當成 TRUE。
 	RecalcFencerStats(ctx context.Context, fencerID int64) (RecalcFencerStatsRow, error)
-	// spent 的權威算式。service 每次寫入前拿它與 match_budgets.spent 核對,
-	// 對不上就整個動作失敗(ErrBudgetInconsistent)而不自動修正 ——
-	// 衍生資料對不上代表寫入路徑有 bug,繼續算下去只會把錯誤擴散到下一次餘額檢查。
-	// 這是 schemas/20 待確認 ② 要求的那條驗證。述詞與 handicap_selections_match_player_idx
-	// 的部分索引條件(WHERE NOT voided)同形,走得到那條索引。
-	RecalcMatchBudgetSpent(ctx context.Context, arg RecalcMatchBudgetSpentParams) (int64, error)
 	// session 異常:近期因重用偵測而撤銷的數量。已輪替的 token 再被使用 = token 被竊
 	// (schemas/02 增補 F),這個數字從 0 變正就是安全事件,不是效能指標。
 	RecentSessionReuse(ctx context.Context, windowHours int32) (int64, error)

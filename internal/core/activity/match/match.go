@@ -88,10 +88,15 @@ const (
 	ActionWithdraw     = "player.withdraw"
 )
 
-// auditTargetMatch / auditTargetPlayer 是 admin_audit_logs.target_type 的值。
+// AuditTargetMatch / AuditTargetPlayer 是 admin_audit_logs.target_type 的值。
+//
+// 導出是因為 adapter 必須填同樣的字串:RecordJudgeAction 由 service 帶進來,
+// 另外五個動作的稽核是 adapter 自己掛的。不導出的話那邊只能再抄一份字面值,
+// 而兩份字面值裡有一份會在某次改名時被忘記 —— 症狀是稽核查詢漏掉一半的紀錄,
+// 而且要等到有人翻舊帳時才會發現。
 const (
-	auditTargetMatch  = "activity.match"
-	auditTargetPlayer = "activity.tournament_player"
+	AuditTargetMatch  = "activity.match"
+	AuditTargetPlayer = "activity.tournament_player"
 )
 
 // ── 型別 ────────────────────────────────────────────────────────

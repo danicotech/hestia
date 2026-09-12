@@ -310,7 +310,7 @@ func (db *fakeDB) MarkReady(_ context.Context, _ fakeTx, w ReadyWrite) (*Match, 
 		return nil, ErrMatchNotFound
 	}
 	m.status, m.handicapOpen = StatusReady, true
-	db.audit(w.ActorUserID, ActionOpenHandicap, auditTargetMatch, m.id, w.Reason)
+	db.audit(w.ActorUserID, ActionOpenHandicap, AuditTargetMatch, m.id, w.Reason)
 	return db.view(m), nil
 }
 
@@ -320,7 +320,7 @@ func (db *fakeDB) MarkLive(_ context.Context, _ fakeTx, w LiveWrite) (*Match, er
 		return nil, ErrMatchNotFound
 	}
 	m.status, m.startedAt = StatusLive, db.now()
-	db.audit(w.ActorUserID, ActionStartMatch, auditTargetMatch, m.id, w.Reason)
+	db.audit(w.ActorUserID, ActionStartMatch, AuditTargetMatch, m.id, w.Reason)
 	return db.view(m), nil
 }
 
@@ -336,7 +336,7 @@ func (db *fakeDB) MarkFinished(_ context.Context, _ fakeTx, w FinishWrite) (*Mat
 	m.status, m.winnerID, m.resultKind = StatusDone, w.WinnerPlayerID, w.ResultKind
 	m.finishedAt = db.now()
 	db.log("MarkFinished(%s,winner=%d,kind=%s)", m.publicID, w.WinnerPlayerID, w.ResultKind)
-	db.audit(w.ActorUserID, ActionReportResult, auditTargetMatch, m.id, w.Reason)
+	db.audit(w.ActorUserID, ActionReportResult, AuditTargetMatch, m.id, w.Reason)
 	return db.view(m), nil
 }
 
@@ -346,7 +346,7 @@ func (db *fakeDB) SetStreamURL(_ context.Context, _ fakeTx, w StreamWrite) (*Mat
 		return nil, ErrMatchNotFound
 	}
 	m.streamURL = w.StreamURL
-	db.audit(w.ActorUserID, ActionSetStreamURL, auditTargetMatch, m.id, w.Reason)
+	db.audit(w.ActorUserID, ActionSetStreamURL, AuditTargetMatch, m.id, w.Reason)
 	return db.view(m), nil
 }
 
@@ -372,7 +372,7 @@ func (db *fakeDB) SetPlayerStatus(_ context.Context, _ fakeTx, w PlayerStatusWri
 	p.status = w.Status
 	db.log("SetPlayerStatus(%s,%s)", p.publicID, w.Status)
 	if w.Status == tournament.PlayerWithdrawn {
-		db.audit(w.ActorUserID, ActionWithdraw, auditTargetPlayer, p.id, w.Reason)
+		db.audit(w.ActorUserID, ActionWithdraw, AuditTargetPlayer, p.id, w.Reason)
 	}
 	return db.playerView(p), nil
 }

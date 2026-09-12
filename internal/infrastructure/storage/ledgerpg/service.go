@@ -64,8 +64,19 @@ func (s *Service) Apply(ctx context.Context, p ledger.ApplyParams) (*ledger.Appl
 // 冪等衝突用 savepoint 隔離:撞鍵只回滾 savepoint,不毒化呼叫端的整個 tx,
 // 重放讀取走同一條連線(caller tx),不會發生 Apply 曾經的連線池 hold-and-wait。
 // 注意:整體原子性由呼叫端的 Commit 決定 —— 呼叫端 rollback 時本次動錢一併消失。
-// 注意:savepoint rollback 不釋放已取得的 row lock —— 本函式失敗(如餘額不足)後,
-// caller tx 仍持有餘額列的鎖,請盡快結束 tx,不要拿著它長時間做別的事(QA 提醒)。
+// 注意:本函式失敗(如餘額不足)後,**餘額列的鎖會被釋放**。
+//
+// 這裡原本寫的是相反的(「savepoint rollback 不釋放已取得的 row lock」),
+// 2026-09-12 對真 Postgres 實測推翻:失敗後由另一條連線對同一列
+// `SELECT ... FOR UPDATE NOWAIT` 會成功;同一個測試的對照組(由外層 tx 直接鎖)
+// 則確實回 55P03,所以偵測手段本身有效。
+// 機制:PostgreSQL 的列鎖不是 heavyweight lock,而是寫在 tuple 的 xmax 上;
+// 子交易 abort 會把該 subxid 標成 aborted 並移出 proc array,別的 session
+// 就再也看不到那把鎖。行為釘在 bettingpg 的 TestApplyInTxContract 裡,變了會紅。
+//
+// **但「失敗後盡快結束 tx」這個建議仍然成立**,理由換成更硬的兩個:
+// 呼叫端此時仍持有它自己在 savepoint **外面**取得的鎖(例如 platform.users 那列),
+// 而且所有會拒絕這次請求的檢查本來就該在碰錢之前做完 —— 走到這裡就該收尾了。
 // 刻意放在具體 *Service 而非 Ledger interface:interface 保持可攜(未來 HTTP 版沒有 tx 可傳),
 // 同 repo 的活動層需要 tx 組合時依賴具體型別。
 func (s *Service) ApplyInTx(ctx context.Context, tx pgx.Tx, p ledger.ApplyParams) (*ledger.ApplyResult, error) {

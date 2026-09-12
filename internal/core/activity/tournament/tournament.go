@@ -189,6 +189,11 @@ type MatchSeat struct {
 //  2. 依 Seats 寫回 seed_no
 //  3. 依 Matches 建列,public_id 由實作產生(core 不碰 ULID 生成)
 //  4. 寫 admin_audit_logs,after 欄位**必須包含 Seed**
+//
+// 實作還必須在取得賽事列鎖**之後**重讀一次 phase,不是 drawing 就回 ErrWrongPhase。
+// 服務層檢查過的階段是「讀的那一刻」的:裁判在服務層讀完之後推進到 in_progress,
+// 這裡再蓋一張新的對戰表,已經發出去的 match_budgets 就會指向不存在的場次 ——
+// 而那時候選手已經在花 BP 了。
 type ReplaceDrawParams struct {
 	TournamentID int64
 	// Seed 是這次抽籤用的亂數種子(16 位小寫 hex)。

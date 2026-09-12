@@ -186,16 +186,6 @@ SET spent = sqlc.arg(spent),
     updated_at = now()
 WHERE match_id = sqlc.arg(match_id) AND player_id = sqlc.arg(player_id);
 
--- name: RecalcMatchBudgetSpent :one
--- spent 的權威算式。service 每次寫入前拿它與 match_budgets.spent 核對,
--- 對不上就整個動作失敗(ErrBudgetInconsistent)而不自動修正 ——
--- 衍生資料對不上代表寫入路徑有 bug,繼續算下去只會把錯誤擴散到下一次餘額檢查。
--- 這是 schemas/20 待確認 ② 要求的那條驗證。述詞與 handicap_selections_match_player_idx
--- 的部分索引條件(WHERE NOT voided)同形,走得到那條索引。
-SELECT COALESCE(SUM(cost), 0)::bigint AS spent
-FROM activity.handicap_selections
-WHERE match_id = sqlc.arg(match_id) AND player_id = sqlc.arg(player_id) AND NOT voided;
-
 -- ── 讓武選擇 ────────────────────────────────────────────────────
 
 -- name: ListHandicapSelections :many

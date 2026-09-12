@@ -389,6 +389,102 @@ func (q *Queries) GetFencerByGameID(ctx context.Context, gameID string) (Activit
 	return i, err
 }
 
+const getPlayerByID = `-- name: GetPlayerByID :one
+SELECT tp.id, tp.public_id, tp.tournament_id, tp.fencer_id, tp.user_id,
+       tp.display_name, tp.discord_name,
+       tp.rank_level, tp.ranked_at, tp.ranked_by,
+       tp.self_rated_level, tp.ladder_rank, tp.ladder_score,
+       tp.arts_note, tp.availability_note,
+       tp.seed_no, tp.status, tp.created_at, tp.updated_at,
+       f.game_id
+FROM activity.tournament_players tp
+JOIN activity.fencers f ON f.id = tp.fencer_id
+WHERE tp.tournament_id = $1::bigint
+  AND tp.id = $2::bigint
+FOR UPDATE OF tp
+`
+
+type GetPlayerByIDParams struct {
+	TournamentID int64
+	ID           int64
+}
+
+type GetPlayerByIDRow struct {
+	ID               int64
+	PublicID         string
+	TournamentID     int64
+	FencerID         int64
+	UserID           *int64
+	DisplayName      string
+	DiscordName      string
+	RankLevel        *int16
+	RankedAt         *time.Time
+	RankedBy         *int64
+	SelfRatedLevel   *int16
+	LadderRank       *string
+	LadderScore      *int32
+	ArtsNote         *string
+	AvailabilityNote *string
+	SeedNo           *int32
+	Status           string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	GameID           string
+}
+
+// 以**內部 id** 查選手,欄位與 GetPlayerByPublicID 逐字相同。
+//
+// 為什麼需要這一支:有兩處只拿得到內部 id,而不接受「猜」。
+//
+//  1. 改段位的稽核要記 before 值。改段位是異議流程的結果 —— 「原本評幾段、
+//     後來改成幾段」正是日後有人不服氣時唯一查得到的東西,記不出來等於沒記。
+//  2. 綁定平台帳號回 0 列時,要分得出「查無此選手」與「已綁別的帳號」。
+//     兩者對使用者的意思完全不同:前者是拿錯 id,後者要他先解綁。
+//
+// tournament_id 同樣進 WHERE(理由見 GetPlayerByPublicID):裁判權限的範圍是一屆,
+// 不是全部。
+//
+// **FOR UPDATE 不是可選的。** 兩個用途都是「讀了要寫」,而 SetPlayerRank 只握著
+// 賽事列的 FOR SHARE —— 兩位裁判可以並發評同一個人。不鎖的話,READ COMMITTED 下
+// 兩邊都讀到同一個舊值,兩筆稽核的 before 就都記成那個值,稽核鏈當場斷掉。
+//
+// 這個錯只在併發時發生:序列化跑完全正常,所有既有測試照樣綠。
+// 而它壞掉的時機,恰好是最需要稽核的時機(有人對段位吵起來、兩位裁判同時動手)。
+// 實測 -count=5 有四輪重現。
+//
+// 只鎖 tp:fencers 那側是 JOIN 進來拿 game_id 的,不需要鎖,
+// 而且鎖序(賽事 → tournament_players → fencers)也不允許在這裡先鎖 fencers。
+//
+// 欄位順序必須與 GetPlayerByPublicID 一致 —— adapter 靠 Go 的結構轉換共用同一份
+// 映射,不一致會編不過,而那正是我們要的:錯位在編譯期爆,不是執行期靜靜接錯欄位。
+func (q *Queries) GetPlayerByID(ctx context.Context, arg GetPlayerByIDParams) (GetPlayerByIDRow, error) {
+	row := q.db.QueryRow(ctx, getPlayerByID, arg.TournamentID, arg.ID)
+	var i GetPlayerByIDRow
+	err := row.Scan(
+		&i.ID,
+		&i.PublicID,
+		&i.TournamentID,
+		&i.FencerID,
+		&i.UserID,
+		&i.DisplayName,
+		&i.DiscordName,
+		&i.RankLevel,
+		&i.RankedAt,
+		&i.RankedBy,
+		&i.SelfRatedLevel,
+		&i.LadderRank,
+		&i.LadderScore,
+		&i.ArtsNote,
+		&i.AvailabilityNote,
+		&i.SeedNo,
+		&i.Status,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.GameID,
+	)
+	return i, err
+}
+
 const getPlayerByPublicID = `-- name: GetPlayerByPublicID :one
 
 SELECT tp.id, tp.public_id, tp.tournament_id, tp.fencer_id, tp.user_id,

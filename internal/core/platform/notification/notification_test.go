@@ -213,3 +213,119 @@ func TestRenderSanitizesUserControlledNames(t *testing.T) {
 		t.Logf("名稱被截斷或改寫:%q", name)
 	}
 }
+
+// ── 賽事公告 ─────────────────────────────────────────────────────────────
+
+// TestRenderHandicapLocked 釘住封盤公告的形狀。
+//
+// 這一則值得單獨測,因為它是整套系統對「參加者不混亂」的主要交付物:
+// 選手、對手、觀眾、裁判就是靠它在同一則訊息裡對齊同一份資訊。
+// 少了任何一項讓武、或漏掉指定內容,場上就會有人以為自己沒被限制。
+func TestRenderHandicapLocked(t *testing.T) {
+	t.Parallel()
+
+	payload := `{
+	  "tournament_name": "百業試鋒", "round_label": "八強", "slot": 2,
+	  "p1": {"display_name": "李璃", "rank_name": "開山"},
+	  "p2": {"display_name": "A冷", "rank_name": "無我"},
+	  "handicap": {
+	    "holder_display_name": "李璃", "constrained_display_name": "A冷",
+	    "budget": 24, "spent": 21,
+	    "items": [
+	      {"name": "禁用奇術", "cost": 12},
+	      {"name": "禁用迴避", "cost": 8},
+	      {"name": "指定對手開局時講一句話", "cost": 1, "target_note": "今日試鋒,請多指教"}
+	    ]
+	  }
+	}`
+
+	got, err := notification.Render(notification.Event{
+		ID: "ev-1", Topic: notification.TopicHandicapLocked, Payload: []byte(payload),
+	}, notification.Names{})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	if got.Title != "讓武封盤" {
+		t.Errorf("title = %q", got.Title)
+	}
+	if got.ChannelKey != "tournament_results" {
+		t.Errorf("channel = %q", got.ChannelKey)
+	}
+
+	joined := ""
+	for _, f := range got.Fields {
+		joined += f.K + "\x00" + f.V + "\n"
+	}
+
+	// slot 是 0-based,對外必須 +1 —— 場上喊的是「第三場」。
+	for _, want := range []string{
+		"八強 第 3 場",
+		"李璃(開山) vs A冷(無我)",
+		"A冷 本場須遵守",
+		"禁用奇術", "禁用迴避",
+		// 需要指定內容的項目,指定的內容本身必須出現在公告裡,
+		// 否則對手看得到限制卻不知道要講哪八個字。
+		"指定對手開局時講一句話:今日試鋒,請多指教",
+		"3 項 · 共 21 BP",
+		// 這句每一則封盤公告都要有:讓武最容易被誤解成放水,
+		// 而誤解的代價是受限方消極應戰,整場就沒有看頭了。
+		"讓武不是放水",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("公告裡缺少 %q\n實際:\n%s", want, strings.ReplaceAll(joined, "\x00", " / "))
+		}
+	}
+}
+
+// TestRenderTournamentMatchTopicsAreDiscordBound 確認五個賽事 topic 都真的
+// 會被閘道拉取,而且沒有與 in-process 消費者重疊。
+//
+// DiscordTopics 是從 renderers 推導的:少寫一個 renderer 的症狀不是編譯錯誤,
+// 是那則公告永遠不會被貼出來,而 outbox 的 pending 列永不刪除 —— 靜靜累積。
+func TestRenderTournamentMatchTopicsAreDiscordBound(t *testing.T) {
+	t.Parallel()
+
+	want := []string{
+		notification.TopicHandicapOpened,
+		notification.TopicHandicapLocked,
+		notification.TopicMatchStarted,
+		notification.TopicMatchFinished,
+		notification.TopicChampion,
+	}
+	for _, topic := range want {
+		if !notification.IsDiscordTopic(topic) {
+			t.Errorf("%s 不在 Discord 推播清單內", topic)
+		}
+	}
+	if err := notification.AssertNoOverlap(want); err == nil {
+		t.Error("AssertNoOverlap 應該要報這五個 topic 已由 Discord 處理")
+	}
+}
+
+// TestRenderHandicapOpenedSameRank 確認同段對決也照樣公告。
+//
+// 沒有讓武不代表不用告訴大家這場開盤了 —— 觀眾要知道可以下注了,
+// 而「本場無讓武」本身就是有用的資訊(否則會有人一直等公告)。
+func TestRenderHandicapOpenedSameRank(t *testing.T) {
+	t.Parallel()
+
+	payload := `{"tournament_name":"百業試鋒","round_label":"四強","slot":0,
+	  "p1":{"display_name":"墨無聲","rank_name":"無我"},
+	  "p2":{"display_name":"雲中鶴","rank_name":"無我"}}`
+
+	got, err := notification.Render(notification.Event{
+		ID: "ev-2", Topic: notification.TopicHandicapOpened, Payload: []byte(payload),
+	}, notification.Names{})
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	found := false
+	for _, f := range got.Fields {
+		if strings.Contains(f.V, "同段對決,本場無讓武") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("同段對決應明說本場無讓武,得到 %+v", got.Fields)
+	}
+}

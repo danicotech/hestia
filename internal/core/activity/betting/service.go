@@ -254,9 +254,15 @@ func (s *Service[TX]) PlaceBet(ctx context.Context, p PlaceBetParams) (*PlaceBet
 //	鎖使用者 → 冪等重放檢查 → 佔冪等鍵 → 讀賽事/場次 → 操守與封盤檢查
 //	→ 算賠率與賠付 → 建注單與腿 → **最後才動錢** → 補分錄 id → outbox → 存冪等結果
 //
-// 動錢排在最後有兩個理由:一是所有會拒絕這張單的檢查都該在碰錢之前做完;
-// 二是 ApplyInTx 的 savepoint rollback **不釋放已取得的餘額列鎖**,
-// 餘額不足回來之後 tx 還握著那列,這時候只該立刻收尾,不該再做別的事。
+// 動錢排在最後有兩個理由:
+//
+//  1. 所有會拒絕這張單的檢查都該在碰錢之前做完。
+//  2. 失敗之後 tx 仍握著它在 savepoint **外面**取得的鎖(platform.users 那列),
+//     這時候只該立刻收尾,不該再做別的事。
+//
+// 這裡原本寫的第二個理由是「savepoint rollback 不釋放餘額列鎖」,
+// 2026-09-12 實測推翻(bettingpg 的 TestApplyInTxContract 把行為釘住了)——
+// 餘額列的鎖確實會放。結論不變,但理由換成上面那個,因為它是真的。
 func (s *Service[TX]) placeBetInTx(ctx context.Context, tx TX, p PlaceBetParams) (*PlaceBetResult, error) {
 	key := placeKeyPrefix + p.IdempotencyKey
 	hash := placeRequestHash(p)

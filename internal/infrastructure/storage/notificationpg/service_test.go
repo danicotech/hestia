@@ -95,6 +95,63 @@ func payloadFor(t *testing.T, ctx context.Context, topic string, user int64) map
 		return map[string]any{"redemption_public_id": "01RED", "user_id": user,
 			"item_public_id": newItem(t, ctx, "手工"), "status": "fulfilled",
 			"handled_by": 424242, "refund_amount": 100}
+	// ── 賽事公告(activity/match)──────────────────────────────────
+	//
+	// 這五則的 payload 刻意**自己夠用**:顯示名與段位名在 match 組事件時
+	// 就放進去了,renderer 不查 DB。所以這裡也不需要先建選手列。
+	case notification.TopicHandicapOpened:
+		return map[string]any{
+			"tournament_name": "百業試鋒", "round_label": "八強", "slot": 2,
+			"p1": map[string]any{"display_name": "李璃", "rank_name": "開山"},
+			"p2": map[string]any{"display_name": "A冷", "rank_name": "無我"},
+			"handicap": map[string]any{
+				"holder_display_name": "李璃", "constrained_display_name": "A冷",
+				"budget": 24, "spent": 0, "remaining": 24,
+			},
+		}
+	case notification.TopicHandicapLocked:
+		return map[string]any{
+			"tournament_name": "百業試鋒", "round_label": "八強", "slot": 2,
+			"p1": map[string]any{"display_name": "李璃", "rank_name": "開山"},
+			"p2": map[string]any{"display_name": "A冷", "rank_name": "無我"},
+			"handicap": map[string]any{
+				"holder_display_name": "李璃", "constrained_display_name": "A冷",
+				"budget": 24, "spent": 22, "remaining": 2,
+				"items": []map[string]any{
+					{"name": "禁用奇術", "cost": 12},
+					{"name": "禁用迴避", "cost": 8},
+					{"name": "指定對手開局時講一句話", "cost": 1, "target_note": "今日試鋒,請多指教"},
+					{"name": "對手必須在開賽前落下一句狠話", "cost": 1},
+				},
+			},
+		}
+	case notification.TopicMatchStarted:
+		return map[string]any{
+			"tournament_name": "百業試鋒", "round_label": "八強", "slot": 2,
+			"p1":         map[string]any{"display_name": "李璃", "rank_name": "開山"},
+			"p2":         map[string]any{"display_name": "A冷", "rank_name": "無我"},
+			"stream_url": "https://example.invalid/live",
+		}
+	case notification.TopicMatchFinished:
+		return map[string]any{
+			"tournament_name": "百業試鋒", "round_label": "八強", "slot": 2,
+			"p1": map[string]any{"display_name": "李璃", "rank_name": "開山"},
+			"p2": map[string]any{"display_name": "A冷", "rank_name": "無我"},
+			"result": map[string]any{
+				"kind":              "normal",
+				"winner":            map[string]any{"display_name": "A冷", "rank_name": "無我"},
+				"loser":             map[string]any{"display_name": "李璃", "rank_name": "開山"},
+				"next_round_label":  "四強",
+				"settled_bet_count": 12,
+			},
+		}
+	case notification.TopicChampion:
+		return map[string]any{
+			"tournament_name": "百業試鋒",
+			"champion":        map[string]any{"display_name": "A冷", "rank_name": "無我"},
+			"runner_up":       map[string]any{"display_name": "燕歸人", "rank_name": "飛花"},
+			"total_rounds":    5,
+		}
 	default:
 		t.Fatalf("測試沒有替 %s 準備 payload —— 新增 topic 時要一起補", topic)
 		return nil

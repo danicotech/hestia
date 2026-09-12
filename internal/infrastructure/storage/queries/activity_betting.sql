@@ -128,7 +128,11 @@ SELECT
   --
   -- 取法與 config.sql 的 GetCurrentConfig 一致:同一個 key 不覆寫舊值,取生效時間最新的一筆。
   COALESCE((
-    SELECT substring(ec.value FROM '^-?[0-9]{1,18}$')
+    -- value 是 JSONB 不是 TEXT。substring(jsonb, unknown) 不存在,直接用會 42883,
+    -- 而每條下注路徑都先讀這裡 —— 整個下注功能會死在這一行。
+    -- 用 #>> '{}' 取裸值而不是 ::text:seed 的 '500' 是 JSON 數字,
+    -- 但裁判可能手打成 "500" JSON 字串,::text 會把引號一起帶出來而落回預設值。
+    SELECT substring(ec.value #>> '{}' FROM '^-?[0-9]{1,18}$')
     FROM platform.economy_configs ec
     WHERE ec.key = 'max_stake' AND ec.effective_at <= now()
     ORDER BY ec.effective_at DESC

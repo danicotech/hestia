@@ -434,8 +434,12 @@ type Repository[TX any] interface {
 // 三個性質決定了本套件的寫法:
 //  1. 原子性由呼叫端決定:我們 rollback,動錢一併消失。
 //  2. 失敗用 savepoint 隔離,不會毒化我們的 tx。
-//  3. **savepoint rollback 不釋放已取得的列鎖** —— 餘額不足回來之後,
-//     tx 仍持有那列的鎖,所以動錢一律排在流程最後,失敗就立刻收尾。
+//  3. 失敗後**餘額列的鎖會被釋放**(列鎖寫在 tuple 的 xmax,子交易 abort
+//     會讓那個 subxid 失效,別的 session 就看不到那把鎖了)。
+//
+// 第 3 點原本寫的是相反的,2026-09-12 對真 Postgres 實測推翻 ——
+// 行為釘在 bettingpg 的 TestApplyInTxContract。但**動錢排在流程最後這個寫法不變**:
+// 理由不需要靠那個(已被推翻的)機制,見 placeBetInTx 的註解。
 type Ledger[TX any] interface {
 	ApplyInTx(ctx context.Context, tx TX, p ledger.ApplyParams) (*ledger.ApplyResult, error)
 }

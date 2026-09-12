@@ -257,7 +257,7 @@ func (s *Service[TX]) LockHandicap(ctx context.Context, p LockHandicapParams) (*
 		if err := s.repo.RecordJudgeAction(ctx, tx, JudgeAction{
 			ActorUserID: p.ActorUserID,
 			Action:      ActionLockHandicap,
-			TargetType:  auditTargetMatch,
+			TargetType:  AuditTargetMatch,
 			TargetID:    locked.ID,
 			After:       after,
 			Reason:      p.Reason,

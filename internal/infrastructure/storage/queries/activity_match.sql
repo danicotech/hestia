@@ -179,6 +179,34 @@ LEFT JOIN activity.tournament_players p1 ON p1.id = m.p1_player_id
 LEFT JOIN activity.tournament_players p2 ON p2.id = m.p2_player_id
 WHERE m.public_id = sqlc.arg(match_public_id)::text;
 
+-- name: GetMatchForJudgeByID :one
+-- 以**內部 id** 無鎖重讀,欄位與 GetMatchForJudge 逐字相同。
+--
+-- 為什麼需要這一支:狀態轉移的參數只帶內部 id,而轉移影響 0 列時必須分得出
+-- 「查無此場次」與「狀態已經被別人改了」—— 兩者對裁判的意思完全不同。
+-- 沒有這支的話,adapter 得自己維護一份 tx 內的 id → public_id 對照表,
+-- 那是把 DB 查得到的事實搬進記憶體再維護一次(規則 9)。
+SELECT
+  m.id, m.public_id, m.tournament_id, m.round, m.slot,
+  m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
+  m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.p1_player_id,
+  p1.public_id    AS p1_public_id,
+  p1.fencer_id    AS p1_fencer_id,
+  p1.display_name AS p1_display_name,
+  p1.rank_level   AS p1_rank_level,
+  p1.status       AS p1_status,
+  m.p2_player_id,
+  p2.public_id    AS p2_public_id,
+  p2.fencer_id    AS p2_fencer_id,
+  p2.display_name AS p2_display_name,
+  p2.rank_level   AS p2_rank_level,
+  p2.status       AS p2_status
+FROM activity.matches m
+LEFT JOIN activity.tournament_players p1 ON p1.id = m.p1_player_id
+LEFT JOIN activity.tournament_players p2 ON p2.id = m.p2_player_id
+WHERE m.id = sqlc.arg(id)::bigint;
+
 -- name: LockUnfinishedMatchesOfPlayer :many
 -- 棄賽路徑:這位選手所有 status <> 'done' 的場次,依 (round, slot) 遞增。
 --

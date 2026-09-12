@@ -135,6 +135,96 @@ func (q *Queries) GetMatchForJudge(ctx context.Context, matchPublicID string) (G
 	return i, err
 }
 
+const getMatchForJudgeByID = `-- name: GetMatchForJudgeByID :one
+SELECT
+  m.id, m.public_id, m.tournament_id, m.round, m.slot,
+  m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
+  m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.p1_player_id,
+  p1.public_id    AS p1_public_id,
+  p1.fencer_id    AS p1_fencer_id,
+  p1.display_name AS p1_display_name,
+  p1.rank_level   AS p1_rank_level,
+  p1.status       AS p1_status,
+  m.p2_player_id,
+  p2.public_id    AS p2_public_id,
+  p2.fencer_id    AS p2_fencer_id,
+  p2.display_name AS p2_display_name,
+  p2.rank_level   AS p2_rank_level,
+  p2.status       AS p2_status
+FROM activity.matches m
+LEFT JOIN activity.tournament_players p1 ON p1.id = m.p1_player_id
+LEFT JOIN activity.tournament_players p2 ON p2.id = m.p2_player_id
+WHERE m.id = $1::bigint
+`
+
+type GetMatchForJudgeByIDRow struct {
+	ID               int64
+	PublicID         string
+	TournamentID     int64
+	Round            int32
+	Slot             int32
+	Status           string
+	ResultKind       string
+	HandicapOpen     bool
+	HandicapLockedAt *time.Time
+	StreamUrl        *string
+	StartedAt        *time.Time
+	FinishedAt       *time.Time
+	WinnerPlayerID   *int64
+	P1PlayerID       *int64
+	P1PublicID       *string
+	P1FencerID       *int64
+	P1DisplayName    *string
+	P1RankLevel      *int16
+	P1Status         *string
+	P2PlayerID       *int64
+	P2PublicID       *string
+	P2FencerID       *int64
+	P2DisplayName    *string
+	P2RankLevel      *int16
+	P2Status         *string
+}
+
+// 以**內部 id** 無鎖重讀,欄位與 GetMatchForJudge 逐字相同。
+//
+// 為什麼需要這一支:狀態轉移的參數只帶內部 id,而轉移影響 0 列時必須分得出
+// 「查無此場次」與「狀態已經被別人改了」—— 兩者對裁判的意思完全不同。
+// 沒有這支的話,adapter 得自己維護一份 tx 內的 id → public_id 對照表,
+// 那是把 DB 查得到的事實搬進記憶體再維護一次(規則 9)。
+func (q *Queries) GetMatchForJudgeByID(ctx context.Context, id int64) (GetMatchForJudgeByIDRow, error) {
+	row := q.db.QueryRow(ctx, getMatchForJudgeByID, id)
+	var i GetMatchForJudgeByIDRow
+	err := row.Scan(
+		&i.ID,
+		&i.PublicID,
+		&i.TournamentID,
+		&i.Round,
+		&i.Slot,
+		&i.Status,
+		&i.ResultKind,
+		&i.HandicapOpen,
+		&i.HandicapLockedAt,
+		&i.StreamUrl,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.WinnerPlayerID,
+		&i.P1PlayerID,
+		&i.P1PublicID,
+		&i.P1FencerID,
+		&i.P1DisplayName,
+		&i.P1RankLevel,
+		&i.P1Status,
+		&i.P2PlayerID,
+		&i.P2PublicID,
+		&i.P2FencerID,
+		&i.P2DisplayName,
+		&i.P2RankLevel,
+		&i.P2Status,
+	)
+	return i, err
+}
+
 const judgeTournamentByID = `-- name: JudgeTournamentByID :one
 
 SELECT t.id, t.public_id, t.slug, t.name, t.phase, t.config,

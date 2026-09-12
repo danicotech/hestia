@@ -55,6 +55,18 @@ const (
 	TopicShopPurchased     = "shop.purchased"
 	TopicMarketSold        = "market.sold"
 	TopicRedemptionHandled = "redemption.handled"
+
+	// 賽事活動的公告(activity/match)。字面值必須與 match 套件的常數一致 ——
+	// platform 不能 import activity(鐵則 1),所以兩邊各有一份字面值,
+	// 這是刻意付出的代價,由測試抓。
+	//
+	// 這五則不是錦上添花。使用者辦這場活動最怕的是「說明不夠清楚讓參加者混亂」,
+	// 而封盤那一則正是解方:選手、對手、觀眾、裁判在同一則訊息裡對齊同一份資訊。
+	TopicHandicapOpened = "match.handicap_opened"
+	TopicHandicapLocked = "match.handicap_locked"
+	TopicMatchStarted   = "match.started"
+	TopicMatchFinished  = "match.finished"
+	TopicChampion       = "tournament.champion"
 )
 
 // 保留給 in-process 消費者的 topic:它們要做的**不是**貼訊息。
@@ -82,6 +94,18 @@ var discordChannels = map[string]string{
 	TopicShopPurchased:     "shop",
 	TopicMarketSold:        "market",
 	TopicRedemptionHandled: "redemptions",
+
+	// 賽事的五種公告目前全部投到同一個用途。
+	//
+	// 只有 tournament_results 這一個賽事用途被 seed 進 channel_purposes,
+	// 而再拆一個(例如 tournament_matches)是 seed 變更,要先討論。
+	// 第一屆二十幾人的量級,一個頻道看得完;真的吵起來再拆,那時候也只是
+	// 改這張表的值加一筆 seed,元件與 renderer 一行都不用動。
+	TopicHandicapOpened: "tournament_results",
+	TopicHandicapLocked: "tournament_results",
+	TopicMatchStarted:   "tournament_results",
+	TopicMatchFinished:  "tournament_results",
+	TopicChampion:       "tournament_results",
 }
 
 // ReservedTopics 是保留給 in-process 消費者的 topic(排序後回傳,方便斷言)。
@@ -260,6 +284,12 @@ var renderers = map[string]renderer{
 	TopicShopPurchased:     {decode: decodeAs[shopPurchased]},
 	TopicMarketSold:        {decode: decodeAs[marketSold]},
 	TopicRedemptionHandled: {decode: decodeAs[redemptionHandled]},
+
+	TopicHandicapOpened: {decode: decodeAs[handicapOpened]},
+	TopicHandicapLocked: {decode: decodeAs[handicapLocked]},
+	TopicMatchStarted:   {decode: decodeAs[matchStarted]},
+	TopicMatchFinished:  {decode: decodeAs[matchFinished]},
+	TopicChampion:       {decode: decodeAs[tournamentChampion]},
 }
 
 // dailyClaimed ← dailypg。claim_date 刻意不宣告:公告貼的是「剛剛發生的事」,
@@ -450,4 +480,219 @@ func (p levelUp) render(n Names) (string, []Field) {
 		{K: "成員", V: userName(n, p.UserID)},
 		{K: "等級", V: fmt.Sprintf("Lv.%d → **Lv.%d**", p.FromLevel, p.ToLevel)},
 	}
+}
+
+// ── 賽事公告 ─────────────────────────────────────────────────────────────
+//
+// 這五個型別的欄位刻意與 activity/match 的 event payload 同名。platform 不能
+// import activity(鐵則 1),所以兩邊各有一份宣告 —— 這是那條界線的代價,
+// 由測試抓對齊。
+//
+// 它們的 refs() 全部回空:match 在組 payload 時就把顯示名與段位名放進去了,
+// renderer 不必再查 DB。這不是巧合,是那邊刻意的設計 —— 公告描述的是
+// 「封盤那一刻的樣子」,事後查名字會查到事後的名字。
+
+// matchSide 是場上一方的快照。
+type matchSide struct {
+	DisplayName string `json:"display_name"`
+	RankName    string `json:"rank_name"`
+}
+
+// label 是「李璃(開山)」。段位名缺漏時只給顯示名,不硬湊括號。
+func (s *matchSide) label() string {
+	if s == nil || s.DisplayName == "" {
+		return "待定"
+	}
+	if s.RankName == "" {
+		return s.DisplayName
+	}
+	return fmt.Sprintf("%s(%s)", s.DisplayName, s.RankName)
+}
+
+// matchHead 是四則場次公告共用的標頭欄位。
+type matchHead struct {
+	TournamentName string     `json:"tournament_name"`
+	RoundLabel     string     `json:"round_label"`
+	Slot           int        `json:"slot"`
+	StreamURL      string     `json:"stream_url,omitempty"`
+	P1             *matchSide `json:"p1,omitempty"`
+	P2             *matchSide `json:"p2,omitempty"`
+}
+
+// versus 是「首輪 第 3 場」與「李璃(開山) vs A冷(無我)」兩個欄位。
+// slot 是 0-based,對外一律 +1 —— 場上喊的是「第三場」不是「第二場」。
+func (h matchHead) versus() []Field {
+	return []Field{
+		{K: "場次", V: fmt.Sprintf("%s 第 %d 場", h.RoundLabel, h.Slot+1)},
+		{K: "對戰", V: fmt.Sprintf("%s vs %s", h.P1.label(), h.P2.label())},
+	}
+}
+
+// handicapInfo 是讓武的預算與清單。
+type handicapInfo struct {
+	HolderDisplayName      string             `json:"holder_display_name,omitempty"`
+	ConstrainedDisplayName string             `json:"constrained_display_name,omitempty"`
+	Budget                 int64              `json:"budget"`
+	Spent                  int64              `json:"spent"`
+	Remaining              int64              `json:"remaining"`
+	Items                  []handicapItemInfo `json:"items"`
+}
+
+type handicapItemInfo struct {
+	Name       string `json:"name"`
+	Cost       int64  `json:"cost"`
+	TargetNote string `json:"target_note,omitempty"`
+}
+
+// handicapOpened ← match.OpenHandicap。提醒低段位者「你有 N BP 還沒花」。
+//
+// 存在的理由很實際:BP 沒花完就作廢,而忘記花掉等於白白放棄整場的調平。
+type handicapOpened struct {
+	matchHead
+	Handicap *handicapInfo `json:"handicap,omitempty"`
+}
+
+func (p handicapOpened) refs() Refs { return Refs{} }
+
+func (p handicapOpened) render(_ Names) (string, []Field) {
+	fields := p.versus()
+	if p.Handicap == nil || p.Handicap.Budget <= 0 {
+		// 同段對決沒有讓武。照樣公告,因為觀眾也需要知道這場開盤了。
+		return "讓武開盤", append(fields, Field{K: "讓武", V: "同段對決,本場無讓武"})
+	}
+	return "讓武開盤", append(fields,
+		Field{K: "取得", V: fmt.Sprintf("%s **%d BP**", p.Handicap.HolderDisplayName, p.Handicap.Budget)},
+		Field{K: "提醒", V: "封盤前沒花掉的 BP 會作廢"},
+	)
+}
+
+// handicapLocked ← match.LockHandicap。**這是整組公告裡最重要的一則。**
+//
+// 封盤後雙方與觀眾第一次看到完整的讓武內容,而這正是「參加者不混亂」的解方:
+// 選手、對手、觀眾、裁判在同一則訊息裡對齊同一份資訊,爭議會少一大半。
+type handicapLocked struct {
+	matchHead
+	Handicap *handicapInfo `json:"handicap,omitempty"`
+}
+
+func (p handicapLocked) refs() Refs { return Refs{} }
+
+func (p handicapLocked) render(_ Names) (string, []Field) {
+	fields := p.versus()
+	if p.Handicap == nil || len(p.Handicap.Items) == 0 {
+		return "讓武封盤", append(fields, Field{K: "讓武", V: "本場無讓武,雙方照常規對戰"})
+	}
+
+	var b strings.Builder
+	for _, it := range p.Handicap.Items {
+		fmt.Fprintf(&b, "\n· %s", it.Name)
+		if it.TargetNote != "" {
+			fmt.Fprintf(&b, ":%s", it.TargetNote)
+		}
+		fmt.Fprintf(&b, "(%d BP)", it.Cost)
+	}
+	return "讓武封盤", append(fields,
+		Field{
+			K: fmt.Sprintf("%s 本場須遵守", p.Handicap.ConstrainedDisplayName),
+			V: strings.TrimPrefix(b.String(), "\n"),
+		},
+		Field{K: "合計", V: fmt.Sprintf("%d 項 · 共 %d BP", len(p.Handicap.Items), p.Handicap.Spent)},
+		// 這句每一則都要出現。讓武的核心觀念最容易被誤解成「放水」,
+		// 而誤解的代價是受限方消極應戰,整場比賽就沒有看頭了。
+		Field{K: "說明", V: "讓武不是放水 —— 受限方仍應以取勝為目的全力應戰"},
+	)
+}
+
+// matchStarted ← match.StartMatch。開打,下注關閉。
+type matchStarted struct {
+	matchHead
+}
+
+func (p matchStarted) refs() Refs { return Refs{} }
+
+func (p matchStarted) render(_ Names) (string, []Field) {
+	fields := append(p.versus(), Field{K: "下注", V: "已關閉"})
+	if p.StreamURL != "" {
+		fields = append(fields, Field{K: "觀戰", V: p.StreamURL})
+	}
+	return "開打", fields
+}
+
+// matchResult 是勝負的結果部分。
+type matchResult struct {
+	Kind           string     `json:"kind"`
+	Winner         *matchSide `json:"winner,omitempty"`
+	Loser          *matchSide `json:"loser,omitempty"`
+	NextRoundLabel string     `json:"next_round_label,omitempty"`
+	// SettledBetCount / VoidedBetCount 是**彙總**。
+	//
+	// 刻意不逐張注單公告:一場結算會產生每張注單各一則,發到頻道就是洗版,
+	// 而個人要知道的「我中了多少」在自己的注單列表裡看得到。
+	SettledBetCount int `json:"settled_bet_count,omitempty"`
+	VoidedBetCount  int `json:"voided_bet_count,omitempty"`
+}
+
+// matchFinished ← match.ReportResult / WithdrawPlayer。
+type matchFinished struct {
+	matchHead
+	Result *matchResult `json:"result,omitempty"`
+}
+
+func (p matchFinished) refs() Refs { return Refs{} }
+
+func (p matchFinished) render(_ Names) (string, []Field) {
+	fields := p.versus()
+	if p.Result == nil {
+		return "賽果", fields
+	}
+
+	title := "賽果"
+	win := p.Result.Winner.label()
+	if p.Result.Kind == "walkover" {
+		title = "不戰而勝"
+		fields = append(fields,
+			Field{K: "勝者", V: win},
+			// 賠率是按「真的打一場」算的,所以這種場次全額退 —— 講清楚,
+			// 不然下注的人只會看到餘額變動而不知道為什麼。
+			Field{K: "下注", V: "本場所有注單全額退款"},
+		)
+	} else {
+		fields = append(fields, Field{K: "勝者", V: win})
+		if p.Result.SettledBetCount > 0 {
+			fields = append(fields, Field{K: "派彩", V: fmt.Sprintf("%d 張注單已結算", p.Result.SettledBetCount)})
+		}
+	}
+	if p.Result.VoidedBetCount > 0 && p.Result.Kind != "walkover" {
+		fields = append(fields, Field{K: "退款", V: fmt.Sprintf("%d 張注單作廢退回", p.Result.VoidedBetCount)})
+	}
+	if p.Result.NextRoundLabel != "" {
+		fields = append(fields, Field{K: "晉級", V: fmt.Sprintf("%s 進入%s", win, p.Result.NextRoundLabel)})
+	}
+	return title, fields
+}
+
+// tournamentChampion ← match.ReportResult 判完決賽。
+type tournamentChampion struct {
+	TournamentName string     `json:"tournament_name"`
+	Champion       matchSide  `json:"champion"`
+	RunnerUp       *matchSide `json:"runner_up,omitempty"`
+	TotalRounds    int        `json:"total_rounds"`
+}
+
+func (p tournamentChampion) refs() Refs { return Refs{} }
+
+func (p tournamentChampion) render(_ Names) (string, []Field) {
+	fields := []Field{
+		{K: "賽事", V: p.TournamentName},
+		{K: "冠軍", V: p.Champion.label()},
+	}
+	if p.RunnerUp != nil {
+		fields = append(fields, Field{K: "亞軍", V: p.RunnerUp.label()})
+	}
+	if p.TotalRounds > 0 {
+		fields = append(fields, Field{K: "賽程", V: fmt.Sprintf("共 %d 輪", p.TotalRounds)})
+	}
+	return "冠軍出爐", append(fields,
+		Field{K: "", V: "段位定其差,BP 量其讓;鋒芒雖受束,勝負仍由場上分曉"},
+	)
 }
