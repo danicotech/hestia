@@ -59,9 +59,9 @@ const activitySessionFallbackTTL = 12 * time.Hour
 //
 // 只有兩個欄位,而且**都是對外識別字**:選手的內部 BIGINT id 不進 token
 // (鐵則 5 —— token 由客戶端持有,內部 id 進去就等於進了對外契約)。
-// 內部 id 由 handler 每次用 public_id 反查,選手被刪掉或換屆後舊 token 會在
-// 那一步自然失效。棄賽不在此列(只改 status,列還在)—— 要踢掉一張已經發出去的
-// token,裁判得用「重新產生通行碼」,細節在 internal/core/activity/session。
+// 內部 id 由 handler 每次用 public_id 反查,選手被刪掉、換屆、或狀態不是
+// active(棄賽、淘汰)之後,舊 token 都會在那一步失效。
+// 撤銷的兩條路見 internal/core/activity/session 套件註解的「撤銷」一節。
 type ActivityIdentity struct {
 	// TournamentSlug 是這個 session 屬於哪一屆。
 	//
@@ -97,6 +97,9 @@ type ActivitySessions interface {
 // ActivitySignup 是報名與選手身分的領域服務(*signup.Service 直接滿足)。
 type ActivitySignup interface {
 	Register(ctx context.Context, p signup.RegisterParams) (*signup.RegisterResult, error)
+	UpdateRegistration(
+		ctx context.Context, p signup.UpdateRegistrationParams,
+	) (*signup.UpdateRegistrationResult, error)
 	Login(ctx context.Context, p signup.LoginParams) (*tournament.Player, error)
 	RegeneratePasscode(ctx context.Context, p signup.RegenerateParams) (*signup.RegenerateResult, error)
 	BindPlatformAccount(ctx context.Context, p signup.BindAccountParams) (*tournament.Player, error)
@@ -234,15 +237,17 @@ func (h activitySignupHandler) Register(
 	// 只有 tournament_slug 在這裡擋:game_id 的必填與格式交給領域層,
 	// 那裡是它唯一的權威(errmap 已經把 ErrGameIDRequired 映射成 InvalidArgument)。
 	res, err := h.svc.Register(ctx, signup.RegisterParams{
-		TournamentSlug:   slug,
-		GameID:           req.Msg.GetGameId(),
-		DisplayName:      req.Msg.GetDisplayName(),
-		DiscordName:      req.Msg.GetDiscordName(),
-		SelfRatedRank:    rankFromProto(req.Msg.GetSelfRatedRank()),
-		LadderRank:       req.Msg.GetLadderRank(),
-		LadderScore:      req.Msg.GetLadderScore(),
-		ArtsNote:         req.Msg.GetArtsNote(),
-		AvailabilityNote: req.Msg.GetAvailabilityNote(),
+		TournamentSlug: slug,
+		GameID:         req.Msg.GetGameId(),
+		RegistrationFields: signup.RegistrationFields{
+			DisplayName:      req.Msg.GetDisplayName(),
+			DiscordName:      req.Msg.GetDiscordName(),
+			SelfRatedRank:    rankFromProto(req.Msg.GetSelfRatedRank()),
+			LadderRank:       req.Msg.GetLadderRank(),
+			LadderScore:      req.Msg.GetLadderScore(),
+			ArtsNote:         req.Msg.GetArtsNote(),
+			AvailabilityNote: req.Msg.GetAvailabilityNote(),
+		},
 	})
 	if err != nil {
 		return nil, toConnectError(err)
@@ -312,8 +317,8 @@ func (h activitySignupHandler) Login(
 // Logout 結束活動層 session。
 //
 // 只清 cookie:活動層 session 是無狀態簽章,沒有伺服器端的撤銷清單。
-// 少一張清單就少一個會忘記清的地方 —— 要從伺服器端踢掉某個人現有的 session,
-// 走裁判的「重新產生通行碼」(那會推進 passcode_issued_at,見 activity session)。
+// 少一張清單就少一個會忘記清的地方。要從伺服器端處理某個人現有的 session,
+// 見 internal/core/activity/session 套件註解的「撤銷」一節。
 //
 // 不帶 cookie 也回成功:登出的語意是「結束後不該有憑證」,而那在
 // 一開始就沒有憑證時已經成立。回錯只會讓前端要為一個無害的狀態寫分支。
@@ -355,6 +360,10 @@ func (h activitySignupHandler) GetMyPlayer(
 	res := &activityv1.GetMyPlayerResponse{
 		Player:     pbPlayer,
 		Tournament: tournamentToProto(view, count),
+		// 「我填了什麼」只有本人看得到:Player 帶的是對戰表要顯示的那幾欄,
+		// 論劍積分、常用武學、可出賽時段不在裡面。少了這一份,選手進站之後
+		// 就沒有任何地方看得到自己的報名內容(也就無從發現填錯了)。
+		Registration: myRegistrationToProto(signup.FieldsFromPlayer(player)),
 	}
 	current, err := h.reader.CurrentMatchOfPlayer(ctx, player.ID)
 	if err != nil {
@@ -364,6 +373,90 @@ func (h activitySignupHandler) GetMyPlayer(
 		res.CurrentMatch = matchToProto(*current)
 	}
 	return connect.NewResponse(res), nil
+}
+
+// UpdateRegistration 讓選手改自己的報名資料。
+//
+// # 對象一律來自 session
+//
+// 請求裡**沒有**「改誰」這個欄位,而且不要加:遊戲ID 是公開資訊(對戰表上就印著),
+// 誰都登得進誰的帳號 —— 由請求指定對象的話,這支就成了一支「改任何人的報名表」
+// 的 API。與 GetMyPlayer 走同一條身分路徑(requireActivityIdentity),
+// 讀得到什麼就改得到什麼,不多不少。
+//
+// # 階段由伺服器驗
+//
+// 只在報名期開放,權威在 signup.Service.UpdateRegistration(那裡讀一次,
+// SQL 的 WHERE 再擋一次)。這裡**不複製**那條判斷 —— 前端把按鈕變灰是體貼,
+// 不是防線。
+//
+// # registration 為 nil 也是一個合法的請求
+//
+// proto3 的訊息欄位沒有「有沒有送」與「送了一份空的」之分,而 GetXxx() 對 nil
+// 回零值,所以「整份清空」與「沒帶 registration」在這一層長得一模一樣。
+// 兩者都當成「把選填欄位全部清掉」處理 —— 清空選填欄位本來就合法
+// (display_name 會退回 game_id),不需要為此發明一個第三種語意。
+func (h activitySignupHandler) UpdateRegistration(
+	ctx context.Context, req *connect.Request[activityv1.UpdateRegistrationRequest],
+) (*connect.Response[activityv1.UpdateRegistrationResponse], error) {
+	if h.svc == nil || h.directory == nil {
+		return nil, unimplemented("SignupService.UpdateRegistration")
+	}
+	id, err := requireActivityIdentity(ctx, h.sessions, req.Header())
+	if err != nil {
+		return nil, err
+	}
+	res, err := h.svc.UpdateRegistration(ctx, signup.UpdateRegistrationParams{
+		TournamentSlug: id.TournamentSlug,
+		PlayerPublicID: id.PlayerPublicID,
+		Fields:         myRegistrationFromProto(req.Msg.GetRegistration()),
+	})
+	if err != nil {
+		return nil, toConnectError(err)
+	}
+	// 只有報名期改得動,而報名期的段位一律未評定 —— showRank 傳 false
+	// 不會少掉任何資訊,而且讓「段位只在公布後才出現」這條規則沒有例外
+	// (與 Register 同一個判斷)。
+	pb, err := playerWithAccountToProto(ctx, h.directory, res.Player, false)
+	if err != nil {
+		return nil, err
+	}
+	return connect.NewResponse(&activityv1.UpdateRegistrationResponse{
+		Player: pb,
+		// 回伺服器整理過的那一份,不是呼叫端送來的:去空白、留空補 game_id、
+		// 負分歸零的規則只有領域層一個權威位置。
+		Registration: myRegistrationToProto(res.Fields),
+	}), nil
+}
+
+// myRegistrationToProto / myRegistrationFromProto 是 MyRegistration 的唯一一組轉換。
+//
+// 讀寫共用同一個 proto 訊息,所以這裡也只有一組函式:「我填了什麼」與
+// 「我要改成什麼」是同一組欄位,分成兩份轉換遲早會有一邊漏掉新欄位。
+func myRegistrationToProto(f signup.RegistrationFields) *activityv1.MyRegistration {
+	return &activityv1.MyRegistration{
+		DisplayName:      f.DisplayName,
+		DiscordName:      f.DiscordName,
+		SelfRatedRank:    rankToProto(f.SelfRatedRank),
+		LadderRank:       f.LadderRank,
+		LadderScore:      f.LadderScore,
+		ArtsNote:         f.ArtsNote,
+		AvailabilityNote: f.AvailabilityNote,
+	}
+}
+
+// myRegistrationFromProto 對 nil 回零值的一份(見 UpdateRegistration 的說明)。
+// 入口層**不補任何預設值** —— 哪些欄位留空要怎麼處理,權威在領域層。
+func myRegistrationFromProto(m *activityv1.MyRegistration) signup.RegistrationFields {
+	return signup.RegistrationFields{
+		DisplayName:      m.GetDisplayName(),
+		DiscordName:      m.GetDiscordName(),
+		SelfRatedRank:    rankFromProto(m.GetSelfRatedRank()),
+		LadderRank:       m.GetLadderRank(),
+		LadderScore:      m.GetLadderScore(),
+		ArtsNote:         m.GetArtsNote(),
+		AvailabilityNote: m.GetAvailabilityNote(),
+	}
 }
 
 // BindPlatformAccount 把活動層身分接到平台帳號(領獎前必做)。

@@ -197,8 +197,15 @@ WHERE provider = 'local' AND provider_user_id = sqlc.arg(login_name);
 -- 授予全域角色(community_id IS NULL)。source='manual':之後同步 Discord
 -- 身分組時只撤 provider_sync,手動授予不受影響(migration 00004 的設計)。
 -- ON CONFLICT DO NOTHING 對齊 user_roles_uniq,重跑不炸。
+--
+-- **`community_id IS NULL` 不是多餘的**:migration 00025 拿掉了 roles.key 的
+-- 全域唯一約束(改成 `UNIQUE (COALESCE(community_id, 0), key)`),因為社群
+-- 可以複製一份內建角色成自己的。少了這個條件,只要有任何社群建了一個也叫
+-- 'judge' 的角色,這句就會一次插入兩列,而且**兩列的 community_id 都是 NULL**
+-- —— 把一個社群範圍的角色授成了全域。呼叫端應該檢查回傳列數恰好是 1。
 INSERT INTO platform.user_roles (user_id, role_id, community_id, source)
 SELECT sqlc.arg(user_id), r.id, NULL, 'manual'
 FROM platform.roles r
 WHERE r.key = sqlc.arg(role_key)
+  AND r.community_id IS NULL
 ON CONFLICT (user_id, role_id, COALESCE(community_id, 0)) DO NOTHING;

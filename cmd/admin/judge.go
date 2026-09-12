@@ -150,10 +150,19 @@ func createJudgeAccount(ctx context.Context, pool *pgxpool.Pool, loginName, disp
 	if err != nil {
 		return "", fmt.Errorf("授予 %s 角色: %w", judgeRoleKey, err)
 	}
-	// 0 列 = roles 裡沒有 judge(migration 00030 沒跑)。這時候繼續下去會建出
-	// 一個登得進去卻什麼都不能做的帳號,而症狀出現在幾天後的賽事現場。
-	if n == 0 {
-		return "", fmt.Errorf("找不到 %s 角色,請先跑 go run ./cmd/migrate", judgeRoleKey)
+	// 恰好 1 列,不是「至少 1 列」。
+	//
+	// 0 列 = roles 裡沒有內建的 judge(migration 00030 沒跑)。這時候繼續下去
+	// 會建出一個登得進去卻什麼都不能做的帳號,而症狀出現在幾天後的賽事現場。
+	//
+	// 超過 1 列 = 查詢選到了不只一個角色。那代表 GrantRoleByKey 的
+	// `community_id IS NULL` 失效了(roles.key 自 migration 00025 起只在
+	// 社群範圍內唯一)。授出去的東西已經不是我們以為的那一個,寧可失敗。
+	if n != 1 {
+		if n == 0 {
+			return "", fmt.Errorf("找不到內建的 %s 角色,請先跑 go run ./cmd/migrate", judgeRoleKey)
+		}
+		return "", fmt.Errorf("授予 %s 角色影響了 %d 列,預期 1 列", judgeRoleKey, n)
 	}
 
 	if err := tx.Commit(ctx); err != nil {

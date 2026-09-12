@@ -23,14 +23,22 @@
 // # 無狀態,但不是不可撤銷
 //
 // session 不落任何儲存:沒有 session 表就沒有清理 job、沒有重啟遺失。
-// 撤銷靠的是 claims 裡的 pat 與 tournament_players.passcode_issued_at 對帳
-// (見 Service.Verify)—— 裁判按下「重新產生通行碼」的那一刻,這位選手
-// **已經發出去的 session 全部作廢**,不需要一張會被忘記清的撤銷清單。
+// # 撤銷:兩條路,只有一條是隔離手段
 //
-// 登入不再用通行碼之後,那個按鈕的意義就只剩這一件事:它是把一個人
-// 從線上踢下來的唯一手段。另一半是 signup.Login 的狀態檢查(只有 active
-// 登得進來)—— 棄賽擋住之後的登入,換發處理現在還活著的 session,
-// 兩個都做才算真的把一個人隔離。
+// **這一段是這件事的唯一權威。** 其他地方只指到這裡,不要再寫一份 ——
+// 這些說法曾經散在六個檔案裡並且彼此矛盾。
+//
+//	狀態  status 不是 active(棄賽、淘汰)。Repo.PasscodeIssuedAt 只回
+//	      active 的列,所以查無 → ErrPlayerGone,**現在還活著的 session
+//	      當場失效**;signup.Login 同時擋住之後的登入。
+//	      這是把一個人擋在外面的**唯一**手段,而且棄賽單獨就夠。
+//
+//	換發  裁判「重新產生通行碼」會推進 passcode_issued_at,claims 裡的 pat
+//	      對不上,既有 session 全部作廢。但登入只要遊戲ID —— 對方可以
+//	      立刻再進來。所以它是「把人踢下線」,**不是**「把人擋在外面」。
+//
+// 兩條都不需要伺服器端的撤銷清單:沒有清單就沒有清理 job,也沒有會被
+// 忘記清的地方。
 package session
 
 import (
@@ -69,13 +77,7 @@ const TTL = 12 * time.Hour
 // 內部 id 由呼叫端每次用 public_id 反查 —— 選手被刪掉或換屆之後,舊 token
 // 會在那一步自然失效。
 //
-// **棄賽會立刻失效**:登入已經不需要任何秘密,所以狀態是唯一能把人擋在
-// 外面的東西 —— PlayerPasscodeIssuedAt 只回 status='active' 的列,非參賽中
-// 的人在這裡就會被折成 ErrPlayerGone。裁判按下棄賽的那一刻就斷線,不必
-// 再多按一次換發通行碼。
-//
-// 已淘汰的人也一起被登出,那是這個取捨的一部分:session 代表的是「以參賽者
-// 身分動作」的權利,而對戰表與戰績本來就公開,不需要 session 才看得到。
+// 非參賽中的人(棄賽、淘汰)也會在那一步失效,見套件註解的「撤銷」一節。
 //
 // 這個型別與 transport.ActivityIdentity 長得一樣但刻意各自宣告:
 // core 不 import transport(那是反向依賴),而活動層遲早搬去 themis。
@@ -123,8 +125,8 @@ type claims struct {
 var (
 	// ErrPasscodeRotated 是這張 session 簽發之後,通行碼被重新產生過。
 	ErrPasscodeRotated = fmt.Errorf("通行碼已重新產生,舊 session 失效: %w", identity.ErrInvalidToken)
-	// ErrPlayerGone 是 token 裡的選手在這一屆已經查不到(被刪、換屆、slug 不存在)。
-	// **棄賽不算**:那只改 status,列還在,見 Identity 的註解。
+	// ErrPlayerGone 是 token 裡的選手在這一屆已經拿不到(被刪、換屆、slug 不存在,
+	// 以及 status 不是 active)。棄賽與淘汰**算在此列** —— 見套件註解的「撤銷」一節。
 	ErrPlayerGone = fmt.Errorf("選手不在這一屆: %w", identity.ErrInvalidToken)
 	// ErrInvalidIdentity 是簽發時給了不完整的身分。
 	//

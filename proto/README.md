@@ -18,7 +18,7 @@ proto/hestia/platform/v1/
 hestia/activity/v1/(活動層 ——《百業試鋒》賽事系統,schemas/20、21、26):
   common.proto          共用列舉與檢視型別(Rank / TournamentPhase / MatchStatus / HandicapCategory
                         / Tournament / Player / Match / BracketRound / HandicapItem / BpBudget)
-  signup.proto          SignupService      報名、通行碼登入、綁定平台帳號
+  signup.proto          SignupService      報名、遊戲ID 登入、查看與修改報名資料、綁定平台帳號
   tournament.proto      TournamentService  賽事、段位、選手、對戰表、場次(匿名可讀)
   handicap.proto        HandicapService    讓武項目、BP 預算、選購與退選、封盤後公開
   betting.proto         BettingService     投票驅動賠率、下注(單場與串關)、我的注單

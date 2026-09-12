@@ -1343,6 +1343,37 @@ func (q *Queries) SwapPlayersInMatches(ctx context.Context, arg SwapPlayersInMat
 	return result.RowsAffected(), nil
 }
 
+const touchFencerDiscordName = `-- name: TouchFencerDiscordName :execrows
+UPDATE activity.fencers
+SET discord_name = COALESCE(NULLIF($1::text, ''), discord_name),
+    updated_at = now()
+WHERE id = $2::bigint
+`
+
+type TouchFencerDiscordNameParams struct {
+	DiscordName string
+	FencerID    int64
+}
+
+// 修改報名表的第 2 步,**跑在 UpdatePlayerRegistration 之後**(鎖序
+// tournament_players → fencers)。
+//
+// fencers.discord_name 是「最近一次報名填的」跨屆聯絡方式(schemas/26),
+// 報名時由 BumpFencerOnRegistration 寫入。改報名表時不同步的話,選手把打錯的
+// Discord 名稱改對了,裁判下一屆照樣聯絡不到人。
+//
+// **空字串不覆寫**(與 BumpFencerOnRegistration 逐字相同的 COALESCE/NULLIF):
+// 本屆清空只是「本屆不想公開」,不該把往屆留下的聯絡方式一起洗掉。
+// 這一支與 BumpFencerOnRegistration 的差別只有一個 —— 它**不動**
+// tournaments_played:改報名表不是又參加了一屆。
+func (q *Queries) TouchFencerDiscordName(ctx context.Context, arg TouchFencerDiscordNameParams) (int64, error) {
+	result, err := q.db.Exec(ctx, touchFencerDiscordName, arg.DiscordName, arg.FencerID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const touchFencerLastRank = `-- name: TouchFencerLastRank :execrows
 UPDATE activity.fencers f
 SET last_rank_level = $1::smallint,
@@ -1406,6 +1437,134 @@ func (q *Queries) UpdatePlayerPasscode(ctx context.Context, arg UpdatePlayerPass
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const updatePlayerRegistration = `-- name: UpdatePlayerRegistration :one
+WITH upd AS (
+  UPDATE activity.tournament_players
+  SET display_name = $1::text,
+      discord_name = $2::text,
+      self_rated_level = NULLIF($3::smallint, 0),
+      ladder_rank = NULLIF($4::text, ''),
+      ladder_score = NULLIF($5::int, 0),
+      arts_note = NULLIF($6::text, ''),
+      availability_note = NULLIF($7::text, ''),
+      updated_at = now()
+  WHERE id = $8::bigint
+    AND tournament_id = $9::bigint
+    AND EXISTS (
+      SELECT 1 FROM activity.tournaments t
+      WHERE t.id = $9::bigint
+        AND t.phase = $10::text
+    )
+  RETURNING id, public_id, tournament_id, fencer_id, user_id,
+            display_name, discord_name,
+            rank_level, ranked_at, ranked_by,
+            self_rated_level, ladder_rank, ladder_score,
+            arts_note, availability_note,
+            seed_no, status, created_at, updated_at
+)
+SELECT upd.id, upd.public_id, upd.tournament_id, upd.fencer_id, upd.user_id, upd.display_name, upd.discord_name, upd.rank_level, upd.ranked_at, upd.ranked_by, upd.self_rated_level, upd.ladder_rank, upd.ladder_score, upd.arts_note, upd.availability_note, upd.seed_no, upd.status, upd.created_at, upd.updated_at, f.game_id
+FROM upd
+JOIN activity.fencers f ON f.id = upd.fencer_id
+`
+
+type UpdatePlayerRegistrationParams struct {
+	DisplayName      string
+	DiscordName      string
+	SelfRatedLevel   int16
+	LadderRank       string
+	LadderScore      int32
+	ArtsNote         string
+	AvailabilityNote string
+	PlayerID         int64
+	TournamentID     int64
+	RequirePhase     string
+}
+
+type UpdatePlayerRegistrationRow struct {
+	ID               int64
+	PublicID         string
+	TournamentID     int64
+	FencerID         int64
+	UserID           *int64
+	DisplayName      string
+	DiscordName      string
+	RankLevel        *int16
+	RankedAt         *time.Time
+	RankedBy         *int64
+	SelfRatedLevel   *int16
+	LadderRank       *string
+	LadderScore      *int32
+	ArtsNote         *string
+	AvailabilityNote *string
+	SeedNo           *int32
+	Status           string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	GameID           string
+}
+
+// 選手在報名期內改自己那一列(SignupService.UpdateRegistration)。
+//
+// 與 InsertTournamentPlayer 對稱,兩道守門各司其職:
+//   - EXISTS (... WHERE phase = @require_phase) —— 階段條件進 WHERE
+//     (port 明文要求)。報名期一過這份資料就是評段的依據,改不得。
+//     配合鎖序第 1 步的 FOR SHARE,這個條件在整個 tx 期間不會被抽換。
+//   - tournament_id 進 WHERE —— 舊屆的 session 改不到新屆的列。
+//
+// 影響 0 列有兩種成因(階段不對 / 查無此選手),adapter 用取鎖時讀到的
+// phase 分辨,不猜。
+//
+// **改得到的只有選手自己填的那七欄。** game_id 不在這裡(它在 fencers,而且
+// 改它等於換一個人),passcode_hash / rank_level / seed_no / status 也不在 ——
+// 那些是身分與裁判的處置,不是報名表的內容。SQL 沒寫到的欄位就是改不到的欄位。
+//
+// 空字串一律 NULLIF 成 NULL,與 InsertTournamentPlayer 同一條規則:
+// 這幾欄是「有沒有填」的語意,空字串與 NULL 兩種表示法並存的話,
+// 每個讀取端都要各判一次。所以**清空一個選填欄位是合法的**,結果是 NULL。
+// ladder_score 同理(0 分與沒填在評段參考上是同一件事)。
+//
+// 回傳形狀與 GetPlayerByPublicID 一致(CTE 再接 fencers 拿 game_id):
+// 呼叫端要的是「更新後的 Player」,而 Player 含 game_id。分成 update + 再 select
+// 兩次的話,中間那個縫隙剛好是別人也在改同一列的時候。
+func (q *Queries) UpdatePlayerRegistration(ctx context.Context, arg UpdatePlayerRegistrationParams) (UpdatePlayerRegistrationRow, error) {
+	row := q.db.QueryRow(ctx, updatePlayerRegistration,
+		arg.DisplayName,
+		arg.DiscordName,
+		arg.SelfRatedLevel,
+		arg.LadderRank,
+		arg.LadderScore,
+		arg.ArtsNote,
+		arg.AvailabilityNote,
+		arg.PlayerID,
+		arg.TournamentID,
+		arg.RequirePhase,
+	)
+	var i UpdatePlayerRegistrationRow
+	err := row.Scan(
+		&i.ID,
+		&i.PublicID,
+		&i.TournamentID,
+		&i.FencerID,
+		&i.UserID,
+		&i.DisplayName,
+		&i.DiscordName,
+		&i.RankLevel,
+		&i.RankedAt,
+		&i.RankedBy,
+		&i.SelfRatedLevel,
+		&i.LadderRank,
+		&i.LadderScore,
+		&i.ArtsNote,
+		&i.AvailabilityNote,
+		&i.SeedNo,
+		&i.Status,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.GameID,
+	)
+	return i, err
 }
 
 const updateTournamentPhase = `-- name: UpdateTournamentPhase :one

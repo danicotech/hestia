@@ -555,6 +555,12 @@ type Querier interface {
 	// 授予全域角色(community_id IS NULL)。source='manual':之後同步 Discord
 	// 身分組時只撤 provider_sync,手動授予不受影響(migration 00004 的設計)。
 	// ON CONFLICT DO NOTHING 對齊 user_roles_uniq,重跑不炸。
+	//
+	// **`community_id IS NULL` 不是多餘的**:migration 00025 拿掉了 roles.key 的
+	// 全域唯一約束(改成 `UNIQUE (COALESCE(community_id, 0), key)`),因為社群
+	// 可以複製一份內建角色成自己的。少了這個條件,只要有任何社群建了一個也叫
+	// 'judge' 的角色,這句就會一次插入兩列,而且**兩列的 community_id 都是 NULL**
+	// —— 把一個社群範圍的角色授成了全域。呼叫端應該檢查回傳列數恰好是 1。
 	GrantRoleByKey(ctx context.Context, arg GrantRoleByKeyParams) (int64, error)
 	// source='level_reward':與 manual / provider_sync 分開,身分組同步撤銷時
 	// 不會誤刪里程碑發出去的角色。
@@ -1641,6 +1647,18 @@ type Querier interface {
 	// winner_player_id 一併換是為了不留下例外:drawing 階段不該有勝者,
 	// 但「這欄有值時會怎樣」不該取決於呼叫端記不記得這件事。
 	SwapPlayersInMatches(ctx context.Context, arg SwapPlayersInMatchesParams) (int64, error)
+	// 修改報名表的第 2 步,**跑在 UpdatePlayerRegistration 之後**(鎖序
+	// tournament_players → fencers)。
+	//
+	// fencers.discord_name 是「最近一次報名填的」跨屆聯絡方式(schemas/26),
+	// 報名時由 BumpFencerOnRegistration 寫入。改報名表時不同步的話,選手把打錯的
+	// Discord 名稱改對了,裁判下一屆照樣聯絡不到人。
+	//
+	// **空字串不覆寫**(與 BumpFencerOnRegistration 逐字相同的 COALESCE/NULLIF):
+	// 本屆清空只是「本屆不想公開」,不該把往屆留下的聯絡方式一起洗掉。
+	// 這一支與 BumpFencerOnRegistration 的差別只有一個 —— 它**不動**
+	// tournaments_played:改報名表不是又參加了一屆。
+	TouchFencerDiscordName(ctx context.Context, arg TouchFencerDiscordNameParams) (int64, error)
 	// 評段後回寫跨屆快照(fencers.last_rank_level 是衍生資料的增量更新路徑)。
 	// **跑在 SetPlayerRank 之後、同一個 tx**(鎖序 tournament_players → fencers)。
 	// FROM tournament_players 只是用來找 fencer_id,不對它取列鎖。
@@ -1711,6 +1729,29 @@ type Querier interface {
 	// 呼叫端必須另外呼叫 InsertAdminAudit(同一個 tx),而且
 	// **明碼與雜湊都絕不可進稽核紀錄**。
 	UpdatePlayerPasscode(ctx context.Context, arg UpdatePlayerPasscodeParams) (int64, error)
+	// 選手在報名期內改自己那一列(SignupService.UpdateRegistration)。
+	//
+	// 與 InsertTournamentPlayer 對稱,兩道守門各司其職:
+	//   *  EXISTS (... WHERE phase = @require_phase) —— 階段條件進 WHERE
+	//      (port 明文要求)。報名期一過這份資料就是評段的依據,改不得。
+	//      配合鎖序第 1 步的 FOR SHARE,這個條件在整個 tx 期間不會被抽換。
+	//   *  tournament_id 進 WHERE —— 舊屆的 session 改不到新屆的列。
+	// 影響 0 列有兩種成因(階段不對 / 查無此選手),adapter 用取鎖時讀到的
+	// phase 分辨,不猜。
+	//
+	// **改得到的只有選手自己填的那七欄。** game_id 不在這裡(它在 fencers,而且
+	// 改它等於換一個人),passcode_hash / rank_level / seed_no / status 也不在 ——
+	// 那些是身分與裁判的處置,不是報名表的內容。SQL 沒寫到的欄位就是改不到的欄位。
+	//
+	// 空字串一律 NULLIF 成 NULL,與 InsertTournamentPlayer 同一條規則:
+	// 這幾欄是「有沒有填」的語意,空字串與 NULL 兩種表示法並存的話,
+	// 每個讀取端都要各判一次。所以**清空一個選填欄位是合法的**,結果是 NULL。
+	// ladder_score 同理(0 分與沒填在評段參考上是同一件事)。
+	//
+	// 回傳形狀與 GetPlayerByPublicID 一致(CTE 再接 fencers 拿 game_id):
+	// 呼叫端要的是「更新後的 Player」,而 Player 含 game_id。分成 update + 再 select
+	// 兩次的話,中間那個縫隙剛好是別人也在改同一列的時候。
+	UpdatePlayerRegistration(ctx context.Context, arg UpdatePlayerRegistrationParams) (UpdatePlayerRegistrationRow, error)
 	// 呼叫前必須已 LockRedemptionForHandle 且確認 status='pending'。
 	UpdateRedemptionStatus(ctx context.Context, arg UpdateRedemptionStatusParams) (PlatformRedemption, error)
 	// 樂觀鎖:WHERE phase = @from_phase。動不到列 = 有人搶先改了,adapter 回

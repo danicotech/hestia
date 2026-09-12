@@ -179,6 +179,49 @@ type Registration struct {
 	PreviousRank bp.Rank
 }
 
+// SaveRegistrationParams 是選手在報名期內改自己那一列。
+//
+// 與 CreateRegistrationParams 的分工:那支負責「建一個人」(查/建 fencer、
+// 產生 public_id、產生通行碼、把參賽次數 +1),這支只負責「換掉那幾欄的內容」。
+// 所以這裡**沒有** GameID 也沒有 PasscodeHash —— 改遊戲ID 等於換一個人,
+// 而換通行碼是裁判把人踢下線的槓桿,兩件事都不該從修改報名表這條路發生。
+//
+// 實作必須在**單一 transaction** 內做完,且照既有鎖序:
+//
+//  1. 鎖賽事列(FOR SHARE)。
+//  2. 更新 activity.tournament_players,**RequirePhase 進 WHERE**
+//     (理由同 CreateRegistrationParams:service 讀階段與寫入之間有時間差)。
+//     影響 0 列時要分得出「階段不對」與「查無此選手」—— 前者回
+//     tournament.ErrWrongPhase,後者回 tournament.ErrPlayerNotFound。
+//     握著 FOR SHARE 時讀到的階段就是整個 tx 期間的真值,足以分辨。
+//  3. 同步 activity.fencers.discord_name(見 FencerID)。
+//
+// 空字串的語意是「清掉這一欄」,所以 tournament_players 那側要照 NULLIF 寫;
+// fencers 那側**相反**,見 FencerID。
+type SaveRegistrationParams struct {
+	TournamentID int64
+	PlayerID     int64
+	// FencerID 是要同步 discord_name 的跨屆檔案。
+	//
+	// 為什麼只同步 discord_name:fencers 與 tournament_players 之間只有這一欄
+	// 是同一份資料的兩個副本(schemas/26 —— fencers.discord_name 是「最近一次
+	// 報名填的」)。display_name / ladder_rank / arts_note 那些是本屆快照,
+	// fencers 上根本沒有對應欄位,沒有東西要同步。
+	//
+	// 為什麼要同步而不是放著:那一份是裁判跨屆聯絡選手的最後手段。選手在報名期
+	// 把打錯的 Discord 名稱改對,結果 fencers 上還留著錯的,等於改了個寂寞 ——
+	// 而報名當初就是寫進去的(BumpFencerOnRegistration),兩條路徑對同一欄
+	// 給出不同結果是最難查的那種不一致。
+	//
+	// **但空字串不覆寫**(與 BumpFencerOnRegistration 同一句 NULLIF/COALESCE):
+	// 本屆清空只是「本屆不想公開」,不該把往屆留下的聯絡方式一起洗掉。
+	// 真要清乾淨,那是裁判的事(而且會留稽核)。
+	FencerID int64
+	// RequirePhase 必須進 WHERE,不能只在 service 檢查。
+	RequirePhase tournament.Phase
+	Fields       RegistrationFields
+}
+
 // UpdatePasscodeParams 是重新產生通行碼。
 //
 // **這支現在真正的用途是「把一位選手現有的 session 全部踢掉」。**
@@ -233,6 +276,10 @@ type Repo interface {
 
 	// CreateRegistration 寫入一次報名,見 CreateRegistrationParams。
 	CreateRegistration(ctx context.Context, p CreateRegistrationParams) (Registration, error)
+
+	// SaveRegistration 改寫選手自己填的那幾欄,回傳更新後的選手,
+	// 見 SaveRegistrationParams。
+	SaveRegistration(ctx context.Context, p SaveRegistrationParams) (tournament.Player, error)
 
 	// PlayerByGameID 依遊戲ID 取本屆的選手(登入用)。
 	//

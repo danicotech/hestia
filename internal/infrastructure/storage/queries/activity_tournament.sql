@@ -295,6 +295,74 @@ RETURNING id, public_id, game_id, user_id, discord_name,
           last_rank_level, last_ranked_at, tournaments_played, wins, losses,
           created_at, updated_at;
 
+-- name: UpdatePlayerRegistration :one
+-- 選手在報名期內改自己那一列(SignupService.UpdateRegistration)。
+--
+-- 與 InsertTournamentPlayer 對稱,兩道守門各司其職:
+--   *  EXISTS (... WHERE phase = @require_phase) —— 階段條件進 WHERE
+--      (port 明文要求)。報名期一過這份資料就是評段的依據,改不得。
+--      配合鎖序第 1 步的 FOR SHARE,這個條件在整個 tx 期間不會被抽換。
+--   *  tournament_id 進 WHERE —— 舊屆的 session 改不到新屆的列。
+-- 影響 0 列有兩種成因(階段不對 / 查無此選手),adapter 用取鎖時讀到的
+-- phase 分辨,不猜。
+--
+-- **改得到的只有選手自己填的那七欄。** game_id 不在這裡(它在 fencers,而且
+-- 改它等於換一個人),passcode_hash / rank_level / seed_no / status 也不在 ——
+-- 那些是身分與裁判的處置,不是報名表的內容。SQL 沒寫到的欄位就是改不到的欄位。
+--
+-- 空字串一律 NULLIF 成 NULL,與 InsertTournamentPlayer 同一條規則:
+-- 這幾欄是「有沒有填」的語意,空字串與 NULL 兩種表示法並存的話,
+-- 每個讀取端都要各判一次。所以**清空一個選填欄位是合法的**,結果是 NULL。
+-- ladder_score 同理(0 分與沒填在評段參考上是同一件事)。
+--
+-- 回傳形狀與 GetPlayerByPublicID 一致(CTE 再接 fencers 拿 game_id):
+-- 呼叫端要的是「更新後的 Player」,而 Player 含 game_id。分成 update + 再 select
+-- 兩次的話,中間那個縫隙剛好是別人也在改同一列的時候。
+WITH upd AS (
+  UPDATE activity.tournament_players
+  SET display_name = sqlc.arg(display_name)::text,
+      discord_name = sqlc.arg(discord_name)::text,
+      self_rated_level = NULLIF(sqlc.arg(self_rated_level)::smallint, 0),
+      ladder_rank = NULLIF(sqlc.arg(ladder_rank)::text, ''),
+      ladder_score = NULLIF(sqlc.arg(ladder_score)::int, 0),
+      arts_note = NULLIF(sqlc.arg(arts_note)::text, ''),
+      availability_note = NULLIF(sqlc.arg(availability_note)::text, ''),
+      updated_at = now()
+  WHERE id = sqlc.arg(player_id)::bigint
+    AND tournament_id = sqlc.arg(tournament_id)::bigint
+    AND EXISTS (
+      SELECT 1 FROM activity.tournaments t
+      WHERE t.id = sqlc.arg(tournament_id)::bigint
+        AND t.phase = sqlc.arg(require_phase)::text
+    )
+  RETURNING id, public_id, tournament_id, fencer_id, user_id,
+            display_name, discord_name,
+            rank_level, ranked_at, ranked_by,
+            self_rated_level, ladder_rank, ladder_score,
+            arts_note, availability_note,
+            seed_no, status, created_at, updated_at
+)
+SELECT upd.*, f.game_id
+FROM upd
+JOIN activity.fencers f ON f.id = upd.fencer_id;
+
+-- name: TouchFencerDiscordName :execrows
+-- 修改報名表的第 2 步,**跑在 UpdatePlayerRegistration 之後**(鎖序
+-- tournament_players → fencers)。
+--
+-- fencers.discord_name 是「最近一次報名填的」跨屆聯絡方式(schemas/26),
+-- 報名時由 BumpFencerOnRegistration 寫入。改報名表時不同步的話,選手把打錯的
+-- Discord 名稱改對了,裁判下一屆照樣聯絡不到人。
+--
+-- **空字串不覆寫**(與 BumpFencerOnRegistration 逐字相同的 COALESCE/NULLIF):
+-- 本屆清空只是「本屆不想公開」,不該把往屆留下的聯絡方式一起洗掉。
+-- 這一支與 BumpFencerOnRegistration 的差別只有一個 —— 它**不動**
+-- tournaments_played:改報名表不是又參加了一屆。
+UPDATE activity.fencers
+SET discord_name = COALESCE(NULLIF(sqlc.arg(discord_name)::text, ''), discord_name),
+    updated_at = now()
+WHERE id = sqlc.arg(fencer_id)::bigint;
+
 -- ═══ 身分維護(通行碼、綁定)═════════════════════════════════
 
 -- name: UpdatePlayerPasscode :execrows

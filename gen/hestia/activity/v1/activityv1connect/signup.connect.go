@@ -73,6 +73,9 @@ const (
 	// SignupServiceGetMyPlayerProcedure is the fully-qualified name of the SignupService's GetMyPlayer
 	// RPC.
 	SignupServiceGetMyPlayerProcedure = "/hestia.activity.v1.SignupService/GetMyPlayer"
+	// SignupServiceUpdateRegistrationProcedure is the fully-qualified name of the SignupService's
+	// UpdateRegistration RPC.
+	SignupServiceUpdateRegistrationProcedure = "/hestia.activity.v1.SignupService/UpdateRegistration"
 	// SignupServiceBindPlatformAccountProcedure is the fully-qualified name of the SignupService's
 	// BindPlatformAccount RPC.
 	SignupServiceBindPlatformAccountProcedure = "/hestia.activity.v1.SignupService/BindPlatformAccount"
@@ -88,6 +91,8 @@ type SignupServiceClient interface {
 	Logout(context.Context, *connect.Request[v1.LogoutRequest]) (*connect.Response[v1.LogoutResponse], error)
 	// 取得目前登入的選手。
 	GetMyPlayer(context.Context, *connect.Request[v1.GetMyPlayerRequest]) (*connect.Response[v1.GetMyPlayerResponse], error)
+	// 修改自己的報名資料。只在 SIGNUP 階段開放,見 UpdateRegistrationRequest。
+	UpdateRegistration(context.Context, *connect.Request[v1.UpdateRegistrationRequest]) (*connect.Response[v1.UpdateRegistrationResponse], error)
 	// 把目前的活動層身分綁到平台帳號(領獎前必做)。
 	BindPlatformAccount(context.Context, *connect.Request[v1.BindPlatformAccountRequest]) (*connect.Response[v1.BindPlatformAccountResponse], error)
 }
@@ -127,6 +132,12 @@ func NewSignupServiceClient(httpClient connect.HTTPClient, baseURL string, opts 
 			connect.WithSchema(signupServiceMethods.ByName("GetMyPlayer")),
 			connect.WithClientOptions(opts...),
 		),
+		updateRegistration: connect.NewClient[v1.UpdateRegistrationRequest, v1.UpdateRegistrationResponse](
+			httpClient,
+			baseURL+SignupServiceUpdateRegistrationProcedure,
+			connect.WithSchema(signupServiceMethods.ByName("UpdateRegistration")),
+			connect.WithClientOptions(opts...),
+		),
 		bindPlatformAccount: connect.NewClient[v1.BindPlatformAccountRequest, v1.BindPlatformAccountResponse](
 			httpClient,
 			baseURL+SignupServiceBindPlatformAccountProcedure,
@@ -142,6 +153,7 @@ type signupServiceClient struct {
 	login               *connect.Client[v1.LoginRequest, v1.LoginResponse]
 	logout              *connect.Client[v1.LogoutRequest, v1.LogoutResponse]
 	getMyPlayer         *connect.Client[v1.GetMyPlayerRequest, v1.GetMyPlayerResponse]
+	updateRegistration  *connect.Client[v1.UpdateRegistrationRequest, v1.UpdateRegistrationResponse]
 	bindPlatformAccount *connect.Client[v1.BindPlatformAccountRequest, v1.BindPlatformAccountResponse]
 }
 
@@ -165,6 +177,11 @@ func (c *signupServiceClient) GetMyPlayer(ctx context.Context, req *connect.Requ
 	return c.getMyPlayer.CallUnary(ctx, req)
 }
 
+// UpdateRegistration calls hestia.activity.v1.SignupService.UpdateRegistration.
+func (c *signupServiceClient) UpdateRegistration(ctx context.Context, req *connect.Request[v1.UpdateRegistrationRequest]) (*connect.Response[v1.UpdateRegistrationResponse], error) {
+	return c.updateRegistration.CallUnary(ctx, req)
+}
+
 // BindPlatformAccount calls hestia.activity.v1.SignupService.BindPlatformAccount.
 func (c *signupServiceClient) BindPlatformAccount(ctx context.Context, req *connect.Request[v1.BindPlatformAccountRequest]) (*connect.Response[v1.BindPlatformAccountResponse], error) {
 	return c.bindPlatformAccount.CallUnary(ctx, req)
@@ -180,6 +197,8 @@ type SignupServiceHandler interface {
 	Logout(context.Context, *connect.Request[v1.LogoutRequest]) (*connect.Response[v1.LogoutResponse], error)
 	// 取得目前登入的選手。
 	GetMyPlayer(context.Context, *connect.Request[v1.GetMyPlayerRequest]) (*connect.Response[v1.GetMyPlayerResponse], error)
+	// 修改自己的報名資料。只在 SIGNUP 階段開放,見 UpdateRegistrationRequest。
+	UpdateRegistration(context.Context, *connect.Request[v1.UpdateRegistrationRequest]) (*connect.Response[v1.UpdateRegistrationResponse], error)
 	// 把目前的活動層身分綁到平台帳號(領獎前必做)。
 	BindPlatformAccount(context.Context, *connect.Request[v1.BindPlatformAccountRequest]) (*connect.Response[v1.BindPlatformAccountResponse], error)
 }
@@ -215,6 +234,12 @@ func NewSignupServiceHandler(svc SignupServiceHandler, opts ...connect.HandlerOp
 		connect.WithSchema(signupServiceMethods.ByName("GetMyPlayer")),
 		connect.WithHandlerOptions(opts...),
 	)
+	signupServiceUpdateRegistrationHandler := connect.NewUnaryHandler(
+		SignupServiceUpdateRegistrationProcedure,
+		svc.UpdateRegistration,
+		connect.WithSchema(signupServiceMethods.ByName("UpdateRegistration")),
+		connect.WithHandlerOptions(opts...),
+	)
 	signupServiceBindPlatformAccountHandler := connect.NewUnaryHandler(
 		SignupServiceBindPlatformAccountProcedure,
 		svc.BindPlatformAccount,
@@ -231,6 +256,8 @@ func NewSignupServiceHandler(svc SignupServiceHandler, opts ...connect.HandlerOp
 			signupServiceLogoutHandler.ServeHTTP(w, r)
 		case SignupServiceGetMyPlayerProcedure:
 			signupServiceGetMyPlayerHandler.ServeHTTP(w, r)
+		case SignupServiceUpdateRegistrationProcedure:
+			signupServiceUpdateRegistrationHandler.ServeHTTP(w, r)
 		case SignupServiceBindPlatformAccountProcedure:
 			signupServiceBindPlatformAccountHandler.ServeHTTP(w, r)
 		default:
@@ -256,6 +283,10 @@ func (UnimplementedSignupServiceHandler) Logout(context.Context, *connect.Reques
 
 func (UnimplementedSignupServiceHandler) GetMyPlayer(context.Context, *connect.Request[v1.GetMyPlayerRequest]) (*connect.Response[v1.GetMyPlayerResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("hestia.activity.v1.SignupService.GetMyPlayer is not implemented"))
+}
+
+func (UnimplementedSignupServiceHandler) UpdateRegistration(context.Context, *connect.Request[v1.UpdateRegistrationRequest]) (*connect.Response[v1.UpdateRegistrationResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("hestia.activity.v1.SignupService.UpdateRegistration is not implemented"))
 }
 
 func (UnimplementedSignupServiceHandler) BindPlatformAccount(context.Context, *connect.Request[v1.BindPlatformAccountRequest]) (*connect.Response[v1.BindPlatformAccountResponse], error) {

@@ -462,7 +462,10 @@ type GetMyPlayerResponse struct {
 	// 本屆賽事的當前狀態,前端用來決定顯示哪個畫面。
 	Tournament *Tournament `protobuf:"bytes,2,opt,name=tournament,proto3" json:"tournament,omitempty"`
 	// 目前輪到我打的比賽;空 = 沒有待打的場次(已出局、或還沒抽籤)。
-	CurrentMatch  *Match `protobuf:"bytes,3,opt,name=current_match,json=currentMatch,proto3,oneof" json:"current_match,omitempty"`
+	CurrentMatch *Match `protobuf:"bytes,3,opt,name=current_match,json=currentMatch,proto3,oneof" json:"current_match,omitempty"`
+	// 我報名時填了什麼。Player 只帶對戰表要顯示的那幾欄,
+	// 論劍積分、常用武學、可出賽時段這些只有本人看得到。
+	Registration  *MyRegistration `protobuf:"bytes,4,opt,name=registration,proto3" json:"registration,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -518,6 +521,226 @@ func (x *GetMyPlayerResponse) GetCurrentMatch() *Match {
 	return nil
 }
 
+func (x *GetMyPlayerResponse) GetRegistration() *MyRegistration {
+	if x != nil {
+		return x.Registration
+	}
+	return nil
+}
+
+// MyRegistration 是選手自己填的那些欄位。讀寫共用同一個訊息 ——
+// 「我填了什麼」與「我要改成什麼」是同一組東西,兩個訊息會漂。
+//
+// **game_id 刻意不在裡面,而且不要加。** 它是登入用的身分、也是 fencers 的
+// 自然鍵 —— 改它等於換一個人(既有的 session、往屆戰績、對戰表上的名字
+// 會一起換掉)。要改得由裁判處理,不是自助。
+//
+// 每一欄都是選填,**送什麼就是最終值**:留空代表「清掉這一欄」,
+// 不是「不動這一欄」。沒有 field mask —— 這張表是一份完整的報名資料,
+// 前端讀回整份、改幾欄、整份送回,沒有「只送改動部分」這個模式要支援。
+type MyRegistration struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 顯示名。留空時伺服器沿用 game_id(與報名同一條規則)。
+	DisplayName string `protobuf:"bytes,1,opt,name=display_name,json=displayName,proto3" json:"display_name,omitempty"`
+	// Discord 名稱。留空不會清掉跨屆檔案(fencers)上既有的那一份,
+	// 只清掉本屆的快照 —— 那份是裁判聯絡你的最後手段。
+	DiscordName   string `protobuf:"bytes,2,opt,name=discord_name,json=discordName,proto3" json:"discord_name,omitempty"`
+	SelfRatedRank Rank   `protobuf:"varint,3,opt,name=self_rated_rank,json=selfRatedRank,proto3,enum=hestia.activity.v1.Rank" json:"self_rated_rank,omitempty"`
+	LadderRank    string `protobuf:"bytes,4,opt,name=ladder_rank,json=ladderRank,proto3" json:"ladder_rank,omitempty"`
+	// 遊戲內積分(0 = 沒填)。
+	LadderScore      int32  `protobuf:"varint,5,opt,name=ladder_score,json=ladderScore,proto3" json:"ladder_score,omitempty"`
+	ArtsNote         string `protobuf:"bytes,6,opt,name=arts_note,json=artsNote,proto3" json:"arts_note,omitempty"`
+	AvailabilityNote string `protobuf:"bytes,7,opt,name=availability_note,json=availabilityNote,proto3" json:"availability_note,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *MyRegistration) Reset() {
+	*x = MyRegistration{}
+	mi := &file_hestia_activity_v1_signup_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MyRegistration) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MyRegistration) ProtoMessage() {}
+
+func (x *MyRegistration) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_activity_v1_signup_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MyRegistration.ProtoReflect.Descriptor instead.
+func (*MyRegistration) Descriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_signup_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *MyRegistration) GetDisplayName() string {
+	if x != nil {
+		return x.DisplayName
+	}
+	return ""
+}
+
+func (x *MyRegistration) GetDiscordName() string {
+	if x != nil {
+		return x.DiscordName
+	}
+	return ""
+}
+
+func (x *MyRegistration) GetSelfRatedRank() Rank {
+	if x != nil {
+		return x.SelfRatedRank
+	}
+	return Rank_RANK_UNSPECIFIED
+}
+
+func (x *MyRegistration) GetLadderRank() string {
+	if x != nil {
+		return x.LadderRank
+	}
+	return ""
+}
+
+func (x *MyRegistration) GetLadderScore() int32 {
+	if x != nil {
+		return x.LadderScore
+	}
+	return 0
+}
+
+func (x *MyRegistration) GetArtsNote() string {
+	if x != nil {
+		return x.ArtsNote
+	}
+	return ""
+}
+
+func (x *MyRegistration) GetAvailabilityNote() string {
+	if x != nil {
+		return x.AvailabilityNote
+	}
+	return ""
+}
+
+// UpdateRegistrationRequest 改自己那一列。
+//
+// **沒有「改誰」這個欄位**:對象一律是活動層 session 認定的那位選手。
+// 帶 player_public_id 進來就等於開一支「改任何人的報名表」的 API,
+// 而遊戲ID 是公開資訊,誰都登得進誰的帳號。
+//
+// 只在 SIGNUP 階段開放,**由伺服器驗**:報名期一過,這份資料就是御風羽
+// 評段的依據,改了等於在裁判眼皮底下換材料。階段不對回
+// tournament_wrong_phase。
+type UpdateRegistrationRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Registration  *MyRegistration        `protobuf:"bytes,1,opt,name=registration,proto3" json:"registration,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UpdateRegistrationRequest) Reset() {
+	*x = UpdateRegistrationRequest{}
+	mi := &file_hestia_activity_v1_signup_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UpdateRegistrationRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpdateRegistrationRequest) ProtoMessage() {}
+
+func (x *UpdateRegistrationRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_activity_v1_signup_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpdateRegistrationRequest.ProtoReflect.Descriptor instead.
+func (*UpdateRegistrationRequest) Descriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_signup_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *UpdateRegistrationRequest) GetRegistration() *MyRegistration {
+	if x != nil {
+		return x.Registration
+	}
+	return nil
+}
+
+type UpdateRegistrationResponse struct {
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Player *Player                `protobuf:"bytes,1,opt,name=player,proto3" json:"player,omitempty"`
+	// 伺服器整理過(去空白、留空補預設)之後的實際內容。
+	// 回這一份而不是讓前端沿用自己送的:整理規則的權威在伺服器。
+	Registration  *MyRegistration `protobuf:"bytes,2,opt,name=registration,proto3" json:"registration,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UpdateRegistrationResponse) Reset() {
+	*x = UpdateRegistrationResponse{}
+	mi := &file_hestia_activity_v1_signup_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UpdateRegistrationResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpdateRegistrationResponse) ProtoMessage() {}
+
+func (x *UpdateRegistrationResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_activity_v1_signup_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpdateRegistrationResponse.ProtoReflect.Descriptor instead.
+func (*UpdateRegistrationResponse) Descriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_signup_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *UpdateRegistrationResponse) GetPlayer() *Player {
+	if x != nil {
+		return x.Player
+	}
+	return nil
+}
+
+func (x *UpdateRegistrationResponse) GetRegistration() *MyRegistration {
+	if x != nil {
+		return x.Registration
+	}
+	return nil
+}
+
 // BindPlatformAccountRequest 需要**同時**持有活動層 session(通行碼登入)
 // 與平台 Bearer(Discord OAuth 登入)。伺服器把兩個身分接起來。
 //
@@ -530,7 +753,7 @@ type BindPlatformAccountRequest struct {
 
 func (x *BindPlatformAccountRequest) Reset() {
 	*x = BindPlatformAccountRequest{}
-	mi := &file_hestia_activity_v1_signup_proto_msgTypes[8]
+	mi := &file_hestia_activity_v1_signup_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -542,7 +765,7 @@ func (x *BindPlatformAccountRequest) String() string {
 func (*BindPlatformAccountRequest) ProtoMessage() {}
 
 func (x *BindPlatformAccountRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_signup_proto_msgTypes[8]
+	mi := &file_hestia_activity_v1_signup_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -555,7 +778,7 @@ func (x *BindPlatformAccountRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BindPlatformAccountRequest.ProtoReflect.Descriptor instead.
 func (*BindPlatformAccountRequest) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_signup_proto_rawDescGZIP(), []int{8}
+	return file_hestia_activity_v1_signup_proto_rawDescGZIP(), []int{11}
 }
 
 type BindPlatformAccountResponse struct {
@@ -567,7 +790,7 @@ type BindPlatformAccountResponse struct {
 
 func (x *BindPlatformAccountResponse) Reset() {
 	*x = BindPlatformAccountResponse{}
-	mi := &file_hestia_activity_v1_signup_proto_msgTypes[9]
+	mi := &file_hestia_activity_v1_signup_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -579,7 +802,7 @@ func (x *BindPlatformAccountResponse) String() string {
 func (*BindPlatformAccountResponse) ProtoMessage() {}
 
 func (x *BindPlatformAccountResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_signup_proto_msgTypes[9]
+	mi := &file_hestia_activity_v1_signup_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -592,7 +815,7 @@ func (x *BindPlatformAccountResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BindPlatformAccountResponse.ProtoReflect.Descriptor instead.
 func (*BindPlatformAccountResponse) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_signup_proto_rawDescGZIP(), []int{9}
+	return file_hestia_activity_v1_signup_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *BindPlatformAccountResponse) GetPlayer() *Player {
@@ -629,22 +852,38 @@ const file_hestia_activity_v1_signup_proto_rawDesc = "" +
 	"\x06player\x18\x01 \x01(\v2\x1a.hestia.activity.v1.PlayerR\x06player\"\x0f\n" +
 	"\rLogoutRequest\"\x10\n" +
 	"\x0eLogoutResponse\"\x14\n" +
-	"\x12GetMyPlayerRequest\"\xe0\x01\n" +
+	"\x12GetMyPlayerRequest\"\xa8\x02\n" +
 	"\x13GetMyPlayerResponse\x122\n" +
 	"\x06player\x18\x01 \x01(\v2\x1a.hestia.activity.v1.PlayerR\x06player\x12>\n" +
 	"\n" +
 	"tournament\x18\x02 \x01(\v2\x1e.hestia.activity.v1.TournamentR\n" +
 	"tournament\x12C\n" +
-	"\rcurrent_match\x18\x03 \x01(\v2\x19.hestia.activity.v1.MatchH\x00R\fcurrentMatch\x88\x01\x01B\x10\n" +
-	"\x0e_current_match\"\x1c\n" +
+	"\rcurrent_match\x18\x03 \x01(\v2\x19.hestia.activity.v1.MatchH\x00R\fcurrentMatch\x88\x01\x01\x12F\n" +
+	"\fregistration\x18\x04 \x01(\v2\".hestia.activity.v1.MyRegistrationR\fregistrationB\x10\n" +
+	"\x0e_current_match\"\xa6\x02\n" +
+	"\x0eMyRegistration\x12!\n" +
+	"\fdisplay_name\x18\x01 \x01(\tR\vdisplayName\x12!\n" +
+	"\fdiscord_name\x18\x02 \x01(\tR\vdiscordName\x12@\n" +
+	"\x0fself_rated_rank\x18\x03 \x01(\x0e2\x18.hestia.activity.v1.RankR\rselfRatedRank\x12\x1f\n" +
+	"\vladder_rank\x18\x04 \x01(\tR\n" +
+	"ladderRank\x12!\n" +
+	"\fladder_score\x18\x05 \x01(\x05R\vladderScore\x12\x1b\n" +
+	"\tarts_note\x18\x06 \x01(\tR\bartsNote\x12+\n" +
+	"\x11availability_note\x18\a \x01(\tR\x10availabilityNote\"c\n" +
+	"\x19UpdateRegistrationRequest\x12F\n" +
+	"\fregistration\x18\x01 \x01(\v2\".hestia.activity.v1.MyRegistrationR\fregistration\"\x98\x01\n" +
+	"\x1aUpdateRegistrationResponse\x122\n" +
+	"\x06player\x18\x01 \x01(\v2\x1a.hestia.activity.v1.PlayerR\x06player\x12F\n" +
+	"\fregistration\x18\x02 \x01(\v2\".hestia.activity.v1.MyRegistrationR\fregistration\"\x1c\n" +
 	"\x1aBindPlatformAccountRequest\"Q\n" +
 	"\x1bBindPlatformAccountResponse\x122\n" +
-	"\x06player\x18\x01 \x01(\v2\x1a.hestia.activity.v1.PlayerR\x06player2\xe7\x03\n" +
+	"\x06player\x18\x01 \x01(\v2\x1a.hestia.activity.v1.PlayerR\x06player2\xde\x04\n" +
 	"\rSignupService\x12W\n" +
 	"\bRegister\x12#.hestia.activity.v1.RegisterRequest\x1a$.hestia.activity.v1.RegisterResponse\"\x00\x12N\n" +
 	"\x05Login\x12 .hestia.activity.v1.LoginRequest\x1a!.hestia.activity.v1.LoginResponse\"\x00\x12Q\n" +
 	"\x06Logout\x12!.hestia.activity.v1.LogoutRequest\x1a\".hestia.activity.v1.LogoutResponse\"\x00\x12`\n" +
-	"\vGetMyPlayer\x12&.hestia.activity.v1.GetMyPlayerRequest\x1a'.hestia.activity.v1.GetMyPlayerResponse\"\x00\x12x\n" +
+	"\vGetMyPlayer\x12&.hestia.activity.v1.GetMyPlayerRequest\x1a'.hestia.activity.v1.GetMyPlayerResponse\"\x00\x12u\n" +
+	"\x12UpdateRegistration\x12-.hestia.activity.v1.UpdateRegistrationRequest\x1a..hestia.activity.v1.UpdateRegistrationResponse\"\x00\x12x\n" +
 	"\x13BindPlatformAccount\x12..hestia.activity.v1.BindPlatformAccountRequest\x1a/.hestia.activity.v1.BindPlatformAccountResponse\"\x00B@Z>github.com/danicotech/hestia/gen/hestia/activity/v1;activityv1b\x06proto3"
 
 var (
@@ -659,7 +898,7 @@ func file_hestia_activity_v1_signup_proto_rawDescGZIP() []byte {
 	return file_hestia_activity_v1_signup_proto_rawDescData
 }
 
-var file_hestia_activity_v1_signup_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
+var file_hestia_activity_v1_signup_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
 var file_hestia_activity_v1_signup_proto_goTypes = []any{
 	(*RegisterRequest)(nil),             // 0: hestia.activity.v1.RegisterRequest
 	(*RegisterResponse)(nil),            // 1: hestia.activity.v1.RegisterResponse
@@ -669,37 +908,47 @@ var file_hestia_activity_v1_signup_proto_goTypes = []any{
 	(*LogoutResponse)(nil),              // 5: hestia.activity.v1.LogoutResponse
 	(*GetMyPlayerRequest)(nil),          // 6: hestia.activity.v1.GetMyPlayerRequest
 	(*GetMyPlayerResponse)(nil),         // 7: hestia.activity.v1.GetMyPlayerResponse
-	(*BindPlatformAccountRequest)(nil),  // 8: hestia.activity.v1.BindPlatformAccountRequest
-	(*BindPlatformAccountResponse)(nil), // 9: hestia.activity.v1.BindPlatformAccountResponse
-	(Rank)(0),                           // 10: hestia.activity.v1.Rank
-	(*Player)(nil),                      // 11: hestia.activity.v1.Player
-	(*Tournament)(nil),                  // 12: hestia.activity.v1.Tournament
-	(*Match)(nil),                       // 13: hestia.activity.v1.Match
+	(*MyRegistration)(nil),              // 8: hestia.activity.v1.MyRegistration
+	(*UpdateRegistrationRequest)(nil),   // 9: hestia.activity.v1.UpdateRegistrationRequest
+	(*UpdateRegistrationResponse)(nil),  // 10: hestia.activity.v1.UpdateRegistrationResponse
+	(*BindPlatformAccountRequest)(nil),  // 11: hestia.activity.v1.BindPlatformAccountRequest
+	(*BindPlatformAccountResponse)(nil), // 12: hestia.activity.v1.BindPlatformAccountResponse
+	(Rank)(0),                           // 13: hestia.activity.v1.Rank
+	(*Player)(nil),                      // 14: hestia.activity.v1.Player
+	(*Tournament)(nil),                  // 15: hestia.activity.v1.Tournament
+	(*Match)(nil),                       // 16: hestia.activity.v1.Match
 }
 var file_hestia_activity_v1_signup_proto_depIdxs = []int32{
-	10, // 0: hestia.activity.v1.RegisterRequest.self_rated_rank:type_name -> hestia.activity.v1.Rank
-	11, // 1: hestia.activity.v1.RegisterResponse.player:type_name -> hestia.activity.v1.Player
-	10, // 2: hestia.activity.v1.RegisterResponse.previous_rank:type_name -> hestia.activity.v1.Rank
-	11, // 3: hestia.activity.v1.LoginResponse.player:type_name -> hestia.activity.v1.Player
-	11, // 4: hestia.activity.v1.GetMyPlayerResponse.player:type_name -> hestia.activity.v1.Player
-	12, // 5: hestia.activity.v1.GetMyPlayerResponse.tournament:type_name -> hestia.activity.v1.Tournament
-	13, // 6: hestia.activity.v1.GetMyPlayerResponse.current_match:type_name -> hestia.activity.v1.Match
-	11, // 7: hestia.activity.v1.BindPlatformAccountResponse.player:type_name -> hestia.activity.v1.Player
-	0,  // 8: hestia.activity.v1.SignupService.Register:input_type -> hestia.activity.v1.RegisterRequest
-	2,  // 9: hestia.activity.v1.SignupService.Login:input_type -> hestia.activity.v1.LoginRequest
-	4,  // 10: hestia.activity.v1.SignupService.Logout:input_type -> hestia.activity.v1.LogoutRequest
-	6,  // 11: hestia.activity.v1.SignupService.GetMyPlayer:input_type -> hestia.activity.v1.GetMyPlayerRequest
-	8,  // 12: hestia.activity.v1.SignupService.BindPlatformAccount:input_type -> hestia.activity.v1.BindPlatformAccountRequest
-	1,  // 13: hestia.activity.v1.SignupService.Register:output_type -> hestia.activity.v1.RegisterResponse
-	3,  // 14: hestia.activity.v1.SignupService.Login:output_type -> hestia.activity.v1.LoginResponse
-	5,  // 15: hestia.activity.v1.SignupService.Logout:output_type -> hestia.activity.v1.LogoutResponse
-	7,  // 16: hestia.activity.v1.SignupService.GetMyPlayer:output_type -> hestia.activity.v1.GetMyPlayerResponse
-	9,  // 17: hestia.activity.v1.SignupService.BindPlatformAccount:output_type -> hestia.activity.v1.BindPlatformAccountResponse
-	13, // [13:18] is the sub-list for method output_type
-	8,  // [8:13] is the sub-list for method input_type
-	8,  // [8:8] is the sub-list for extension type_name
-	8,  // [8:8] is the sub-list for extension extendee
-	0,  // [0:8] is the sub-list for field type_name
+	13, // 0: hestia.activity.v1.RegisterRequest.self_rated_rank:type_name -> hestia.activity.v1.Rank
+	14, // 1: hestia.activity.v1.RegisterResponse.player:type_name -> hestia.activity.v1.Player
+	13, // 2: hestia.activity.v1.RegisterResponse.previous_rank:type_name -> hestia.activity.v1.Rank
+	14, // 3: hestia.activity.v1.LoginResponse.player:type_name -> hestia.activity.v1.Player
+	14, // 4: hestia.activity.v1.GetMyPlayerResponse.player:type_name -> hestia.activity.v1.Player
+	15, // 5: hestia.activity.v1.GetMyPlayerResponse.tournament:type_name -> hestia.activity.v1.Tournament
+	16, // 6: hestia.activity.v1.GetMyPlayerResponse.current_match:type_name -> hestia.activity.v1.Match
+	8,  // 7: hestia.activity.v1.GetMyPlayerResponse.registration:type_name -> hestia.activity.v1.MyRegistration
+	13, // 8: hestia.activity.v1.MyRegistration.self_rated_rank:type_name -> hestia.activity.v1.Rank
+	8,  // 9: hestia.activity.v1.UpdateRegistrationRequest.registration:type_name -> hestia.activity.v1.MyRegistration
+	14, // 10: hestia.activity.v1.UpdateRegistrationResponse.player:type_name -> hestia.activity.v1.Player
+	8,  // 11: hestia.activity.v1.UpdateRegistrationResponse.registration:type_name -> hestia.activity.v1.MyRegistration
+	14, // 12: hestia.activity.v1.BindPlatformAccountResponse.player:type_name -> hestia.activity.v1.Player
+	0,  // 13: hestia.activity.v1.SignupService.Register:input_type -> hestia.activity.v1.RegisterRequest
+	2,  // 14: hestia.activity.v1.SignupService.Login:input_type -> hestia.activity.v1.LoginRequest
+	4,  // 15: hestia.activity.v1.SignupService.Logout:input_type -> hestia.activity.v1.LogoutRequest
+	6,  // 16: hestia.activity.v1.SignupService.GetMyPlayer:input_type -> hestia.activity.v1.GetMyPlayerRequest
+	9,  // 17: hestia.activity.v1.SignupService.UpdateRegistration:input_type -> hestia.activity.v1.UpdateRegistrationRequest
+	11, // 18: hestia.activity.v1.SignupService.BindPlatformAccount:input_type -> hestia.activity.v1.BindPlatformAccountRequest
+	1,  // 19: hestia.activity.v1.SignupService.Register:output_type -> hestia.activity.v1.RegisterResponse
+	3,  // 20: hestia.activity.v1.SignupService.Login:output_type -> hestia.activity.v1.LoginResponse
+	5,  // 21: hestia.activity.v1.SignupService.Logout:output_type -> hestia.activity.v1.LogoutResponse
+	7,  // 22: hestia.activity.v1.SignupService.GetMyPlayer:output_type -> hestia.activity.v1.GetMyPlayerResponse
+	10, // 23: hestia.activity.v1.SignupService.UpdateRegistration:output_type -> hestia.activity.v1.UpdateRegistrationResponse
+	12, // 24: hestia.activity.v1.SignupService.BindPlatformAccount:output_type -> hestia.activity.v1.BindPlatformAccountResponse
+	19, // [19:25] is the sub-list for method output_type
+	13, // [13:19] is the sub-list for method input_type
+	13, // [13:13] is the sub-list for extension type_name
+	13, // [13:13] is the sub-list for extension extendee
+	0,  // [0:13] is the sub-list for field type_name
 }
 
 func init() { file_hestia_activity_v1_signup_proto_init() }
@@ -715,7 +964,7 @@ func file_hestia_activity_v1_signup_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_hestia_activity_v1_signup_proto_rawDesc), len(file_hestia_activity_v1_signup_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   10,
+			NumMessages:   13,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

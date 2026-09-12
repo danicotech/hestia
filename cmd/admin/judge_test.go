@@ -272,3 +272,60 @@ func TestCreateJudge(t *testing.T) {
 		}
 	})
 }
+
+// 社群可以複製一份自己的角色,而 roles.key 自 migration 00025 起只在
+// 社群範圍內唯一(`UNIQUE (COALESCE(community_id, 0), key)`)。
+//
+// 所以「找 key = 'judge' 的角色」會選到不只一個。授出去的必須是**內建的
+// 那一個**,而不是連社群的那一份一起授成全域 —— 後者把一個社群範圍的
+// 權限變成全站有效,而且不會有任何訊號。
+func TestCreateJudgeIgnoresCommunityScopedRoleWithSameKey(t *testing.T) {
+	pool := testdb.Start(t)
+	ctx := context.Background()
+
+	var communityID int64
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO platform.communities (public_id, name)
+		 VALUES (gen_random_uuid()::text, '測試社群')
+		 RETURNING id`).Scan(&communityID); err != nil {
+		t.Fatalf("建社群: %v", err)
+	}
+
+	var communityRoleID int64
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO platform.roles (key, name, public_id, community_id)
+		 VALUES ('judge', '社群自己的裁判', gen_random_uuid()::text, $1)
+		 RETURNING id`, communityID).Scan(&communityRoleID); err != nil {
+		t.Fatalf("建社群角色: %v", err)
+	}
+
+	if _, err := captureStdout(t, func() error {
+		return createJudge(ctx, pool, []string{"--login", "scoped.judge"})
+	}); err != nil {
+		t.Fatalf("create-judge: %v", err)
+	}
+
+	var granted []int64
+	rows, err := pool.Query(ctx,
+		`SELECT ur.role_id FROM platform.user_roles ur
+		 JOIN platform.identities i ON i.user_id = ur.user_id
+		 WHERE i.provider = 'local' AND i.provider_user_id = 'scoped.judge'`)
+	if err != nil {
+		t.Fatalf("查授予: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("掃描: %v", err)
+		}
+		granted = append(granted, id)
+	}
+
+	if len(granted) != 1 {
+		t.Fatalf("應該只授予一個角色,實際 %d 個:%v", len(granted), granted)
+	}
+	if granted[0] == communityRoleID {
+		t.Fatal("授到了社群範圍的角色,而且被當成全域")
+	}
+}

@@ -252,6 +252,75 @@ func fencerForGameID(ctx context.Context, qtx *db.Queries, gameID string) (db.Ac
 	return fencer, true, nil
 }
 
+// SaveRegistration 改寫選手自己填的那幾欄(報名期內的自助修改)。
+//
+// 步驟與鎖序和 CreateRegistration 同一套,少了「查/建 fencer」那一段:
+//
+//	鎖賽事(FOR SHARE)→ 改 tournament_players(階段條件進 WHERE)
+//	→ 同步 fencers.discord_name
+//
+// 兩件事刻意**不做**:不動 tournaments_played(改報名表不是又參加了一屆),
+// 不寫 admin_audit_logs(這是本人改自己的資料,不是裁判的處置 ——
+// 稽核表是給「誰對別人做了什麼」用的)。
+func (s *Service) SaveRegistration(
+	ctx context.Context, p signup.SaveRegistrationParams,
+) (tournament.Player, error) {
+	var out tournament.Player
+	err := s.inTx(ctx, func(qtx *db.Queries) error {
+		lock, err := qtx.LockTournamentShared(ctx, p.TournamentID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("賽事 %d: %w", p.TournamentID, tournament.ErrTournamentNotFound)
+			}
+			return fmt.Errorf("鎖賽事 %d: %w", p.TournamentID, err)
+		}
+
+		row, err := qtx.UpdatePlayerRegistration(ctx, db.UpdatePlayerRegistrationParams{
+			DisplayName:      p.Fields.DisplayName,
+			DiscordName:      p.Fields.DiscordName,
+			SelfRatedLevel:   int16(p.Fields.SelfRatedRank),
+			LadderRank:       p.Fields.LadderRank,
+			LadderScore:      p.Fields.LadderScore,
+			ArtsNote:         p.Fields.ArtsNote,
+			AvailabilityNote: p.Fields.AvailabilityNote,
+			PlayerID:         p.PlayerID,
+			TournamentID:     p.TournamentID,
+			RequirePhase:     string(p.RequirePhase),
+		})
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				// 0 列有兩種成因。**不猜** —— 兩者對使用者的意思完全不同
+				// (「報名期已過」vs「這個 session 指的人不在了」)。
+				// lock.Phase 是握著 FOR SHARE 時讀到的值,整個 tx 期間都是真值,
+				// 所以這個分辨是精確的,不是啟發式的。
+				if string(p.RequirePhase) != lock.Phase {
+					return fmt.Errorf("賽事 %d 目前在 %s 階段,修改報名資料需要 %s: %w",
+						p.TournamentID, lock.Phase, p.RequirePhase, tournament.ErrWrongPhase)
+				}
+				return fmt.Errorf("賽事 %d 的選手 %d: %w",
+					p.TournamentID, p.PlayerID, tournament.ErrPlayerNotFound)
+			}
+			if isCheckViolation(err, "tournament_players_self_rated_level_check") {
+				return fmt.Errorf("%w: 自評段位 %d", tournament.ErrInvalidRank, p.Fields.SelfRatedRank)
+			}
+			return fmt.Errorf("更新賽事 %d 的選手 %d: %w", p.TournamentID, p.PlayerID, err)
+		}
+
+		// 跨屆檔案上的 discord_name 跟著走(理由與空字串為何不覆寫,
+		// 見 port 的 FencerID 註解與 query 的 TouchFencerDiscordName)。
+		if _, err := qtx.TouchFencerDiscordName(ctx, db.TouchFencerDiscordNameParams{
+			DiscordName: p.Fields.DiscordName,
+			FencerID:    p.FencerID,
+		}); err != nil {
+			return fmt.Errorf("同步選手檔案 %d 的 Discord 名稱: %w", p.FencerID, err)
+		}
+
+		out = tournamentpg.PlayerFromRow(db.GetPlayerByPublicIDRow(row))
+		return nil
+	})
+	return out, err
+}
+
 // registrationError 把報名寫入的失敗翻成 port 的語意。
 func registrationError(err error, p signup.CreateRegistrationParams, lockedPhase string) error {
 	switch {

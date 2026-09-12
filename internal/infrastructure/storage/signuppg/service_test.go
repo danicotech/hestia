@@ -742,3 +742,284 @@ func TestPasscodeIssuedAtRequiresActivePlayer(t *testing.T) {
 		})
 	}
 }
+
+// ── 修改報名資料 ──────────────────────────────────────────────
+
+// saveParams 是一份「改成這樣」的完整內容。與 regParams 刻意不同值,
+// 這樣測試分得出「真的被改掉了」與「原本就長這樣」。
+func saveParams(tournamentID, playerID, fencerID int64) signup.SaveRegistrationParams {
+	return signup.SaveRegistrationParams{
+		TournamentID: tournamentID,
+		PlayerID:     playerID,
+		FencerID:     fencerID,
+		RequirePhase: tournament.PhaseSignup,
+		Fields: signup.RegistrationFields{
+			DisplayName:      "改過的名字",
+			DiscordName:      "fencer#9999",
+			SelfRatedRank:    bp.RankFeihua,
+			LadderRank:       "論劍·天榜",
+			LadderScore:      2100,
+			ArtsNote:         "改用問水劍法",
+			AvailabilityNote: "週末整天",
+		},
+	}
+}
+
+// 改完之後讀得到新值,而且**只有那七欄**變了 —— 段位、籤位、狀態、遊戲ID
+// 都不是選手能自助修改的東西。
+func TestSaveRegistrationWritesNewValues(t *testing.T) {
+	setup(t)
+	ctx := context.Background()
+	tid := newTournament(t, tournament.PhaseSignup)
+	id := gameID("要改資料")
+
+	reg, err := svc.CreateRegistration(ctx, regParams(tid, id))
+	if err != nil {
+		t.Fatalf("報名: %v", err)
+	}
+	p := saveParams(tid, reg.Player.ID, reg.Fencer.ID)
+	updated, err := svc.SaveRegistration(ctx, p)
+	if err != nil {
+		t.Fatalf("修改報名資料: %v", err)
+	}
+	if updated.DisplayName != p.Fields.DisplayName ||
+		updated.DiscordName != p.Fields.DiscordName ||
+		updated.SelfRatedRank != p.Fields.SelfRatedRank ||
+		updated.LadderRank != p.Fields.LadderRank ||
+		updated.LadderScore != p.Fields.LadderScore ||
+		updated.ArtsNote != p.Fields.ArtsNote ||
+		updated.AvailabilityNote != p.Fields.AvailabilityNote {
+		t.Fatalf("新值沒寫進去: %+v", updated)
+	}
+	// 讀回來的與寫進去的必須一致(這支 RPC 存在的理由就是「看得到自己填了什麼」)。
+	got, err := svc.PlayerByPublicID(ctx, tid, reg.Player.PublicID)
+	if err != nil {
+		t.Fatalf("重讀: %v", err)
+	}
+	if got != updated {
+		t.Fatalf("重讀的內容與回傳的不一致:\n got %+v\nwant %+v", got, updated)
+	}
+	// 身分與裁判的處置都不該被這條路徑碰到。
+	if got.GameID != id {
+		t.Fatalf("遊戲ID 不該被修改,得到 %q", got.GameID)
+	}
+	if got.Rank != bp.RankUnspecified || got.SeedNo != 0 || got.Status != tournament.PlayerActive {
+		t.Fatalf("段位 / 籤位 / 狀態不該被選手改到: %+v", got)
+	}
+	// 跨屆檔案:discord_name 跟著改,但參賽屆數不動(改報名表不是又參加了一屆)。
+	var fencerDiscord *string
+	if err := pool.QueryRow(ctx,
+		`SELECT discord_name FROM activity.fencers WHERE id = $1`, reg.Fencer.ID,
+	).Scan(&fencerDiscord); err != nil {
+		t.Fatalf("讀跨屆檔案: %v", err)
+	}
+	if fencerDiscord == nil || *fencerDiscord != p.Fields.DiscordName {
+		t.Fatalf("fencers.discord_name 未同步,得到 %v", fencerDiscord)
+	}
+	if _, played, _ := fencerRow(t, reg.Fencer.ID); played != 1 {
+		t.Fatalf("改報名表不該增加參賽屆數,得到 %d", played)
+	}
+}
+
+// 清空選填欄位是合法的,而且要真的變成 NULL(與報名同一條 NULLIF 規則)。
+// **但空字串不能洗掉 fencers 既有的 discord_name** —— 那是裁判跨屆聯絡的最後手段。
+func TestSaveRegistrationClearsOptionalFieldsButKeepsFencerDiscord(t *testing.T) {
+	setup(t)
+	ctx := context.Background()
+	tid := newTournament(t, tournament.PhaseSignup)
+	id := gameID("清空")
+
+	reg, err := svc.CreateRegistration(ctx, regParams(tid, id))
+	if err != nil {
+		t.Fatalf("報名: %v", err)
+	}
+	updated, err := svc.SaveRegistration(ctx, signup.SaveRegistrationParams{
+		TournamentID: tid,
+		PlayerID:     reg.Player.ID,
+		FencerID:     reg.Fencer.ID,
+		RequirePhase: tournament.PhaseSignup,
+		// DisplayName 由 service 補成 game_id(這一層不補值,照收)。
+		Fields: signup.RegistrationFields{DisplayName: id},
+	})
+	if err != nil {
+		t.Fatalf("清空選填欄位應該合法: %v", err)
+	}
+	if updated.LadderRank != "" || updated.ArtsNote != "" || updated.AvailabilityNote != "" ||
+		updated.LadderScore != 0 || updated.SelfRatedRank != bp.RankUnspecified {
+		t.Fatalf("選填欄位應該被清掉: %+v", updated)
+	}
+
+	var ladderRank, artsNote, availability *string
+	var selfRated *int16
+	var ladderScore *int32
+	if err := pool.QueryRow(ctx,
+		`SELECT ladder_rank, arts_note, availability_note, self_rated_level, ladder_score
+		 FROM activity.tournament_players WHERE id = $1`, reg.Player.ID,
+	).Scan(&ladderRank, &artsNote, &availability, &selfRated, &ladderScore); err != nil {
+		t.Fatalf("讀選填欄位: %v", err)
+	}
+	if ladderRank != nil || artsNote != nil || availability != nil ||
+		selfRated != nil || ladderScore != nil {
+		t.Fatalf("清空要被 NULLIF 成 NULL,得到 %v/%v/%v/%v/%v",
+			ladderRank, artsNote, availability, selfRated, ladderScore)
+	}
+
+	var fencerDiscord *string
+	if err := pool.QueryRow(ctx,
+		`SELECT discord_name FROM activity.fencers WHERE id = $1`, reg.Fencer.ID,
+	).Scan(&fencerDiscord); err != nil {
+		t.Fatalf("讀跨屆檔案: %v", err)
+	}
+	if fencerDiscord == nil || *fencerDiscord != "fencer#0001" {
+		t.Fatalf("空字串不該洗掉 fencers 既有的值,得到 %v", fencerDiscord)
+	}
+}
+
+// 報名期以外一律改不動,而且錯誤要說得出是階段的問題 ——
+// 「查無此選手」會讓選手以為自己的帳號壞了。
+func TestSaveRegistrationRequiresSignupPhase(t *testing.T) {
+	setup(t)
+	ctx := context.Background()
+	tid := newTournament(t, tournament.PhaseSignup)
+	id := gameID("太晚改")
+
+	reg, err := svc.CreateRegistration(ctx, regParams(tid, id))
+	if err != nil {
+		t.Fatalf("報名: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`UPDATE activity.tournaments SET phase = $2 WHERE id = $1`,
+		tid, string(tournament.PhaseRanking),
+	); err != nil {
+		t.Fatalf("推進階段: %v", err)
+	}
+
+	_, err = svc.SaveRegistration(ctx, saveParams(tid, reg.Player.ID, reg.Fencer.ID))
+	if !errors.Is(err, tournament.ErrWrongPhase) {
+		t.Fatalf("非報名期應回 ErrWrongPhase,得到 %v", err)
+	}
+	got, err := svc.PlayerByPublicID(ctx, tid, reg.Player.PublicID)
+	if err != nil {
+		t.Fatalf("重讀: %v", err)
+	}
+	if got.DisplayName != id || got.ArtsNote != "擅長劍法" {
+		t.Fatalf("被拒絕的修改不該留下痕跡: %+v", got)
+	}
+}
+
+// 0 列的另一種成因要分得出來:這個人不在這一屆。
+func TestSaveRegistrationUnknownPlayer(t *testing.T) {
+	setup(t)
+	ctx := context.Background()
+	tid := newTournament(t, tournament.PhaseSignup)
+	other := newTournament(t, tournament.PhaseSignup)
+
+	reg, err := svc.CreateRegistration(ctx, regParams(tid, gameID("別屆的人")))
+	if err != nil {
+		t.Fatalf("報名: %v", err)
+	}
+	// 同一個 player id,但拿去另一屆的路徑上改 —— 必須查不到。
+	_, err = svc.SaveRegistration(ctx, saveParams(other, reg.Player.ID, reg.Fencer.ID))
+	if !errors.Is(err, tournament.ErrPlayerNotFound) {
+		t.Fatalf("跨屆修改應回 ErrPlayerNotFound,得到 %v", err)
+	}
+	_, err = svc.SaveRegistration(ctx, saveParams(tid, reg.Player.ID+1000000, reg.Fencer.ID))
+	if !errors.Is(err, tournament.ErrPlayerNotFound) {
+		t.Fatalf("查無此選手應回 ErrPlayerNotFound,得到 %v", err)
+	}
+}
+
+// 一個人改不到另一個人那一列。這是併發下的版本:兩位選手同時改自己的資料,
+// 各自的內容不能互相污染(SaveRegistration 的 WHERE 只認自己那一列)。
+func TestConcurrentSaveRegistrationTouchesOnlyOwnRow(t *testing.T) {
+	setup(t)
+	ctx := context.Background()
+	tid := newTournament(t, tournament.PhaseSignup)
+
+	const n = 4
+	players := make([]signup.Registration, n)
+	for i := range players {
+		reg, err := svc.CreateRegistration(ctx, regParams(tid, gameID(fmt.Sprintf("並發改%d", i))))
+		if err != nil {
+			t.Fatalf("報名 %d: %v", i, err)
+		}
+		players[i] = reg
+	}
+
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			p := saveParams(tid, players[i].Player.ID, players[i].Fencer.ID)
+			p.Fields.DisplayName = fmt.Sprintf("各改各的-%d", i)
+			p.Fields.DiscordName = fmt.Sprintf("fencer#%04d", i)
+			<-start
+			_, errs[i] = svc.SaveRegistration(ctx, p)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("並發修改 %d: %v", i, err)
+		}
+	}
+	for i, reg := range players {
+		got, err := svc.PlayerByPublicID(ctx, tid, reg.Player.PublicID)
+		if err != nil {
+			t.Fatalf("重讀 %d: %v", i, err)
+		}
+		if want := fmt.Sprintf("各改各的-%d", i); got.DisplayName != want {
+			t.Fatalf("選手 %d 的內容被別人蓋掉了:got %q want %q", i, got.DisplayName, want)
+		}
+	}
+}
+
+// 連點儲存鈕:同一列被自己併發覆寫,結果必須是那份內容本身,
+// 不是欄位東一半西一半的混合體。**刻意不加冪等鍵** —— 這是冪等的覆寫,
+// 送兩次與送一次的結果相同(與報名靠 UNIQUE 擋連點是不同的情況)。
+func TestConcurrentSaveRegistrationSameRowIsIdempotent(t *testing.T) {
+	setup(t)
+	ctx := context.Background()
+	tid := newTournament(t, tournament.PhaseSignup)
+	id := gameID("連點儲存")
+
+	reg, err := svc.CreateRegistration(ctx, regParams(tid, id))
+	if err != nil {
+		t.Fatalf("報名: %v", err)
+	}
+
+	const n = 4
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, errs[i] = svc.SaveRegistration(ctx, saveParams(tid, reg.Player.ID, reg.Fencer.ID))
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("連點第 %d 次: %v", i, err)
+		}
+	}
+	got, err := svc.PlayerByPublicID(ctx, tid, reg.Player.PublicID)
+	if err != nil {
+		t.Fatalf("重讀: %v", err)
+	}
+	want := saveParams(tid, reg.Player.ID, reg.Fencer.ID).Fields
+	if got.DisplayName != want.DisplayName || got.DiscordName != want.DiscordName ||
+		got.ArtsNote != want.ArtsNote || got.LadderScore != want.LadderScore {
+		t.Fatalf("連點後的內容不是送出的那一份: %+v", got)
+	}
+}

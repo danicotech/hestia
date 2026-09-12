@@ -33,19 +33,19 @@ func NewService(repo Repo, hasher *Hasher) *Service {
 	return &Service{repo: repo, hasher: hasher}
 }
 
-// RegisterParams 是一份報名表。
+// RegistrationFields 是報名表上「選手自己填的那幾欄」。
 //
-// **只有 GameID 是必填的**(2026-09-13 定案,推翻了 Discord 名稱必填)。
-// 其餘每一欄留空都能報名成功 —— 報名的門檻要低到「知道自己遊戲ID 就能報」,
-// 每多一個必填欄位就在報名頁上攔掉一部分人。
+// 它獨立成一個型別,是因為有**兩條路**寫得到同一組欄位:報名(Register)
+// 與報名期內的修改(UpdateRegistration)。兩邊各抄一份欄位清單與一份整理規則,
+// 結果是有一天改了其中一邊的長度上限 —— 而那正是鐵則 9 要避免的重複。
 //
-// 選填的那些是**給裁判評段用的參考資料**:評段要綜合論劍段位、積分、實戰經驗與
-// 整體 PVP 實力,所以表單問得比「你叫什麼」多;問得多不等於要求得多,
-// 沒填就是裁判少一份參考。
-type RegisterParams struct {
-	TournamentSlug string
-	// GameID 全服唯一,**唯一必填欄位**。報過往屆的話會自動接上既有的選手檔案。
-	GameID string
+// **GameID 不在裡面,而且不要加進來。** 它是登入用的身分、也是 fencers 的
+// 自然鍵:改它等於換一個人。報名時它是獨立的必填參數,修改時它根本不開放。
+//
+// 每一欄都是選填。選填的那些是**給裁判評段用的參考資料**:評段要綜合論劍段位、
+// 積分、實戰經驗與整體 PVP 實力,所以表單問得比「你叫什麼」多;
+// 問得多不等於要求得多,沒填就是裁判少一份參考。
+type RegistrationFields struct {
 	// DisplayName 留空則沿用 GameID。
 	DisplayName string
 	// DiscordName 選填。裁判聯絡選手(排輪次、通知封盤)用,沒填就只能在遊戲裡找人 ——
@@ -58,6 +58,60 @@ type RegisterParams struct {
 	LadderScore      int32
 	ArtsNote         string
 	AvailabilityNote string
+}
+
+// normalize 整理並驗證一份報名欄位,回傳可以直接寫進資料庫的版本。
+//
+// 這是**唯一**一份整理規則,報名與修改共用(見型別註解)。
+// gameID 是 DisplayName 留空時的退路 —— 對戰表上不能有一列沒有名字。
+func (f RegistrationFields) normalize(gameID string) (RegistrationFields, error) {
+	out := RegistrationFields{
+		// Discord 名稱選填(2026-09-13)。空字串是合法值,照樣寫進去 ——
+		// discord_name 是 NOT NULL,而 adapter 那句 NULLIF/COALESCE 會處理
+		// 「沒填就別洗掉跨屆檔案上原有的那一份」。
+		DiscordName:      strings.TrimSpace(f.DiscordName),
+		DisplayName:      strings.TrimSpace(f.DisplayName),
+		SelfRatedRank:    f.SelfRatedRank,
+		LadderRank:       strings.TrimSpace(f.LadderRank),
+		LadderScore:      f.LadderScore,
+		ArtsNote:         strings.TrimSpace(f.ArtsNote),
+		AvailabilityNote: strings.TrimSpace(f.AvailabilityNote),
+	}
+	if out.DisplayName == "" {
+		out.DisplayName = gameID
+	}
+	if out.SelfRatedRank != bp.RankUnspecified && !out.SelfRatedRank.Valid() {
+		return RegistrationFields{}, fmt.Errorf("%w: 自評段位 %d", tournament.ErrInvalidRank, out.SelfRatedRank)
+	}
+	if out.LadderScore < 0 {
+		// 論劍積分不會是負的;與其拒絕整份報名表,不如當成沒填 ——
+		// 這個欄位只是評段的參考,不值得為它把一個人擋在門外。
+		out.LadderScore = 0
+	}
+	if err := errors.Join(
+		checkLen("display_name", out.DisplayName, maxDisplayNameLen),
+		checkLen("discord_name", out.DiscordName, maxDiscordNameLen),
+		checkLen("ladder_rank", out.LadderRank, maxLadderRankLen),
+		checkLen("arts_note", out.ArtsNote, maxNoteLen),
+		checkLen("availability_note", out.AvailabilityNote, maxNoteLen),
+	); err != nil {
+		return RegistrationFields{}, err
+	}
+	return out, nil
+}
+
+// RegisterParams 是一份報名表。
+//
+// **只有 GameID 是必填的**(2026-09-13 定案,推翻了 Discord 名稱必填)。
+// 其餘每一欄留空都能報名成功 —— 報名的門檻要低到「知道自己遊戲ID 就能報」,
+// 每多一個必填欄位就在報名頁上攔掉一部分人。
+type RegisterParams struct {
+	TournamentSlug string
+	// GameID 全服唯一,**唯一必填欄位**。報過往屆的話會自動接上既有的選手檔案。
+	GameID string
+	// RegistrationFields 是選手自己填的那幾欄,與 UpdateRegistration 共用同一份
+	// 定義與同一份整理規則。
+	RegistrationFields
 }
 
 // RegisterResult 是報名的結果。
@@ -89,33 +143,10 @@ func (s *Service) Register(ctx context.Context, p RegisterParams) (*RegisterResu
 	if err != nil {
 		return nil, err
 	}
-	// Discord 名稱選填(2026-09-13)。空字串是合法值,照樣寫進去 ——
-	// discord_name 是 NOT NULL,而 adapter 那句 NULLIF/COALESCE 會處理
-	// 「沒填就別洗掉跨屆檔案上原有的那一份」。
-	discordName := strings.TrimSpace(p.DiscordName)
-	displayName := strings.TrimSpace(p.DisplayName)
-	if displayName == "" {
-		displayName = gameID
-	}
-	if p.SelfRatedRank != bp.RankUnspecified && !p.SelfRatedRank.Valid() {
-		return nil, fmt.Errorf("%w: 自評段位 %d", tournament.ErrInvalidRank, p.SelfRatedRank)
-	}
-	ladderScore := p.LadderScore
-	if ladderScore < 0 {
-		// 論劍積分不會是負的;與其拒絕整份報名表,不如當成沒填 ——
-		// 這個欄位只是評段的參考,不值得為它把一個人擋在門外。
-		ladderScore = 0
-	}
-	ladderRank := strings.TrimSpace(p.LadderRank)
-	artsNote := strings.TrimSpace(p.ArtsNote)
-	availabilityNote := strings.TrimSpace(p.AvailabilityNote)
-	if err := errors.Join(
-		checkLen("display_name", displayName, maxDisplayNameLen),
-		checkLen("discord_name", discordName, maxDiscordNameLen),
-		checkLen("ladder_rank", ladderRank, maxLadderRankLen),
-		checkLen("arts_note", artsNote, maxNoteLen),
-		checkLen("availability_note", availabilityNote, maxNoteLen),
-	); err != nil {
+	// normalize 是從內嵌的 RegistrationFields 提升上來的 —— 報名與修改共用
+	// 同一份整理規則,這裡不會有第二套。
+	fields, err := p.normalize(gameID)
+	if err != nil {
 		return nil, err
 	}
 
@@ -143,14 +174,14 @@ func (s *Service) Register(ctx context.Context, p RegisterParams) (*RegisterResu
 		TournamentID:     t.ID,
 		RequirePhase:     tournament.PhaseSignup,
 		GameID:           gameID,
-		DisplayName:      displayName,
-		DiscordName:      discordName,
+		DisplayName:      fields.DisplayName,
+		DiscordName:      fields.DiscordName,
 		PasscodeHash:     hash,
-		SelfRatedRank:    p.SelfRatedRank,
-		LadderRank:       ladderRank,
-		LadderScore:      ladderScore,
-		ArtsNote:         artsNote,
-		AvailabilityNote: availabilityNote,
+		SelfRatedRank:    fields.SelfRatedRank,
+		LadderRank:       fields.LadderRank,
+		LadderScore:      fields.LadderScore,
+		ArtsNote:         fields.ArtsNote,
+		AvailabilityNote: fields.AvailabilityNote,
 	})
 	if err != nil {
 		return nil, err
@@ -162,6 +193,101 @@ func (s *Service) Register(ctx context.Context, p RegisterParams) (*RegisterResu
 		ReturningFencer: reg.ReturningFencer,
 		PreviousRank:    reg.PreviousRank,
 	}, nil
+}
+
+// FieldsFromPlayer 讀出一位選手目前填的那份報名資料。
+//
+// 存在的理由是對稱:UpdateRegistration 寫進去的那幾欄,要有一個地方負責
+// 再讀回來(GetMyPlayer 要回「我填了什麼」)。讓 transport 自己從 Player
+// 挑欄位的話,「哪些欄位算是選手自己填的」就有了第二個權威位置 ——
+// 而那份清單正是日後最容易漏改的東西(加一欄就會有一邊忘了加)。
+func FieldsFromPlayer(p tournament.Player) RegistrationFields {
+	return RegistrationFields{
+		DisplayName:      p.DisplayName,
+		DiscordName:      p.DiscordName,
+		SelfRatedRank:    p.SelfRatedRank,
+		LadderRank:       p.LadderRank,
+		LadderScore:      p.LadderScore,
+		ArtsNote:         p.ArtsNote,
+		AvailabilityNote: p.AvailabilityNote,
+	}
+}
+
+// UpdateRegistrationParams 是選手修改自己的報名資料。
+//
+// **沒有 GameID。** 遊戲ID 是登入用的身分、fencers 的自然鍵、對戰表上的辨識名,
+// 改它等於換一個人 —— 既有的 session、往屆戰績、已公布的名字會一起換掉。
+// 要改由裁判處理,不是自助。
+//
+// PlayerPublicID 必須來自**活動層 session**,不是請求 body:遊戲ID 是公開資訊,
+// 誰都登得進誰的帳號,所以「改誰」如果由請求指定,這支就成了一支
+// 「改任何人的報名表」的 API。
+type UpdateRegistrationParams struct {
+	TournamentSlug string
+	PlayerPublicID string
+	// Fields 是送什麼就是最終值 —— 留空代表清掉那一欄,不是「不動那一欄」。
+	// 沒有 field mask:這是一份完整的報名表,前端讀回整份、改幾欄、整份送回。
+	Fields RegistrationFields
+}
+
+// UpdateRegistrationResult 是修改後的結果。
+type UpdateRegistrationResult struct {
+	Player tournament.Player
+	// Fields 是伺服器整理過之後真正寫進去的內容(去空白、留空補 game_id、
+	// 負分歸零)。回這一份而不是讓呼叫端沿用自己送的,整理規則才只有一個權威。
+	Fields RegistrationFields
+}
+
+// UpdateRegistration 讓選手改自己那一列報名資料。
+//
+// # 只在報名期開放
+//
+// 報名期一過,這份資料就是御風羽評段的依據 —— 改了等於在裁判眼皮底下換材料。
+// 階段由**伺服器**驗,而且與 Register 同樣**檢查兩次**:這裡讀一次,
+// 寫入時帶著 RequirePhase 讓 SQL 的 WHERE 再擋一次(裁判剛好在那一瞬封閉報名時,
+// 沒有第二道就會漏進一筆)。
+//
+// # 驗證與報名同一份
+//
+// 長度上限、留空補 game_id、負分歸零全部走 RegistrationFields.normalize ——
+// 「報名時填得進去的東西,改的時候也填得進去」不是巧合,是同一段程式碼。
+//
+// # 不碰 status、rank、seed_no
+//
+// 那三欄是裁判的處置,不是選手填的內容。它們不在 RegistrationFields 裡,
+// 所以這條路徑在型別上就碰不到。
+func (s *Service) UpdateRegistration(
+	ctx context.Context, p UpdateRegistrationParams,
+) (*UpdateRegistrationResult, error) {
+	t, err := s.repo.TournamentBySlug(ctx, p.TournamentSlug)
+	if err != nil {
+		return nil, err
+	}
+	if err := tournament.RequirePhase(t.Phase, tournament.PhaseSignup); err != nil {
+		return nil, err
+	}
+	// 先讀出這一列:DisplayName 留空要退回 game_id,而 game_id 只有這裡查得到。
+	// 順帶確認「這個 public_id 真的屬於這一屆」——舊屆的 session 拿不到新屆的列。
+	player, err := s.repo.PlayerByPublicID(ctx, t.ID, p.PlayerPublicID)
+	if err != nil {
+		return nil, err
+	}
+	fields, err := p.Fields.normalize(player.GameID)
+	if err != nil {
+		return nil, err
+	}
+
+	updated, err := s.repo.SaveRegistration(ctx, SaveRegistrationParams{
+		TournamentID: t.ID,
+		PlayerID:     player.ID,
+		FencerID:     player.FencerID,
+		RequirePhase: tournament.PhaseSignup,
+		Fields:       fields,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &UpdateRegistrationResult{Player: updated, Fields: FieldsFromPlayer(updated)}, nil
 }
 
 // LoginParams 是一次選手登入。**沒有通行碼欄位**,見 Login。

@@ -22,6 +22,9 @@ type fakeActivitySignup struct {
 	regResult  *signup.RegisterResult
 	regErr     error
 
+	updated   []signup.UpdateRegistrationParams
+	updateErr error
+
 	logins   []signup.LoginParams
 	loginRes *tournament.Player
 	loginErr error
@@ -43,6 +46,28 @@ func (f *fakeActivitySignup) Register(
 		return nil, f.regErr
 	}
 	return f.regResult, nil
+}
+
+// UpdateRegistration 回一份「伺服器整理過」的結果:整理規則的權威在領域層,
+// 這個 fake 只負責把送進來的原樣回去,讓入口層的轉換被真的驗到。
+func (f *fakeActivitySignup) UpdateRegistration(
+	_ context.Context, p signup.UpdateRegistrationParams,
+) (*signup.UpdateRegistrationResult, error) {
+	f.updated = append(f.updated, p)
+	if f.updateErr != nil {
+		return nil, f.updateErr
+	}
+	player := testPlayer(p.PlayerPublicID, bp.RankUnspecified, nil)
+	player.DisplayName = p.Fields.DisplayName
+	player.DiscordName = p.Fields.DiscordName
+	player.SelfRatedRank = p.Fields.SelfRatedRank
+	player.LadderRank = p.Fields.LadderRank
+	player.LadderScore = p.Fields.LadderScore
+	player.ArtsNote = p.Fields.ArtsNote
+	player.AvailabilityNote = p.Fields.AvailabilityNote
+	return &signup.UpdateRegistrationResult{
+		Player: player, Fields: signup.FieldsFromPlayer(player),
+	}, nil
 }
 
 func (f *fakeActivitySignup) Login(
@@ -399,4 +424,165 @@ func findSetCookie(t *testing.T, header http.Header, name string) *http.Cookie {
 	}
 	t.Fatalf("回應裡沒有 %s 這個 Set-Cookie(有的是 %v)", name, header.Values("Set-Cookie"))
 	return nil
+}
+
+// ── 查看與修改自己的報名資料 ────────────────────────────────────
+
+// GetMyPlayer 要帶回「我填了什麼」:Player 只有對戰表要顯示的那幾欄,
+// 論劍積分、常用武學、可出賽時段只有本人看得到 —— 少了這一份,
+// 選手進站之後就沒有任何地方看得到自己的報名內容。
+func TestGetMyPlayerReturnsMyRegistration(t *testing.T) {
+	deps, _, _, reader := signupDeps()
+	p := testPlayer(testPlayerAID, bp.RankKaishan, nil)
+	p.DisplayName = "御風羽"
+	p.DiscordName = "yufengyu#0001"
+	p.SelfRatedRank = bp.RankDuanshui
+	p.LadderRank = "論劍·地榜"
+	p.LadderScore = 1820
+	p.ArtsNote = "常用太虛劍意"
+	p.AvailabilityNote = "平日晚上"
+	reader.playerByPublic[testPlayerAID] = p
+	srv := newActivityServer(t, deps)
+	client := activityv1connect.NewSignupServiceClient(srv.Client(), srv.URL)
+
+	got, err := client.GetMyPlayer(context.Background(),
+		withPlayerSession(connect.NewRequest(&activityv1.GetMyPlayerRequest{}), testSessionTok))
+	if err != nil {
+		t.Fatalf("GetMyPlayer: %v", err)
+	}
+	reg := got.Msg.GetRegistration()
+	if reg == nil {
+		t.Fatal("registration 缺席:進站之後看不到自己填了什麼")
+	}
+	if reg.GetDisplayName() != "御風羽" || reg.GetDiscordName() != "yufengyu#0001" ||
+		reg.GetSelfRatedRank() != activityv1.Rank_RANK_DUANSHUI ||
+		reg.GetLadderRank() != "論劍·地榜" || reg.GetLadderScore() != 1820 ||
+		reg.GetArtsNote() != "常用太虛劍意" || reg.GetAvailabilityNote() != "平日晚上" {
+		t.Fatalf("讀回來的內容與報名時送進去的不一致:%+v", reg)
+	}
+}
+
+// 改的對象只來自 session:請求裡沒有「改誰」,拿 A 的 session 就只動得了 A。
+func TestUpdateRegistrationTargetsSessionPlayerOnly(t *testing.T) {
+	deps, svc, sessions, _ := signupDeps()
+	// B 的 session 指向另一位選手,拿它來證明對象確實跟著 session 走。
+	const otherTok = "token-B"
+	sessions.byToken[otherTok] = ActivityIdentity{
+		TournamentSlug: testSlug, PlayerPublicID: testPlayerBID,
+	}
+	srv := newActivityServer(t, deps)
+	client := activityv1connect.NewSignupServiceClient(srv.Client(), srv.URL)
+
+	body := &activityv1.MyRegistration{
+		DisplayName:   "斷水",
+		DiscordName:   "duanshui#0002",
+		SelfRatedRank: activityv1.Rank_RANK_KAISHAN,
+		LadderRank:    "論劍·天榜",
+		LadderScore:   2100,
+		ArtsNote:      "改用問水劍法",
+	}
+	got, err := client.UpdateRegistration(context.Background(), withPlayerSession(
+		connect.NewRequest(&activityv1.UpdateRegistrationRequest{Registration: body}), testSessionTok))
+	if err != nil {
+		t.Fatalf("UpdateRegistration: %v", err)
+	}
+	if len(svc.updated) != 1 {
+		t.Fatalf("領域層收到 %d 次修改", len(svc.updated))
+	}
+	if svc.updated[0].PlayerPublicID != testPlayerAID || svc.updated[0].TournamentSlug != testSlug {
+		t.Fatalf("對象應取自 session:%+v", svc.updated[0])
+	}
+	// 欄位原樣下送,入口層不補任何預設值(整理規則的權威在領域層)。
+	if svc.updated[0].Fields.SelfRatedRank != bp.RankKaishan ||
+		svc.updated[0].Fields.LadderScore != 2100 ||
+		svc.updated[0].Fields.ArtsNote != "改用問水劍法" {
+		t.Fatalf("欄位轉換錯誤:%+v", svc.updated[0].Fields)
+	}
+	if got.Msg.GetRegistration().GetDisplayName() != "斷水" {
+		t.Fatalf("回應要帶伺服器整理後的那一份:%+v", got.Msg.GetRegistration())
+	}
+
+	// 換成 B 的 session:改到的是 B 那一列,A 的內容與這次請求無關。
+	if _, err := client.UpdateRegistration(context.Background(), withPlayerSession(
+		connect.NewRequest(&activityv1.UpdateRegistrationRequest{Registration: body}), otherTok)); err != nil {
+		t.Fatalf("UpdateRegistration(B): %v", err)
+	}
+	if svc.updated[1].PlayerPublicID != testPlayerBID {
+		t.Fatalf("B 的 session 應該改到 B:%+v", svc.updated[1])
+	}
+}
+
+// 遊戲ID 不在可改欄位裡,而且不要加:它是登入用的身分,改它等於換一個人。
+// 這條盯著 proto —— 有人把 game_id 加回 MyRegistration 時它會紅。
+func TestUpdateRegistrationCannotChangeGameID(t *testing.T) {
+	fields := (&activityv1.MyRegistration{}).ProtoReflect().Descriptor().Fields()
+	for i := 0; i < fields.Len(); i++ {
+		if name := string(fields.Get(i).Name()); strings.Contains(name, "game_id") {
+			t.Fatalf("MyRegistration 不該有 %s:遊戲ID 是身分,要改由裁判處理", name)
+		}
+	}
+}
+
+// 沒有 session 一律 Unauthenticated —— 與 GetMyPlayer 同一條身分路徑。
+func TestUpdateRegistrationRequiresActivitySession(t *testing.T) {
+	deps, svc, _, _ := signupDeps()
+	srv := newActivityServer(t, deps)
+	client := activityv1connect.NewSignupServiceClient(srv.Client(), srv.URL)
+	req := func() *connect.Request[activityv1.UpdateRegistrationRequest] {
+		return connect.NewRequest(&activityv1.UpdateRegistrationRequest{
+			Registration: &activityv1.MyRegistration{DisplayName: "偷改的"},
+		})
+	}
+
+	_, err := client.UpdateRegistration(context.Background(), req())
+	requireCode(t, err, connect.CodeUnauthenticated)
+
+	// 只有平台帳號也不行:兩軌身分不能互相頂替。
+	_, err = client.UpdateRegistration(context.Background(), withUser(req(), testUserID))
+	requireCode(t, err, connect.CodeUnauthenticated)
+
+	// 壞掉的 token 同樣是未認證。
+	_, err = client.UpdateRegistration(context.Background(), withPlayerSession(req(), "偽造的-token"))
+	requireCode(t, err, connect.CodeUnauthenticated)
+
+	if len(svc.updated) != 0 {
+		t.Fatalf("沒有身分時不該碰領域層,卻呼叫了 %d 次", len(svc.updated))
+	}
+}
+
+// 階段限制由伺服器驗,不是前端把按鈕變灰 —— 入口層原樣轉發領域層的 ErrWrongPhase,
+// 並帶上穩定的 reason 讓前端挑文案。
+func TestUpdateRegistrationOutsideSignupPhase(t *testing.T) {
+	deps, svc, _, _ := signupDeps()
+	svc.updateErr = tournament.ErrWrongPhase
+	srv := newActivityServer(t, deps)
+	client := activityv1connect.NewSignupServiceClient(srv.Client(), srv.URL)
+
+	_, err := client.UpdateRegistration(context.Background(), withPlayerSession(
+		connect.NewRequest(&activityv1.UpdateRegistrationRequest{
+			Registration: &activityv1.MyRegistration{DisplayName: "太晚了"},
+		}), testSessionTok))
+	requireCode(t, err, connect.CodeFailedPrecondition)
+	if got := ErrorReason(err); got != "tournament_wrong_phase" {
+		t.Fatalf("reason = %q", got)
+	}
+}
+
+// 選填欄位清空是合法的:整份留空(甚至完全不帶 registration)要照樣下送,
+// 入口層不把「空的」當成「沒送」而擋下來。
+func TestUpdateRegistrationAllowsClearingFields(t *testing.T) {
+	deps, svc, _, _ := signupDeps()
+	srv := newActivityServer(t, deps)
+	client := activityv1connect.NewSignupServiceClient(srv.Client(), srv.URL)
+
+	if _, err := client.UpdateRegistration(context.Background(), withPlayerSession(
+		connect.NewRequest(&activityv1.UpdateRegistrationRequest{}), testSessionTok)); err != nil {
+		t.Fatalf("清空整份應該合法:%v", err)
+	}
+	if len(svc.updated) != 1 {
+		t.Fatalf("領域層收到 %d 次修改", len(svc.updated))
+	}
+	if svc.updated[0].Fields != (signup.RegistrationFields{}) {
+		t.Fatalf("入口層不該替留空的欄位補值:%+v", svc.updated[0].Fields)
+	}
 }

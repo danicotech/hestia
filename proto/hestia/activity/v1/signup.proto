@@ -27,8 +27,10 @@ syntax = "proto3";
 //
 // 通行碼沒有消失,只是不再是給選手看的東西:tournament_players.passcode_hash
 // 照舊產生並寫入(NOT NULL),它的同伴 passcode_issued_at 則是**已發出的
-// session 的作廢依據**。裁判的「重新產生通行碼」現在的意思是「把這個人
-// 現在所有的 session 全部踢掉」—— 棄賽之外的第二道槓桿。
+// session 的作廢依據**。裁判的「重新產生通行碼」會把這個人現在所有的
+// session 踢掉,但他可以立刻用遊戲ID 再進來 —— 那是「踢下線」,不是
+// 「擋在外面」。要擋在外面只有棄賽一條路,而棄賽單獨就夠(它同時讓
+// 現有 session 失效)。
 package hestia.activity.v1;
 
 import "hestia/activity/v1/common.proto";
@@ -45,6 +47,8 @@ service SignupService {
   rpc Logout(LogoutRequest) returns (LogoutResponse) {}
   // 取得目前登入的選手。
   rpc GetMyPlayer(GetMyPlayerRequest) returns (GetMyPlayerResponse) {}
+  // 修改自己的報名資料。只在 SIGNUP 階段開放,見 UpdateRegistrationRequest。
+  rpc UpdateRegistration(UpdateRegistrationRequest) returns (UpdateRegistrationResponse) {}
   // 把目前的活動層身分綁到平台帳號(領獎前必做)。
   rpc BindPlatformAccount(BindPlatformAccountRequest) returns (BindPlatformAccountResponse) {}
 }
@@ -127,6 +131,53 @@ message GetMyPlayerResponse {
   Tournament tournament = 2;
   // 目前輪到我打的比賽;空 = 沒有待打的場次(已出局、或還沒抽籤)。
   optional Match current_match = 3;
+  // 我報名時填了什麼。Player 只帶對戰表要顯示的那幾欄,
+  // 論劍積分、常用武學、可出賽時段這些只有本人看得到。
+  MyRegistration registration = 4;
+}
+
+// MyRegistration 是選手自己填的那些欄位。讀寫共用同一個訊息 ——
+// 「我填了什麼」與「我要改成什麼」是同一組東西,兩個訊息會漂。
+//
+// **game_id 刻意不在裡面,而且不要加。** 它是登入用的身分、也是 fencers 的
+// 自然鍵 —— 改它等於換一個人(既有的 session、往屆戰績、對戰表上的名字
+// 會一起換掉)。要改得由裁判處理,不是自助。
+//
+// 每一欄都是選填,**送什麼就是最終值**:留空代表「清掉這一欄」,
+// 不是「不動這一欄」。沒有 field mask —— 這張表是一份完整的報名資料,
+// 前端讀回整份、改幾欄、整份送回,沒有「只送改動部分」這個模式要支援。
+message MyRegistration {
+  // 顯示名。留空時伺服器沿用 game_id(與報名同一條規則)。
+  string display_name = 1;
+  // Discord 名稱。留空不會清掉跨屆檔案(fencers)上既有的那一份,
+  // 只清掉本屆的快照 —— 那份是裁判聯絡你的最後手段。
+  string discord_name = 2;
+  Rank self_rated_rank = 3;
+  string ladder_rank = 4;
+  // 遊戲內積分(0 = 沒填)。
+  int32 ladder_score = 5;
+  string arts_note = 6;
+  string availability_note = 7;
+}
+
+// UpdateRegistrationRequest 改自己那一列。
+//
+// **沒有「改誰」這個欄位**:對象一律是活動層 session 認定的那位選手。
+// 帶 player_public_id 進來就等於開一支「改任何人的報名表」的 API,
+// 而遊戲ID 是公開資訊,誰都登得進誰的帳號。
+//
+// 只在 SIGNUP 階段開放,**由伺服器驗**:報名期一過,這份資料就是御風羽
+// 評段的依據,改了等於在裁判眼皮底下換材料。階段不對回
+// tournament_wrong_phase。
+message UpdateRegistrationRequest {
+  MyRegistration registration = 1;
+}
+
+message UpdateRegistrationResponse {
+  Player player = 1;
+  // 伺服器整理過(去空白、留空補預設)之後的實際內容。
+  // 回這一份而不是讓前端沿用自己送的:整理規則的權威在伺服器。
+  MyRegistration registration = 2;
 }
 
 // BindPlatformAccountRequest 需要**同時**持有活動層 session(通行碼登入)

@@ -35,6 +35,7 @@ type fakeRepo struct {
 	nextID  int64
 
 	createCalls []CreateRegistrationParams
+	saveCalls   []SaveRegistrationParams
 	updateCalls []UpdatePasscodeParams
 	bindCalls   []BindParams
 	// lookups 數 PlayerByGameID 被叫了幾次:格式不合的登入不該打到資料庫。
@@ -117,6 +118,36 @@ func (f *fakeRepo) CreateRegistration(_ context.Context, p CreateRegistrationPar
 	}, nil
 }
 
+// SaveRegistration 貼著 adapter 被要求的行為:階段條件進 WHERE、只改那七欄、
+// discord_name 同步到 fencers 但空字串不覆寫。
+func (f *fakeRepo) SaveRegistration(_ context.Context, p SaveRegistrationParams) (tournament.Player, error) {
+	f.saveCalls = append(f.saveCalls, p)
+	// 對應 SQL 的 EXISTS (... WHERE phase = @require_phase)。
+	if p.RequirePhase != "" && f.tourn.Phase != p.RequirePhase {
+		return tournament.Player{}, tournament.ErrWrongPhase
+	}
+	for _, r := range f.rows {
+		if r.player.ID != p.PlayerID || r.player.TournamentID != p.TournamentID {
+			continue
+		}
+		r.player.DisplayName = p.Fields.DisplayName
+		r.player.DiscordName = p.Fields.DiscordName
+		r.player.SelfRatedRank = p.Fields.SelfRatedRank
+		r.player.LadderRank = p.Fields.LadderRank
+		r.player.LadderScore = p.Fields.LadderScore
+		r.player.ArtsNote = p.Fields.ArtsNote
+		r.player.AvailabilityNote = p.Fields.AvailabilityNote
+		// 跨屆檔案:空字串不覆寫(COALESCE(NULLIF(...), discord_name))。
+		for _, fe := range f.fencers {
+			if fe.ID == p.FencerID && p.Fields.DiscordName != "" {
+				fe.DiscordName = p.Fields.DiscordName
+			}
+		}
+		return r.player, nil
+	}
+	return tournament.Player{}, tournament.ErrPlayerNotFound
+}
+
 // PlayerByGameID 刻意**不看 status** —— adapter 也不看(誰登得進來由 Service 決定)。
 func (f *fakeRepo) PlayerByGameID(_ context.Context, tournamentID int64, gameID string) (tournament.Player, error) {
 	f.lookups++
@@ -193,8 +224,14 @@ func newTestService(t *testing.T, phase tournament.Phase) (*Service, *fakeRepo) 
 
 func validRegistration(gameID string) RegisterParams {
 	return RegisterParams{
-		TournamentSlug:   testSlug,
-		GameID:           gameID,
+		TournamentSlug:     testSlug,
+		GameID:             gameID,
+		RegistrationFields: validFields(),
+	}
+}
+
+func validFields() RegistrationFields {
+	return RegistrationFields{
 		DisplayName:      "御風羽",
 		DiscordName:      "yufengyu#0001",
 		SelfRatedRank:    bp.RankDuanshui,
@@ -795,6 +832,228 @@ func TestBindPlatformAccountRequiresUser(t *testing.T) {
 		t.Errorf("要回 ErrUserRequired,得到 %v", err)
 	}
 	if len(repo.bindCalls) != 0 {
+		t.Error("不該寫入")
+	}
+}
+
+// ── 修改報名資料 ──────────────────────────────────────────────
+
+// 報名時送進去的東西要一字不差地讀得回來 —— 進站之後看不到自己填了什麼,
+// 就不可能發現填錯了。
+func TestFieldsFromPlayerRoundTripsRegistration(t *testing.T) {
+	t.Parallel()
+
+	s, _ := newTestService(t, tournament.PhaseSignup)
+	res, err := s.Register(context.Background(), validRegistration("御風羽"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := FieldsFromPlayer(res.Player), validFields(); got != want {
+		t.Errorf("讀回來的報名內容與送進去的不一致:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+func TestUpdateRegistrationWritesNewValues(t *testing.T) {
+	t.Parallel()
+
+	s, repo := newTestService(t, tournament.PhaseSignup)
+	ctx := context.Background()
+	res, err := s.Register(ctx, validRegistration("御風羽"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := RegistrationFields{
+		DisplayName:      "斷水",
+		DiscordName:      "duanshui#0002",
+		SelfRatedRank:    bp.RankKaishan,
+		LadderRank:       "論劍·天榜",
+		LadderScore:      2100,
+		ArtsNote:         "改用問水劍法",
+		AvailabilityNote: "週末整天",
+	}
+	updated, err := s.UpdateRegistration(ctx, UpdateRegistrationParams{
+		TournamentSlug: testSlug, PlayerPublicID: res.Player.PublicID, Fields: want,
+	})
+	if err != nil {
+		t.Fatalf("報名期修改應該成功:%v", err)
+	}
+	if got := FieldsFromPlayer(updated.Player); got != want {
+		t.Errorf("改完的內容不對:\n got %+v\nwant %+v", got, want)
+	}
+	if updated.Fields != want {
+		t.Errorf("回傳的 Fields 應是伺服器整理後的實際值:%+v", updated.Fields)
+	}
+	// 遊戲ID 是身分,不在可改欄位裡 —— 型別上就碰不到,這裡確認它真的沒動。
+	if updated.Player.GameID != "御風羽" {
+		t.Errorf("遊戲ID 不該被修改,得到 %q", updated.Player.GameID)
+	}
+	if len(repo.saveCalls) != 1 || repo.saveCalls[0].RequirePhase != tournament.PhaseSignup {
+		t.Errorf("階段條件必須進寫入層(第二道防線):%+v", repo.saveCalls)
+	}
+	// 跨屆檔案上的聯絡方式要跟著改,否則裁判下一屆照樣聯絡不到人。
+	if fe := repo.fencerByGameID("御風羽"); fe.DiscordName != want.DiscordName {
+		t.Errorf("fencers.discord_name 未同步,得到 %q", fe.DiscordName)
+	}
+}
+
+// 選填欄位清空是合法的:表單上填錯的東西要能刪掉,不是只能改成別的字。
+// display_name 清空則退回 game_id —— 對戰表上不能有一列沒有名字。
+func TestUpdateRegistrationAllowsClearingOptionalFields(t *testing.T) {
+	t.Parallel()
+
+	s, repo := newTestService(t, tournament.PhaseSignup)
+	ctx := context.Background()
+	res, err := s.Register(ctx, validRegistration("御風羽"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := s.UpdateRegistration(ctx, UpdateRegistrationParams{
+		TournamentSlug: testSlug, PlayerPublicID: res.Player.PublicID,
+	})
+	if err != nil {
+		t.Fatalf("清空選填欄位應該合法:%v", err)
+	}
+	if updated.Fields.DisplayName != "御風羽" {
+		t.Errorf("顯示名留空要退回遊戲ID,得到 %q", updated.Fields.DisplayName)
+	}
+	if updated.Fields.LadderRank != "" || updated.Fields.LadderScore != 0 ||
+		updated.Fields.ArtsNote != "" || updated.Fields.AvailabilityNote != "" ||
+		updated.Fields.SelfRatedRank != bp.RankUnspecified {
+		t.Errorf("選填欄位應該被清掉:%+v", updated.Fields)
+	}
+	// **但空字串不洗掉跨屆檔案上的聯絡方式** —— 本屆不想公開,不等於
+	// 把往屆留下的那一份也丟了。
+	if fe := repo.fencerByGameID("御風羽"); fe.DiscordName != "yufengyu#0001" {
+		t.Errorf("空字串不該洗掉 fencers 既有的值,得到 %q", fe.DiscordName)
+	}
+}
+
+// 報名期以外一律改不動 —— 之後這份資料就是御風羽評段的依據。
+func TestUpdateRegistrationOnlyInSignupPhase(t *testing.T) {
+	t.Parallel()
+
+	for _, phase := range []tournament.Phase{
+		tournament.PhaseRanking, tournament.PhaseRanked, tournament.PhaseDrawing,
+		tournament.PhaseInProgress, tournament.PhaseFinished,
+	} {
+		t.Run(string(phase), func(t *testing.T) {
+			t.Parallel()
+
+			s, repo := newTestService(t, tournament.PhaseSignup)
+			ctx := context.Background()
+			res, err := s.Register(ctx, validRegistration("御風羽"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			repo.tourn.Phase = phase
+
+			_, err = s.UpdateRegistration(ctx, UpdateRegistrationParams{
+				TournamentSlug: testSlug,
+				PlayerPublicID: res.Player.PublicID,
+				Fields:         RegistrationFields{DisplayName: "偷改的"},
+			})
+			if !errors.Is(err, tournament.ErrWrongPhase) {
+				t.Fatalf("%s 階段要回 ErrWrongPhase,得到 %v", phase, err)
+			}
+			if len(repo.saveCalls) != 0 {
+				t.Errorf("階段不對時不該寫入,卻呼叫了 %d 次", len(repo.saveCalls))
+			}
+			if repo.rows[0].player.DisplayName != "御風羽" {
+				t.Errorf("內容不該被改動,得到 %q", repo.rows[0].player.DisplayName)
+			}
+		})
+	}
+}
+
+// 拿 A 的身分改不動 B 那一列。這支 RPC 的對象只來自 session,
+// 所以「改別人」在這一層根本沒有入口 —— 這條測的是那件事仍然成立。
+func TestUpdateRegistrationTouchesOnlyOwnRow(t *testing.T) {
+	t.Parallel()
+
+	s, repo := newTestService(t, tournament.PhaseSignup)
+	ctx := context.Background()
+	a, err := s.Register(ctx, validRegistration("御風羽"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.Register(ctx, validRegistration("聽雪樓"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpdateRegistration(ctx, UpdateRegistrationParams{
+		TournamentSlug: testSlug,
+		PlayerPublicID: a.Player.PublicID,
+		Fields:         RegistrationFields{DisplayName: "只有我改了"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range repo.rows {
+		if r.player.PublicID != b.Player.PublicID {
+			continue
+		}
+		if r.player.DisplayName != "御風羽" || r.player.ArtsNote != "常用太虛劍意" {
+			t.Errorf("別人那一列被動到了:%+v", r.player)
+		}
+	}
+	if repo.saveCalls[0].PlayerID != a.Player.ID {
+		t.Errorf("寫入的是 %d,應該是自己那一列 %d", repo.saveCalls[0].PlayerID, a.Player.ID)
+	}
+}
+
+// 長度上限與報名同一份規則(RegistrationFields.normalize),不是另寫一套。
+func TestUpdateRegistrationReusesRegistrationValidation(t *testing.T) {
+	t.Parallel()
+
+	s, repo := newTestService(t, tournament.PhaseSignup)
+	ctx := context.Background()
+	res, err := s.Register(ctx, validRegistration("御風羽"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tooLong := RegistrationFields{DisplayName: strings.Repeat("長", maxDisplayNameLen+1)}
+	if _, err := s.UpdateRegistration(ctx, UpdateRegistrationParams{
+		TournamentSlug: testSlug, PlayerPublicID: res.Player.PublicID, Fields: tooLong,
+	}); !errors.Is(err, ErrFieldTooLong) {
+		t.Errorf("超長欄位要回 ErrFieldTooLong,得到 %v", err)
+	}
+
+	badRank := RegistrationFields{SelfRatedRank: bp.Rank(9)}
+	if _, err := s.UpdateRegistration(ctx, UpdateRegistrationParams{
+		TournamentSlug: testSlug, PlayerPublicID: res.Player.PublicID, Fields: badRank,
+	}); !errors.Is(err, tournament.ErrInvalidRank) {
+		t.Errorf("段位不合法要回 ErrInvalidRank,得到 %v", err)
+	}
+
+	// 負分當成沒填(與報名同一條:不為一個參考欄位擋下整份表單)。
+	got, err := s.UpdateRegistration(ctx, UpdateRegistrationParams{
+		TournamentSlug: testSlug, PlayerPublicID: res.Player.PublicID,
+		Fields: RegistrationFields{LadderScore: -5},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Fields.LadderScore != 0 {
+		t.Errorf("負分要歸零,得到 %d", got.Fields.LadderScore)
+	}
+	if len(repo.saveCalls) != 1 {
+		t.Errorf("驗證失敗的兩次不該碰到寫入層,共寫了 %d 次", len(repo.saveCalls))
+	}
+}
+
+// 拿不屬於這一屆的 public_id 進來,是查無此選手而不是悄悄改到別屆的列。
+func TestUpdateRegistrationUnknownPlayer(t *testing.T) {
+	t.Parallel()
+
+	s, repo := newTestService(t, tournament.PhaseSignup)
+	_, err := s.UpdateRegistration(context.Background(), UpdateRegistrationParams{
+		TournamentSlug: testSlug, PlayerPublicID: "P99", Fields: validFields(),
+	})
+	if !errors.Is(err, tournament.ErrPlayerNotFound) {
+		t.Errorf("要回 ErrPlayerNotFound,得到 %v", err)
+	}
+	if len(repo.saveCalls) != 0 {
 		t.Error("不該寫入")
 	}
 }
