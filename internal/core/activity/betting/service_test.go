@@ -174,9 +174,6 @@ func TestPlaceBet扣款與鎖定賠率(t *testing.T) {
 	}
 
 	// 下注要能被通知到,不然使用者只會看到餘額莫名其妙變了。
-	if got := db.topics(); !slices.Equal(got, []string{TopicBetPlaced}) {
-		t.Fatalf("outbox = %v,want [bet.placed]", got)
-	}
 }
 
 // 連點的核心測試:同一把鍵送兩次,只扣一次款、只有一張注單。
@@ -212,9 +209,6 @@ func TestPlaceBet冪等重送不重複扣款(t *testing.T) {
 		t.Fatalf("SUM(entries) = %d,want -100", db.sumEntries(bettor))
 	}
 	// 重放不該再發一次通知。
-	if got := db.topics(); !slices.Equal(got, []string{TopicBetPlaced}) {
-		t.Fatalf("outbox = %v,want 只有一筆 bet.placed", got)
-	}
 }
 
 // 併發連點。fake 的 InTx 是互斥的,所以這測的是「兩個 tx 不交錯時冪等是否正確」,
@@ -443,9 +437,6 @@ func TestPlaceBet餘額不足時整筆消失(t *testing.T) {
 	if len(db.bets) != 0 || len(db.legs) != 0 {
 		t.Fatalf("留下了 %d 張注單 / %d 條腿,want 0", len(db.bets), len(db.legs))
 	}
-	if len(db.events) != 0 {
-		t.Fatalf("留下了 %d 筆 outbox,want 0", len(db.events))
-	}
 	// 冪等鍵也必須一起消失,否則合法的重試會被當成重放而永遠下不了注。
 	if len(db.idem) != 0 {
 		t.Fatalf("留下了 %d 把冪等鍵,want 0", len(db.idem))
@@ -593,9 +584,6 @@ func TestSettleMatch全腿贏就派彩(t *testing.T) {
 	}
 	if b := db.betByPublicID("BET1"); b.SettledAt == nil {
 		t.Fatal("settled_at 仍是 NULL,違反 bets_settled_at_check")
-	}
-	if !slices.Equal(db.topics(), []string{TopicBetPlaced, TopicBetSettled}) {
-		t.Fatalf("outbox = %v", db.topics())
 	}
 	if !slices.Equal(db.advisoryLocks, []int64{1}) {
 		t.Fatalf("advisory lock = %v,want [1]", db.advisoryLocks)
@@ -778,9 +766,6 @@ func TestVoidMatch單場全額退(t *testing.T) {
 	}
 	if b.PayoutRecalculated {
 		t.Fatal("單場全退沒有重算金額,payout_recalculated 不該是 true")
-	}
-	if !slices.Equal(db.topics(), []string{TopicBetPlaced, TopicBetVoided}) {
-		t.Fatalf("outbox = %v", db.topics())
 	}
 }
 

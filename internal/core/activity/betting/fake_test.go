@@ -45,7 +45,6 @@ type fakeDB struct {
 	idem        map[string]*IdempotencyRecord
 	bets        map[int64]*Bet
 	legs        map[int64]*Leg
-	events      []Event
 
 	balances   map[int64]int64
 	entries    []fakeEntry
@@ -82,7 +81,6 @@ type dbState struct {
 	idem       map[string]*IdempotencyRecord
 	bets       map[int64]*Bet
 	legs       map[int64]*Leg
-	events     []Event
 	balances   map[int64]int64
 	entries    []fakeEntry
 	ledgerKeys map[string]*ledger.ApplyResult
@@ -96,7 +94,6 @@ func (d *fakeDB) snapshot() dbState {
 		idem:       cloneIdem(d.idem),
 		bets:       clonePtrMap(d.bets),
 		legs:       clonePtrMap(d.legs),
-		events:     slices.Clone(d.events),
 		balances:   maps.Clone(d.balances),
 		entries:    slices.Clone(d.entries),
 		ledgerKeys: maps.Clone(d.ledgerKeys),
@@ -107,7 +104,7 @@ func (d *fakeDB) snapshot() dbState {
 
 func (d *fakeDB) restore(s dbState) {
 	d.votes, d.idem, d.bets, d.legs = s.votes, s.idem, s.bets, s.legs
-	d.events, d.balances, d.entries, d.ledgerKeys = s.events, s.balances, s.entries, s.ledgerKeys
+	d.balances, d.entries, d.ledgerKeys = s.balances, s.entries, s.ledgerKeys
 	d.nextBetID, d.nextLegID = s.nextBetID, s.nextLegID
 }
 
@@ -377,11 +374,6 @@ func (d *fakeDB) BetsByUser(_ context.Context, tx fakeTx, tournamentID, userID i
 	return out, nil
 }
 
-func (d *fakeDB) AppendEvents(_ context.Context, _ fakeTx, events []Event) error {
-	d.events = append(d.events, events...)
-	return nil
-}
-
 // ── Ledger ───────────────────────────────────────────────────────
 
 func (d *fakeDB) ApplyInTx(_ context.Context, _ fakeTx, p ledger.ApplyParams) (*ledger.ApplyResult, error) {
@@ -487,14 +479,6 @@ func (d *fakeDB) sumEntries(userID int64) int64 {
 		}
 	}
 	return sum
-}
-
-func (d *fakeDB) topics() []string {
-	out := make([]string, 0, len(d.events))
-	for _, e := range d.events {
-		out = append(out, e.Topic)
-	}
-	return out
 }
 
 // player 是綁了平台帳號報名的選手(tournament_players.user_id 有值)。

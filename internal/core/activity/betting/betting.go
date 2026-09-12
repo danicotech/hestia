@@ -308,18 +308,19 @@ type IdempotencyRecord struct {
 	Response json.RawMessage
 }
 
-// Event 是要與領域變更同 transaction 寫入 outbox 的事件。
-type Event struct {
-	Topic   string
-	Payload json.RawMessage
-}
-
-// outbox topic:派彩與退款都要通知本人,不然使用者只會看到餘額莫名其妙變了。
-const (
-	TopicBetPlaced  = "bet.placed"
-	TopicBetSettled = "bet.settled"
-	TopicBetVoided  = "bet.voided"
-)
+// 這裡刻意沒有 outbox 事件。
+//
+// 曾經有過 bet.placed / bet.settled / bet.voided 三個 topic,拆掉的理由有兩層:
+//
+//  1. 沒有消費者。它們既不在 notification 的 Discord 清單也不在 in-process 保留清單,
+//     而 outbox 的 pending 列**永不刪除**(CleanupOutboxEvents 只清 done/failed)——
+//     發了就是永久累積。
+//  2. 就算接上也不該接。它們是 per-bet 的:一場比賽結算會產生每張注單各一則,
+//     發到公開頻道就是洗版。公開的那一則應該是**彙總**,而那屬於 match.finished
+//     (它已經帶 settled_bet_count 與 voided_bet_count)。
+//
+// 日後若要做站內通知(對本人說「你中了 480」),事實已經完整記在 bets 與
+// token_entries 裡,不必為此先發事件 —— 到時候再依那個功能的需要決定形狀。
 
 // 錯誤語意:呼叫端據此決定回 4xx 還是重試。帳本層的錯誤
 // (ledger.ErrInsufficientBalance / ErrIdempotencyConflict / ErrInFlight)
@@ -422,9 +423,6 @@ type Repository[TX any] interface {
 
 	// BetsByUser 列某人在某屆的注單(含腿),依 created_at 由新到舊。
 	BetsByUser(ctx context.Context, tx TX, tournamentID, userID int64, openOnly bool) ([]Bet, error)
-
-	// AppendEvents 與領域變更同 tx 寫 outbox。events 為空時不做事。
-	AppendEvents(ctx context.Context, tx TX, events []Event) error
 }
 
 // Ledger 是本套件對帳本的最小依賴:與注單寫入同 tx 動錢。

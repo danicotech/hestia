@@ -434,10 +434,6 @@ func (s *Service[TX]) placeBetInTx(ctx context.Context, tx TX, p PlaceBetParams)
 		})
 	}
 	result := &PlaceBetResult{Bet: bet}
-
-	if err := s.repo.AppendEvents(ctx, tx, []Event{eventFor(TopicBetPlaced, bet, "", p.Stake)}); err != nil {
-		return nil, fmt.Errorf("寫 outbox: %w", err)
-	}
 	payload, err := json.Marshal(result)
 	if err != nil {
 		return nil, fmt.Errorf("序列化結果: %w", err)
@@ -668,7 +664,6 @@ func (s *Service[TX]) applyOutcomes(ctx context.Context, tx TX, m Match, betIDs 
 	// 依 id 升冪處理,與 LockBets 的取鎖順序一致,結果也才可重現。
 	slices.SortFunc(bets, func(a, b Bet) int { return cmp.Compare(a.ID, b.ID) })
 	outcomes := make([]BetOutcome, 0, len(bets))
-	events := make([]Event, 0, len(bets))
 
 	for _, b := range bets {
 		if b.Status != BetOpen {
@@ -693,7 +688,6 @@ func (s *Service[TX]) applyOutcomes(ctx context.Context, tx TX, m Match, betIDs 
 			Status:             status,
 			PayoutRecalculated: b.PayoutRecalculated || newPayout != nil,
 		}
-		topic := TopicBetSettled
 
 		switch status {
 		case BetWon:
@@ -714,7 +708,6 @@ func (s *Service[TX]) applyOutcomes(ctx context.Context, tx TX, m Match, betIDs 
 			}
 			oc.Amount, oc.LedgerEntryID = b.Stake, entryID
 			upd.LedgerRefundEntryID = &entryID
-			topic = TopicBetVoided
 		case BetLost:
 			// 不動錢:本金在下注當下就扣掉了。
 		case BetOpen:
@@ -722,19 +715,13 @@ func (s *Service[TX]) applyOutcomes(ctx context.Context, tx TX, m Match, betIDs 
 				// 沒判定出結果也沒重算金額,這張注單這次完全沒變 —— 不寫、不發事件。
 				continue
 			}
-			topic = TopicBetVoided
 		}
 
 		if err := s.repo.UpdateBet(ctx, tx, upd); err != nil {
 			return nil, fmt.Errorf("更新注單 %d: %w", b.ID, err)
 		}
 		b.Status, b.PotentialPayout, b.PayoutRecalculated = status, payout, oc.PayoutRecalculated
-		events = append(events, eventFor(topic, b, m.PublicID, oc.Amount))
 		outcomes = append(outcomes, oc)
-	}
-
-	if err := s.repo.AppendEvents(ctx, tx, events); err != nil {
-		return nil, fmt.Errorf("寫 outbox: %w", err)
 	}
 	return outcomes, nil
 }
@@ -837,34 +824,6 @@ func dedupStrings(in []string) []string {
 		out = append(out, s)
 	}
 	return out
-}
-
-// betEventPayload 是 outbox 事件的內容。只放通知端需要的東西,
-// 而且一律是 public_id —— 事件會流到 Discord,內部 id 不該出現在那裡。
-type betEventPayload struct {
-	BetPublicID        string    `json:"bet_public_id"`
-	UserID             int64     `json:"user_id"`
-	MatchPublicID      string    `json:"match_public_id,omitempty"`
-	Status             BetStatus `json:"status"`
-	Stake              int64     `json:"stake"`
-	Amount             int64     `json:"amount,omitempty"`
-	PotentialPayout    int64     `json:"potential_payout"`
-	PayoutRecalculated bool      `json:"payout_recalculated,omitempty"`
-}
-
-func eventFor(topic string, b Bet, matchPublicID string, amount int64) Event {
-	// json.Marshal 對這個結構不可能失敗(全是純量),忽略錯誤不會掩蓋任何東西。
-	payload, _ := json.Marshal(betEventPayload{
-		BetPublicID:        b.PublicID,
-		UserID:             b.UserID,
-		MatchPublicID:      matchPublicID,
-		Status:             b.Status,
-		Stake:              b.Stake,
-		Amount:             amount,
-		PotentialPayout:    b.PotentialPayout,
-		PayoutRecalculated: b.PayoutRecalculated,
-	})
-	return Event{Topic: topic, Payload: payload}
 }
 
 // validate 做所有不需要碰資料庫就能判斷的檢查。
