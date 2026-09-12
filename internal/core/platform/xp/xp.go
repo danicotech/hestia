@@ -70,7 +70,17 @@ type AwardResult struct {
 	OnCooldown bool  // 冷卻期內被攔,未入帳
 	Capped     bool  // 觸及 daily_cap(裁小或裁到 0)
 	XP         int64 // user_xp.xp 現值(入帳後;被攔時為攔下當時值)
+
+	// FromLevel / ToLevel 是這次入帳前後的等級。相等 = 沒升級。
+	//
+	// 一次跳兩級以上是可能的(語音一次入帳很大),所以是區間而不是單一值 ——
+	// 只回新等級的話,呼叫端會漏掉中間跨過的里程碑。
+	FromLevel int32
+	ToLevel   int32
 }
+
+// LeveledUp 回報這次入帳有沒有升級。
+func (r AwardResult) LeveledUp() bool { return r.ToLevel > r.FromLevel }
 
 // 錯誤語意:呼叫端據此決定回應方式。FK 也擋得住不存在的 source,
 // 但先查 registry 才能給出可讀錯誤而不是資料庫約束錯誤。

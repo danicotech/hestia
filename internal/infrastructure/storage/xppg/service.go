@@ -3,6 +3,7 @@ package xppg
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/danicotech/hestia/internal/core/platform/notification"
 	"github.com/danicotech/hestia/internal/core/platform/xp"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/db"
 )
@@ -211,7 +213,53 @@ func (s *Service) run(
 		return nil, false, fmt.Errorf("更新 user_xp: %w", err)
 	}
 
-	return &xp.AwardResult{Awarded: award, Capped: capped, XP: newXP}, true, nil
+	// ── 7. 升級偵測(schemas/24)──
+	//
+	// 等級是 XP 的純函數,所以「升級了沒」就是入帳前後各算一次。
+	// 用區間而不是單一新等級:語音一次入帳可能跨兩級以上,
+	// 只看新等級會漏掉中間那些里程碑。
+	from := cfg.ProgressFor(row.Xp).Level
+	to := cfg.ProgressFor(newXP).Level
+	if to > from {
+		if err := s.emitLevelUp(ctx, qtx, p, from, to); err != nil {
+			return nil, false, err
+		}
+	}
+
+	return &xp.AwardResult{
+		Awarded: award, Capped: capped, XP: newXP,
+		FromLevel: from, ToLevel: to,
+	}, true, nil
+}
+
+// emitLevelUp 在同一個 transaction 寫出兩則 outbox 事件。
+//
+// **兩則而不是一則**:公告由閘道投遞、發獎由 in-process 消費者處理,
+// 兩者的失敗模式完全不同 —— Discord 限流時公告會重試,但那不該讓
+// 里程碑獎勵跟著卡住;反過來,獎勵設定寫壞了也不該讓升級訊息貼不出去。
+//
+// 同 tx 是鐵則第六條:升級這件事與「有人會知道它」必須同生共死。
+func (s *Service) emitLevelUp(
+	ctx context.Context, qtx *db.Queries, p xp.AwardParams, from, to int32,
+) error {
+	payload, err := json.Marshal(map[string]any{
+		"user_id":      p.UserID,
+		"community_id": p.CommunityID,
+		"subject":      "user",
+		"from_level":   from,
+		"to_level":     to,
+	})
+	if err != nil {
+		return fmt.Errorf("序列化升級事件: %w", err)
+	}
+	for _, topic := range []string{notification.TopicLevelUp, notification.TopicLevelReward} {
+		if _, err := qtx.InsertOutboxEvent(ctx, db.InsertOutboxEventParams{
+			Topic: topic, Payload: payload,
+		}); err != nil {
+			return fmt.Errorf("寫 %s 事件: %w", topic, err)
+		}
+	}
+	return nil
 }
 
 // Rebuild 從 xp_events 重算 user_xp(xp ← SUM、last_xp_at ← MAX(created_at))並覆寫。

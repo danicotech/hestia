@@ -46,7 +46,12 @@ import (
 // 送往 Discord 頻道的 topic。字面值與產生端(dailypg / shoppg / marketpg)
 // 一致 —— 它們是同一條契約的兩端,改一邊必須改另一邊(本套件的測試會抓)。
 const (
-	TopicDailyClaimed      = "daily.claimed"
+	TopicDailyClaimed = "daily.claimed"
+	// TopicLevelUp 是升級公告(schemas/24)。發獎走另一個 in-process topic:
+	// 貼不出公告不該擋住獎勵,發不出獎勵也不該擋住公告。
+	TopicLevelUp = "level.up"
+	// TopicLevelReward 由 in-process 消費者處理(發角色/點數/物品)。
+	TopicLevelReward       = "level.reward"
 	TopicShopPurchased     = "shop.purchased"
 	TopicMarketSold        = "market.sold"
 	TopicRedemptionHandled = "redemption.handled"
@@ -73,6 +78,7 @@ const (
 // 對不到頻道的公告 stentor 會略過並記 warn,那是預期行為,不是錯誤。
 var discordChannels = map[string]string{
 	TopicDailyClaimed:      "daily",
+	TopicLevelUp:           "level_up",
 	TopicShopPurchased:     "shop",
 	TopicMarketSold:        "market",
 	TopicRedemptionHandled: "redemptions",
@@ -80,7 +86,7 @@ var discordChannels = map[string]string{
 
 // ReservedTopics 是保留給 in-process 消費者的 topic(排序後回傳,方便斷言)。
 func ReservedTopics() []string {
-	out := []string{TopicShopRefunded, TopicRedemptionCreated, TopicEntitlementExpired}
+	out := []string{TopicShopRefunded, TopicRedemptionCreated, TopicEntitlementExpired, TopicLevelReward}
 	sort.Strings(out)
 	return out
 }
@@ -250,6 +256,7 @@ func decodeAs[T payload](b []byte) (payload, error) {
 
 var renderers = map[string]renderer{
 	TopicDailyClaimed:      {decode: decodeAs[dailyClaimed]},
+	TopicLevelUp:           {decode: decodeAs[levelUp]},
 	TopicShopPurchased:     {decode: decodeAs[shopPurchased]},
 	TopicMarketSold:        {decode: decodeAs[marketSold]},
 	TopicRedemptionHandled: {decode: decodeAs[redemptionHandled]},
@@ -420,3 +427,27 @@ func sanitize(s string) string {
 // 匯出它是為了讓儲存層能先把一批事件要用到的用途收集起來、一次查完,
 // 而不必為此把 discordChannels 這張表複製一份出去(專案第 9 條)。
 func ChannelKeyFor(topic string) string { return discordChannels[topic] }
+
+// levelUp 是升級公告的 payload(schemas/24)。
+//
+// 只帶等級與主體,不帶 XP 數字:公告是給整個頻道看的,
+// 而「他有多少 XP」是個人檔案的事,貼在公開頻道沒有必要。
+type levelUp struct {
+	UserID    int64  `json:"user_id"`
+	Subject   string `json:"subject"`
+	FromLevel int32  `json:"from_level"`
+	ToLevel   int32  `json:"to_level"`
+}
+
+func (p levelUp) refs() Refs { return Refs{UserIDs: []int64{p.UserID}} }
+
+func (p levelUp) render(n Names) (string, []Field) {
+	title := "升級了"
+	if p.Subject == "pet" {
+		title = "寵物升級了"
+	}
+	return title, []Field{
+		{K: "成員", V: userName(n, p.UserID)},
+		{K: "等級", V: fmt.Sprintf("Lv.%d → **Lv.%d**", p.FromLevel, p.ToLevel)},
+	}
+}

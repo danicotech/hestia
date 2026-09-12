@@ -72,3 +72,38 @@ FROM (
 ) s
 WHERE u.user_id = $1 AND u.community_id = $2
 RETURNING u.xp;
+
+-- ── 里程碑獎勵(schemas/24)────────────────────────────────────────────
+
+-- name: ListLevelRewardsBetween :many
+-- 這次升級跨過的所有里程碑。一次跳兩級以上是可能的(語音一次入帳很大),
+-- 所以取區間而不是等於 —— 只看新等級會漏掉中間那些。
+SELECT id, level, reward_kind, reward_ref, amount, note
+FROM platform.level_rewards
+WHERE community_id = $1 AND subject = $2 AND level > $3 AND level <= $4
+ORDER BY level;
+
+-- name: ClaimLevelReward :execrows
+-- 冪等鍵。outbox 是至少一次投遞,重送時這裡撞鍵 → 0 列 → 呼叫端跳過發放。
+-- 沒有它的話,重試一次就發兩隻寵物。
+INSERT INTO platform.level_reward_grants (reward_id, user_id, pet_instance_id)
+VALUES ($1, $2, sqlc.narg(pet_instance_id)::bigint)
+ON CONFLICT (reward_id, user_id, COALESCE(pet_instance_id, 0)) DO NOTHING;
+
+-- name: GrantRoleByPublicID :execrows
+-- source='level_reward':與 manual / provider_sync 分開,身分組同步撤銷時
+-- 不會誤刪里程碑發出去的角色。
+INSERT INTO platform.user_roles (user_id, role_id, community_id, source, granted_at)
+SELECT $1, r.id, $2, 'level_reward', now()
+FROM platform.roles r
+WHERE r.public_id = $3
+ON CONFLICT (user_id, role_id, COALESCE(community_id, 0)) DO NOTHING;
+
+-- name: GrantItemByDefinitionPublicID :one
+-- 發一件物品。bound 跟著定義走:成就類的東西不該能轉手賣掉。
+INSERT INTO platform.item_instances
+  (public_id, definition_id, owner_id, bound, acquired_via, acquired_at)
+SELECT $1, d.id, $2, d.bind_on_acquire, 'level_reward', now()
+FROM platform.item_definitions d
+WHERE d.public_id = $3
+RETURNING id, public_id;

@@ -140,9 +140,17 @@ func run() error {
 	// 否則會認領 → 找不到 handler → 退避重試到上限 → 標 failed,公告被燒掉。
 	consumer := outbox.NewConsumer(pool)
 	consumer.ExcludedTopics = notification.DiscordTopics()
-	// 之後在這裡註冊 in-process handler(如身分組回收)。Consumer.Handle 會直接
-	// 拒絕閘道負責的 topic,所以「兩邊都處理」在結構上不可能;這道斷言讀的是
-	// 實際註冊結果(不是手寫清單),當作第二層保險。
+	// 里程碑獎勵(schemas/24)。與升級公告刻意是兩個 topic:
+	// 公告由閘道投遞、獎勵在這裡發,兩者的失敗模式不同 ——
+	// Discord 限流時公告會重試,但那不該讓獎勵跟著卡住。
+	rewards := xppg.NewRewardGranter(xpSvc, led)
+	consumer.Handle(notification.TopicLevelReward,
+		func(ctx context.Context, _ string, payload []byte) error {
+			return rewards.Handle(ctx, payload)
+		})
+
+	// Consumer.Handle 會直接拒絕閘道負責的 topic,所以「兩邊都處理」在結構上
+	// 不可能;這道斷言讀的是實際註冊結果(不是手寫清單),當作第二層保險。
 	if err := notification.AssertNoOverlap(consumer.RegisteredTopics()); err != nil {
 		return fmt.Errorf("outbox topic 分工衝突: %w", err)
 	}

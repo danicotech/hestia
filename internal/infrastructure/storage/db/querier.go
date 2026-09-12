@@ -60,6 +60,9 @@ type Querier interface {
 	// RETURNING 的順序不保證(UPDATE ... FROM 不吃 ORDER BY),
 	// 呼叫端依 id 排序後才交出去:舊事件先貼。
 	ClaimAnnouncements(ctx context.Context, arg ClaimAnnouncementsParams) ([]ClaimAnnouncementsRow, error)
+	// 冪等鍵。outbox 是至少一次投遞,重送時這裡撞鍵 → 0 列 → 呼叫端跳過發放。
+	// 沒有它的話,重試一次就發兩隻寵物。
+	ClaimLevelReward(ctx context.Context, arg ClaimLevelRewardParams) (int64, error)
 	// ══ 訊息 ══
 	// **訊息冪等的權威**:message_stats.message_id 是 PK,而且不論頻道白名單或
 	// opt-out 都會寫這一列 —— 所以它是唯一「每則訊息必定存在一次」的鍵。
@@ -253,6 +256,11 @@ type Querier interface {
 	// 冷卻用 user_xp.last_xp_at 直接查 DB(schemas/06:不上 Redis)。
 	// source 檢查:registry 管「存在與開關」(全域);數值/冷卻/上限在 xp_rulesets.config
 	GetXpEventType(ctx context.Context, key string) (GetXpEventTypeRow, error)
+	// 發一件物品。bound 跟著定義走:成就類的東西不該能轉手賣掉。
+	GrantItemByDefinitionPublicID(ctx context.Context, arg GrantItemByDefinitionPublicIDParams) (GrantItemByDefinitionPublicIDRow, error)
+	// source='level_reward':與 manual / provider_sync 分開,身分組同步撤銷時
+	// 不會誤刪里程碑發出去的角色。
+	GrantRoleByPublicID(ctx context.Context, arg GrantRoleByPublicIDParams) (int64, error)
 	// 只有 hestia 見過的被回覆訊息才累加(message_stats.user_id 是 NOT NULL,
 	// 沒見過就沒有作者可填 —— 那種情況直接略過,不猜)。
 	IncrementReplyCount(ctx context.Context, messageID string) error
@@ -384,6 +392,10 @@ type Querier interface {
 	// token_entries_ref_idx (ref_type, ref_id) WHERE ref_type IS NOT NULL,
 	// 且探測次數被 CTE 的 LIMIT 綁死在一頁之內。
 	ListLedgerEntries(ctx context.Context, arg ListLedgerEntriesParams) ([]ListLedgerEntriesRow, error)
+	// ── 里程碑獎勵(schemas/24)────────────────────────────────────────────
+	// 這次升級跨過的所有里程碑。一次跳兩級以上是可能的(語音一次入帳很大),
+	// 所以取區間而不是等於 —— 只看新等級會漏掉中間那些。
+	ListLevelRewardsBetween(ctx context.Context, arg ListLevelRewardsBetweenParams) ([]ListLevelRewardsBetweenRow, error)
 	// ── 型錄與持有物(Catalog)──────────────────────────────────────────────
 	// 上架條件與 shop.sql 的 GetShopItemForPurchase **完全同一套**(DB 時鐘,單一時鐘來源):
 	//   listed_at IS NOT NULL AND listed_at <= now() AND (delisted_at IS NULL OR delisted_at > now())

@@ -32,6 +32,28 @@ func (q *Queries) AddUserXp(ctx context.Context, arg AddUserXpParams) (int64, er
 	return xp, err
 }
 
+const claimLevelReward = `-- name: ClaimLevelReward :execrows
+INSERT INTO platform.level_reward_grants (reward_id, user_id, pet_instance_id)
+VALUES ($1, $2, $3::bigint)
+ON CONFLICT (reward_id, user_id, COALESCE(pet_instance_id, 0)) DO NOTHING
+`
+
+type ClaimLevelRewardParams struct {
+	RewardID      int64
+	UserID        int64
+	PetInstanceID *int64
+}
+
+// 冪等鍵。outbox 是至少一次投遞,重送時這裡撞鍵 → 0 列 → 呼叫端跳過發放。
+// 沒有它的話,重試一次就發兩隻寵物。
+func (q *Queries) ClaimLevelReward(ctx context.Context, arg ClaimLevelRewardParams) (int64, error) {
+	result, err := q.db.Exec(ctx, claimLevelReward, arg.RewardID, arg.UserID, arg.PetInstanceID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const ensureUserXpRow = `-- name: EnsureUserXpRow :exec
 INSERT INTO platform.user_xp (user_id, community_id)
 VALUES ($1, $2)
@@ -85,6 +107,58 @@ func (q *Queries) GetXpEventType(ctx context.Context, key string) (GetXpEventTyp
 	var i GetXpEventTypeRow
 	err := row.Scan(&i.Key, &i.Enabled)
 	return i, err
+}
+
+const grantItemByDefinitionPublicID = `-- name: GrantItemByDefinitionPublicID :one
+INSERT INTO platform.item_instances
+  (public_id, definition_id, owner_id, bound, acquired_via, acquired_at)
+SELECT $1, d.id, $2, d.bind_on_acquire, 'level_reward', now()
+FROM platform.item_definitions d
+WHERE d.public_id = $3
+RETURNING id, public_id
+`
+
+type GrantItemByDefinitionPublicIDParams struct {
+	PublicID   string
+	OwnerID    int64
+	PublicID_2 string
+}
+
+type GrantItemByDefinitionPublicIDRow struct {
+	ID       int64
+	PublicID string
+}
+
+// 發一件物品。bound 跟著定義走:成就類的東西不該能轉手賣掉。
+func (q *Queries) GrantItemByDefinitionPublicID(ctx context.Context, arg GrantItemByDefinitionPublicIDParams) (GrantItemByDefinitionPublicIDRow, error) {
+	row := q.db.QueryRow(ctx, grantItemByDefinitionPublicID, arg.PublicID, arg.OwnerID, arg.PublicID_2)
+	var i GrantItemByDefinitionPublicIDRow
+	err := row.Scan(&i.ID, &i.PublicID)
+	return i, err
+}
+
+const grantRoleByPublicID = `-- name: GrantRoleByPublicID :execrows
+INSERT INTO platform.user_roles (user_id, role_id, community_id, source, granted_at)
+SELECT $1, r.id, $2, 'level_reward', now()
+FROM platform.roles r
+WHERE r.public_id = $3
+ON CONFLICT (user_id, role_id, COALESCE(community_id, 0)) DO NOTHING
+`
+
+type GrantRoleByPublicIDParams struct {
+	UserID      int64
+	CommunityID *int64
+	PublicID    string
+}
+
+// source='level_reward':與 manual / provider_sync 分開,身分組同步撤銷時
+// 不會誤刪里程碑發出去的角色。
+func (q *Queries) GrantRoleByPublicID(ctx context.Context, arg GrantRoleByPublicIDParams) (int64, error) {
+	result, err := q.db.Exec(ctx, grantRoleByPublicID, arg.UserID, arg.CommunityID, arg.PublicID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const insertXpEvent = `-- name: InsertXpEvent :one
@@ -143,6 +217,65 @@ func (q *Queries) LastXpEventAtBySource(ctx context.Context, arg LastXpEventAtBy
 	var created_at time.Time
 	err := row.Scan(&created_at)
 	return created_at, err
+}
+
+const listLevelRewardsBetween = `-- name: ListLevelRewardsBetween :many
+
+SELECT id, level, reward_kind, reward_ref, amount, note
+FROM platform.level_rewards
+WHERE community_id = $1 AND subject = $2 AND level > $3 AND level <= $4
+ORDER BY level
+`
+
+type ListLevelRewardsBetweenParams struct {
+	CommunityID int64
+	Subject     string
+	Level       int32
+	Level_2     int32
+}
+
+type ListLevelRewardsBetweenRow struct {
+	ID         int64
+	Level      int32
+	RewardKind string
+	RewardRef  string
+	Amount     *int64
+	Note       *string
+}
+
+// ── 里程碑獎勵(schemas/24)────────────────────────────────────────────
+// 這次升級跨過的所有里程碑。一次跳兩級以上是可能的(語音一次入帳很大),
+// 所以取區間而不是等於 —— 只看新等級會漏掉中間那些。
+func (q *Queries) ListLevelRewardsBetween(ctx context.Context, arg ListLevelRewardsBetweenParams) ([]ListLevelRewardsBetweenRow, error) {
+	rows, err := q.db.Query(ctx, listLevelRewardsBetween,
+		arg.CommunityID,
+		arg.Subject,
+		arg.Level,
+		arg.Level_2,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListLevelRewardsBetweenRow
+	for rows.Next() {
+		var i ListLevelRewardsBetweenRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Level,
+			&i.RewardKind,
+			&i.RewardRef,
+			&i.Amount,
+			&i.Note,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const lockUserXp = `-- name: LockUserXp :one
