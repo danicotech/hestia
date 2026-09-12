@@ -1,0 +1,167 @@
+syntax = "proto3";
+
+// 觀眾投票與下注(schemas/21)。
+//
+// ── 為什麼是投票驅動而不是彩池 ──────────────────────────────────
+//
+// 彩池做不了串關:彩池的賠率要等封盤後才算得出來,而串關必須在下注當下就
+// 知道每一腿的賠率才能乘起來。所以改成投票推導隱含機率:
+//
+//   隱含機率 = (該方票數 + SMOOTHING) / (總票數 + 2×SMOOTHING)
+//   賠率     = (1 − VIG) / 隱含機率,夾在 [MIN_ODDS, MAX_ODDS]
+//
+// **賠率在下注當下鎖定**寫進注單。之後票數再怎麼跑都不影響已成立的注單,
+// 派彩也直接發下注當下算定的金額 —— 選手看到的「可能贏得 X」必須等於實際入帳。
+//
+// ── 這裡全部是真錢 ──────────────────────────────────────────────
+//
+// 下注動的是平台代幣,所以:
+//   * 一律需要平台帳號 Bearer(不是活動層通行碼 session)
+//   * PlaceBet 一律帶 idempotency_key
+//   * 扣款與建注單必須同一個 tx(依賴 Ledger.ApplyInTx)
+//
+// 這與讓武 BP 完全相反 —— BP 不是錢,所以那邊沒有冪等鍵。
+//
+// ── 兩條操守規則 ────────────────────────────────────────────────
+//
+//   1. 選手不得對自己參與的場次下注。伺服器擋,不是前端隱藏。
+//   2. 投票只回票數,**永不回傳誰投給誰**。投票會直接動賠率,
+//      公開投票人等於公開可操縱的標的。
+package hestia.activity.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/danicotech/hestia/gen/hestia/activity/v1;activityv1";
+
+// BettingService 是觀眾側的投票與下注。除了 GetOdds,全部需要平台帳號。
+service BettingService {
+  // 投票給某一方。一場一票,再投即改票。
+  rpc Vote(VoteRequest) returns (VoteResponse) {}
+  // 取得目前賠率與票數。匿名可讀。
+  rpc GetOdds(GetOddsRequest) returns (GetOddsResponse) {}
+  // 下注。單場或串關都走這支。
+  rpc PlaceBet(PlaceBetRequest) returns (PlaceBetResponse) {}
+  // 列出我的注單。
+  rpc ListMyBets(ListMyBetsRequest) returns (ListMyBetsResponse) {}
+}
+
+// BetStatus 是注單狀態。
+enum BetStatus {
+  BET_STATUS_UNSPECIFIED = 0;
+  BET_STATUS_OPEN = 1;
+  BET_STATUS_WON = 2;
+  BET_STATUS_LOST = 3;
+  // 作廢退款。整場棄賽、或串關的每一腿都作廢時。
+  BET_STATUS_VOID = 4;
+}
+
+// LegResult 是串關單腿的結果。
+enum LegResult {
+  LEG_RESULT_UNSPECIFIED = 0;
+  LEG_RESULT_PENDING = 1;
+  LEG_RESULT_WON = 2;
+  LEG_RESULT_LOST = 3;
+  // 該場不戰而勝,這一腿不成立 —— 從乘積中移除,剩餘腿照各自鎖定的賠率重算。
+  LEG_RESULT_VOID = 4;
+}
+
+// MatchOdds 是一場比賽的即時賠率。
+message MatchOdds {
+  string match_public_id = 1;
+  int32 p1_votes = 2;
+  int32 p2_votes = 3;
+  // 賠率 ×1000 的整數(1.43 → 1430)。
+  // 浮點數在這裡是禁止的:賠率會參與串關的連乘,誤差會直接乘進派彩金額。
+  int64 p1_odds_milli = 4;
+  int64 p2_odds_milli = 5;
+  // 現在能不能下注。READY 與 LOCKED 可以,LIVE 之後不行。
+  bool open_for_bets = 6;
+  // 我投給了哪一方(1 或 2);0 = 還沒投或未登入。
+  // 只回自己的 —— 別人投給誰永遠不會出現在任何回應裡。
+  int32 my_vote = 7;
+}
+
+message VoteRequest {
+  string match_public_id = 1;
+  // 1 = p1,2 = p2。
+  int32 side = 2;
+}
+
+message VoteResponse {
+  // 投完後的即時賠率。票數變了賠率就會變,所以一併回。
+  MatchOdds odds = 1;
+}
+
+message GetOddsRequest {
+  // 一次問多場,對戰表頁要同時顯示很多場的賠率。
+  repeated string match_public_ids = 1;
+}
+
+message GetOddsResponse {
+  repeated MatchOdds odds = 1;
+}
+
+// BetLegInput 是要押的一腿。
+message BetLegInput {
+  string match_public_id = 1;
+  // 1 = p1,2 = p2。
+  int32 side = 2;
+}
+
+message PlaceBetRequest {
+  string tournament_slug = 1;
+  // 下注額。同一注單的所有腿共用這一筆本金(串關不是各押各的)。
+  int64 stake = 2;
+  // 一腿 = 單場,多腿 = 串關。同一場不可押兩次(押完 p1 再押 p2 等於穩賺)。
+  repeated BetLegInput legs = 3;
+  // 動錢的 RPC 一律要帶。重送同一把鍵回同一張注單,不會重複扣款。
+  string idempotency_key = 4;
+  // 客戶端算出來的預期賠付。伺服器會拿自己算的比對,差太多就拒絕 ——
+  // 防的是「使用者看到 5.0 倍按下去,送達時票數已經跑到 2.0 倍」。
+  // 0 = 不檢查。
+  int64 expected_payout = 5;
+}
+
+// Bet 是一張注單。
+message Bet {
+  string public_id = 1;
+  int64 stake = 2;
+  // 下注當下算定的賠付(含本金),受 MAX_PARLAY 封頂。
+  int64 potential_payout = 3;
+  BetStatus status = 4;
+  repeated BetLeg legs = 5;
+  // true = 有腿因棄賽作廢而重算過 potential_payout。
+  // 對帳時看得出「這筆金額為什麼跟原始承諾不同」。
+  bool payout_recalculated = 6;
+  google.protobuf.Timestamp created_at = 7;
+  optional google.protobuf.Timestamp settled_at = 8;
+}
+
+// BetLeg 是串關的一腿。
+message BetLeg {
+  string match_public_id = 1;
+  // 場次描述快照,如「首輪 · 李璃 vs A冷」。避免列注單時還要再查每一場。
+  string match_label = 2;
+  int32 side = 3;
+  // 押的那一方的顯示名快照。
+  string side_display_name = 4;
+  // 下注當下鎖定的賠率 ×1000。之後票數再跑都不改這個值。
+  int64 odds_milli = 5;
+  LegResult result = 6;
+}
+
+message PlaceBetResponse {
+  Bet bet = 1;
+  // true = 冪等重放,本次未實際扣款(回的是原次的注單)。
+  bool replayed = 2;
+}
+
+message ListMyBetsRequest {
+  string tournament_slug = 1;
+  // 只列未結的。
+  bool open_only = 2;
+}
+
+message ListMyBetsResponse {
+  repeated Bet bets = 1;
+}

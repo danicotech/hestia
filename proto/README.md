@@ -15,6 +15,22 @@ proto/hestia/platform/v1/
   activity.proto        ActivityService    Discord 活動記錄寫入(只收服務身分)
   notification.proto    NotificationService outbox → Discord 頻道的拉取/確認(只收服務身分)
 
+hestia/activity/v1/(活動層 ——《百業試鋒》賽事系統,schemas/20、21、26):
+  common.proto          共用列舉與檢視型別(Rank / TournamentPhase / MatchStatus / HandicapCategory
+                        / Tournament / Player / Match / BracketRound / HandicapItem / BpBudget)
+  signup.proto          SignupService      報名、通行碼登入、綁定平台帳號
+  tournament.proto      TournamentService  賽事、段位、選手、對戰表、場次(匿名可讀)
+  handicap.proto        HandicapService    讓武項目、BP 預算、選購與退選、封盤後公開
+  betting.proto         BettingService     投票驅動賠率、下注(單場與串關)、我的注單
+  judge.proto           JudgeService       裁判後台:評段、抽籤、開/封盤、賽果、棄賽、發獎
+
+  **這個 package 刻意不 import hestia.platform.v1。** 活動層可以引用平台層的概念,
+  平台層永遠不知道活動層存在(鐵則 1)。需要平台身分時只帶 user_public_id 字串,
+  由伺服器自己解 —— 不讓 proto 變成偷渡這條界線的後門。
+
+  注意 platform/v1/activity.proto 是**同名不同義**:那是 stentor 回報語音與訊息的
+  「活動記錄」,與這裡的賽事活動層無關。
+
 hestia/render/v1/(給閘道與活動服務的呈現契約,不是平台 API):
   render.proto          ActivityInteractionService  活動服務回傳「要顯示什麼」的描述
                         + Announcement(公告的渲染形式)

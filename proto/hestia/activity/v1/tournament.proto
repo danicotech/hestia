@@ -1,0 +1,88 @@
+syntax = "proto3";
+
+// 賽事的公開讀取:規則、段位、對戰表、場次(schemas/20)。
+//
+// 這個服務全部是**匿名可讀**的 —— 觀眾不必登入就能看對戰表、段位與封盤後的
+// 讓武內容。理由不是技術上的方便,而是這場活動的目的本身:
+// 「闔家觀賞、強弱同樂」,看的人比打的人多。
+//
+// 唯一的資訊控制在讓武上:封盤前只有施加者本人看得到自己買了什麼,
+// 封盤後全部公開。那段邏輯在 handicap.proto。
+package hestia.activity.v1;
+
+import "hestia/activity/v1/common.proto";
+
+option go_package = "github.com/danicotech/hestia/gen/hestia/activity/v1;activityv1";
+
+// TournamentService 是賽事的公開檢視。
+service TournamentService {
+  // 取得一屆賽事的基本資訊與當前階段。
+  rpc GetTournament(GetTournamentRequest) returns (GetTournamentResponse) {}
+  // 取得段位定義(規則頁用)。名稱與描述存在 config,由伺服器給。
+  rpc ListRanks(ListRanksRequest) returns (ListRanksResponse) {}
+  // 列出參賽者。段位在 RANKED 階段之後才會有值。
+  rpc ListPlayers(ListPlayersRequest) returns (ListPlayersResponse) {}
+  // 取得完整對戰表。
+  rpc GetBracket(GetBracketRequest) returns (GetBracketResponse) {}
+  // 取得單場詳情。
+  rpc GetMatch(GetMatchRequest) returns (GetMatchResponse) {}
+}
+
+message GetTournamentRequest {
+  string slug = 1;
+}
+
+message GetTournamentResponse {
+  Tournament tournament = 1;
+}
+
+message ListRanksRequest {
+  string tournament_slug = 1;
+}
+
+message ListRanksResponse {
+  // 由低至高:開山 → 斷水 → 飛花 → 無我。
+  repeated RankInfo ranks = 1;
+  // 每差一段給多少 BP,規則頁要顯示。
+  int64 bp_per_rank_gap = 2;
+}
+
+message ListPlayersRequest {
+  string tournament_slug = 1;
+}
+
+message ListPlayersResponse {
+  repeated Player players = 1;
+  // false = 段位尚未公布,players 裡的 rank 全是 UNSPECIFIED。
+  // 前端用這個旗標決定要不要顯示段位欄,而不是自己猜。
+  bool ranks_published = 2;
+}
+
+message GetBracketRequest {
+  string tournament_slug = 1;
+}
+
+message GetBracketResponse {
+  repeated BracketRound rounds = 1;
+  // 對戰表裡出現的所有選手,前端據此把 public_id 解成顯示名與段位,
+  // 不必為每個節點各發一次請求。
+  repeated Player players = 2;
+  // false = 尚未抽籤,rounds 為空。
+  bool bracket_published = 3;
+}
+
+message GetMatchRequest {
+  string match_public_id = 1;
+}
+
+message GetMatchResponse {
+  Match match = 1;
+  // 場上兩人的完整檢視(含段位,觀眾要看得懂為什麼某方有 24 BP)。
+  optional Player p1 = 2;
+  optional Player p2 = 3;
+  // 低段位方本場取得的 BP 總額;0 = 同段對決,本場無讓武。
+  // 這是公開資訊 —— 段位在 RANKED 就公布了,BP 由段位差直接推得出來。
+  int64 handicap_budget = 4;
+  // 誰取得了 BP(低段位方);空 = 同段對決。
+  string handicap_holder_public_id = 5;
+}

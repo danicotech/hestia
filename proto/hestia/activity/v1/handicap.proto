@@ -1,0 +1,100 @@
+syntax = "proto3";
+
+// 讓武 BP 的選購(schemas/20)——《百業試鋒》的核心。
+//
+// ── 讓武不是放水 ────────────────────────────────────────────────
+//
+// 低段位者花 BP 換到的是「高手必須遵守的正式比賽條件」,不是要求高手故意失誤
+// 或手下留情。受限方仍應以取勝為目的全力應戰。這句話不只是文案 ——
+// 它決定了這個服務沒有「認輸」「放水」之類的 RPC,只有施加限制。
+//
+// ── 為什麼沒有冪等鍵 ────────────────────────────────────────────
+//
+// 動平台代幣的 RPC 一律要帶 idempotency_key(平台鐵則)。這裡**刻意沒有**,
+// 因為 BP 不是代幣:每輪依段位差重發、該場有效、賽後作廢、不可交易。
+// 重複扣一次 BP 的後果是使用者看到餘額不對,不是對不上帳 ——
+// 前者可以由裁判在封盤前退掉,後者無法事後修復。
+//
+// 真正動錢的是 betting.proto 與 judge.proto 的發獎,那兩處才有冪等鍵。
+//
+// ── 封盤前後的可見性 ────────────────────────────────────────────
+//
+// 封盤前:只有施加者本人看得到自己買了什麼。
+// 封盤後:雙方與觀眾全部看得到,並自動發一則 Discord 公告。
+// 這條界線由伺服器守,不是前端隱藏。
+package hestia.activity.v1;
+
+import "hestia/activity/v1/common.proto";
+
+option go_package = "github.com/danicotech/hestia/gen/hestia/activity/v1;activityv1";
+
+// HandicapService 是選手側的讓武選購。除了 GetMatchHandicaps,全部需要活動層 session。
+service HandicapService {
+  // 列出本屆所有可購買的讓武項目(六大類)。
+  rpc ListItems(ListItemsRequest) returns (ListItemsResponse) {}
+  // 取得我在某場的 BP 預算與已選項目。
+  rpc GetMyBudget(GetMyBudgetRequest) returns (GetMyBudgetResponse) {}
+  // 買一項讓武。同一項目可以重複買,只要 BP 夠。
+  rpc Select(SelectRequest) returns (SelectResponse) {}
+  // 退掉一項。只在封盤前可行。
+  rpc VoidSelection(VoidSelectionRequest) returns (VoidSelectionResponse) {}
+  // 取得某場的讓武全貌。封盤後匿名可讀;封盤前只回請求者自己的。
+  rpc GetMatchHandicaps(GetMatchHandicapsRequest) returns (GetMatchHandicapsResponse) {}
+}
+
+message ListItemsRequest {
+  string tournament_slug = 1;
+}
+
+message ListItemsResponse {
+  repeated HandicapItem items = 1;
+}
+
+message GetMyBudgetRequest {
+  string match_public_id = 1;
+}
+
+message GetMyBudgetResponse {
+  // 我在本場的預算。budget = 0 表示同段對決或我是高段位方。
+  BpBudget budget = 1;
+  // 我已經買的項目。
+  repeated HandicapSelection selections = 2;
+  // 還能不能改。false 的原因可能是已封盤、尚未開盤、或這場不歸我。
+  bool editable = 3;
+  // editable = false 時的人話說明,前端直接顯示。
+  string locked_reason = 4;
+}
+
+message SelectRequest {
+  string match_public_id = 1;
+  string item_public_id = 2;
+  // 需要指定內容的項目必填(如「指定對手武學」要填武學名)。
+  // 項目的 requires_target_note 為 true 時,留空會被拒絕。
+  string target_note = 3;
+}
+
+message SelectResponse {
+  HandicapSelection selection = 1;
+  // 買完後的預算,前端不必再查一次。
+  BpBudget budget = 2;
+  // 非阻擋式提醒。目前唯一會觸發的情況:VICTORY 類買了第二項,
+  // 兩者同時生效可能互相矛盾,請與裁判確認。
+  // 伺服器**不會**因此拒絕購買 —— 互斥由裁判臨場判,不由系統擋。
+  string advisory = 3;
+}
+
+message VoidSelectionRequest {
+  string selection_public_id = 1;
+}
+
+message VoidSelectionResponse {
+  BpBudget budget = 1;
+}
+
+message GetMatchHandicapsRequest {
+  string match_public_id = 1;
+}
+
+message GetMatchHandicapsResponse {
+  MatchHandicaps handicaps = 1;
+}

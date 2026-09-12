@@ -1,0 +1,115 @@
+syntax = "proto3";
+
+// 報名與選手登入(schemas/20、26)。
+//
+// ── 為什麼不用平台帳號 ──────────────────────────────────────────
+//
+// 報名**不需要**平台帳號。門檻要夠低:百業的成員未必都綁過 Discord OAuth,
+// 而「先去登入再回來報名」會直接勸退一部分人。
+//
+// 代價是活動層要自己發一組憑證,也就是通行碼。這造成雙軌身分:
+//   選手    → 遊戲ID + 通行碼 → 活動層 session
+//   下注者  → 平台帳號 Bearer → 要動平台代幣
+// 兩者可以是同一人:選手事後 BindPlatformAccount 即可。領獎**必須**先綁。
+//
+// ── 通行碼的安全性 ──────────────────────────────────────────────
+//
+// 通行碼是 6 碼、排除易混淆字元(0/O、1/I/l)、DB 只存 hash。
+// 它只在 Register 的回應裡出現**一次**,之後任何 API 都不會再吐明碼 ——
+// 裁判後台也看不到,只能「重新產生」(舊碼立即失效,動作進稽核紀錄)。
+//
+// 這不是銀行等級的安全,也不需要是:它保護的是「別人不能改你的讓武選擇」,
+// 而所有破壞性操作都還有裁判這道人工關卡。
+package hestia.activity.v1;
+
+import "hestia/activity/v1/common.proto";
+
+option go_package = "github.com/danicotech/hestia/gen/hestia/activity/v1;activityv1";
+
+// SignupService 是選手側的報名與身分。
+service SignupService {
+  // 報名。只在賽事處於 SIGNUP 階段時開放。
+  rpc Register(RegisterRequest) returns (RegisterResponse) {}
+  // 用遊戲ID + 通行碼換發活動層 session。
+  rpc Login(LoginRequest) returns (LoginResponse) {}
+  // 結束活動層 session。
+  rpc Logout(LogoutRequest) returns (LogoutResponse) {}
+  // 取得目前登入的選手。
+  rpc GetMyPlayer(GetMyPlayerRequest) returns (GetMyPlayerResponse) {}
+  // 把目前的活動層身分綁到平台帳號(領獎前必做)。
+  rpc BindPlatformAccount(BindPlatformAccountRequest) returns (BindPlatformAccountResponse) {}
+}
+
+// RegisterRequest 是一份報名表。
+//
+// 除了前四欄,其餘全是**給裁判評段用的參考資料** —— 御風羽要綜合論劍段位、
+// 積分、實戰經驗與整體 PVP 實力來評,所以表單問的比「你叫什麼」多。
+message RegisterRequest {
+  // 要報名哪一屆,如 2026-baiye-shifeng。
+  string tournament_slug = 1;
+  // 遊戲ID。全服唯一,場上辨識與登入都用它。
+  // 若這個 ID 報過往屆,伺服器會自動接上既有的選手檔案。
+  string game_id = 2;
+  // 顯示名。留空則沿用 game_id。
+  string display_name = 3;
+  // Discord 名稱。裁判聯絡與公告 tag 用。
+  string discord_name = 4;
+  // 自評段位。除了當評段起點,也讓裁判看得出誰高估或低估自己。
+  Rank self_rated_rank = 5;
+  // 遊戲內論劍段位。
+  string ladder_rank = 6;
+  // 遊戲內積分。
+  int32 ladder_score = 7;
+  // 常用武學 / PVP 經驗描述。沒實際對過時的判斷依據,也能做選手介紹卡。
+  string arts_note = 8;
+  // 可出賽時段 / 備註。裁判排輪次時程用。
+  string availability_note = 9;
+}
+
+// RegisterResponse 帶回**唯一一次**看得到明碼通行碼的機會。
+message RegisterResponse {
+  Player player = 1;
+  // 明碼通行碼。**只在這裡出現一次**,伺服器只存 hash。
+  // 前端必須明確提示使用者截圖或抄下來。
+  string passcode = 2;
+  // true = 這個遊戲ID 在往屆報過名,已接上既有檔案。
+  // 前端可據此顯示「歡迎回來,上屆你是斷水」。
+  bool returning_fencer = 3;
+  // 往屆最後一次的評定段位;UNSPECIFIED = 初次參賽或從未評過。
+  // 這**不是**本屆段位 —— 本屆要等裁判重新評定。
+  Rank previous_rank = 4;
+}
+
+message LoginRequest {
+  string tournament_slug = 1;
+  string game_id = 2;
+  string passcode = 3;
+}
+
+message LoginResponse {
+  Player player = 1;
+}
+
+message LogoutRequest {}
+
+message LogoutResponse {}
+
+message GetMyPlayerRequest {}
+
+message GetMyPlayerResponse {
+  Player player = 1;
+  // 本屆賽事的當前狀態,前端用來決定顯示哪個畫面。
+  Tournament tournament = 2;
+  // 目前輪到我打的比賽;空 = 沒有待打的場次(已出局、或還沒抽籤)。
+  optional Match current_match = 3;
+}
+
+// BindPlatformAccountRequest 需要**同時**持有活動層 session(通行碼登入)
+// 與平台 Bearer(Discord OAuth 登入)。伺服器把兩個身分接起來。
+//
+// 刻意不讓裁判代綁:綁定決定獎金匯到誰的帳戶,必須由本人雙重證明。
+message BindPlatformAccountRequest {}
+
+message BindPlatformAccountResponse {
+  Player player = 1;
+}

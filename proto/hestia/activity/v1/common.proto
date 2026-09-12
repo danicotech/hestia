@@ -1,0 +1,269 @@
+syntax = "proto3";
+
+// hestia 活動層對外契約 ——《百業試鋒》賽事系統(schemas/20、21、26)。
+//
+// 與 hestia.platform.v1 的關係:**單向**。活動層可以引用平台層的概念
+// (使用者、餘額),平台層永遠不知道活動層存在(專案鐵則 1)。
+// 為了不讓 proto 變成偷渡這條界線的後門,這裡刻意**不 import platform 的 proto**
+// —— 需要平台身分時只帶 user_public_id 字串,由伺服器自己解。
+//
+// 四條貫穿全檔的鐵則:
+//   1. 對外只出現 public_id(ULID),永不出現內部 BIGINT id。
+//   2. 金額與 BP 一律 int64。protobuf 的 JSON 編碼把 64 位整數寫成字串以保精度,
+//      這是刻意的。賠率同理用 int64 毫分(odds_milli),絕不用 float/double。
+//   3. 段位用 enum,而且**列舉值刻意等於資料庫的 rank_level**(開山=1 … 無我=4)。
+//      BP 公式要對段位做減法,兩邊數字一致才不會在轉換層出錯。
+//   4. 選手身分與平台身分是兩軌。參賽者未必有平台帳號,所以選手訊息裡的
+//      user_public_id 可以是空字串;下注與領獎則一定要有。
+package hestia.activity.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/danicotech/hestia/gen/hestia/activity/v1;activityv1";
+
+// ── 枚舉 ────────────────────────────────────────────────────────
+
+// Rank 是試鋒段位。**數值即 rank_level**,由低至高。
+//
+// 段位不是榮譽排名,唯一用途是衡量雙方實力差距以決定讓武 BP:
+// 每差一段,低段位者得 8 BP;高段位者永不獲得反向補償。
+enum Rank {
+  RANK_UNSPECIFIED = 0;
+  // 開山|初試之境 —— 初入 PVP、實戰場次較少。
+  RANK_KAISHAN = 1;
+  // 斷水|初成之境 —— 已具操作能力,對局觀念尚未成熟。
+  RANK_DUANSHUI = 2;
+  // 飛花|純熟之境 —— 成熟的 PVP 實力與足夠實戰經驗。
+  RANK_FEIHUA = 3;
+  // 無我|歷戰之境 —— 頂尖實戰能力與大量對局經驗。
+  RANK_WUWO = 4;
+}
+
+// TournamentPhase 是賽事生命週期。單向前進,所有階段限制**由伺服器驗證**
+// (前端變灰只是視覺)。唯一的例外是 RANKED → 可退回讓裁判改段位,
+// 一旦進入 DRAWING 就不能再改 —— BP 依段位差算出,抽籤後改段位會讓已發的預算對不上。
+enum TournamentPhase {
+  TOURNAMENT_PHASE_UNSPECIFIED = 0;
+  // 報名期。
+  TOURNAMENT_PHASE_SIGNUP = 1;
+  // 報名截止,尚未開始評段。
+  TOURNAMENT_PHASE_SIGNUP_CLOSED = 2;
+  // 裁判逐人評定段位中。
+  TOURNAMENT_PHASE_RANKING = 3;
+  // 段位已公布。刻意排在抽籤**之前**,讓選手有異議可提(走 Discord,不做線上申訴)。
+  TOURNAMENT_PHASE_RANKED = 4;
+  // 抽籤中。裁判確認前可整體重抽或交換籤位,每次動作進稽核紀錄。
+  TOURNAMENT_PHASE_DRAWING = 5;
+  // 比賽中。
+  TOURNAMENT_PHASE_IN_PROGRESS = 6;
+  // 結束。
+  TOURNAMENT_PHASE_FINISHED = 7;
+}
+
+// MatchStatus 是單場狀態。讓武與下注是**兩條不同的時間線**:
+//
+//   PENDING  對手未齊    讓武 ✗  下注 ✗
+//   READY    已開盤      讓武 ✓  下注 ✓
+//   LOCKED   讓武已封盤  讓武 ✗  下注 ✓
+//   LIVE     比賽中      讓武 ✗  下注 ✗
+//   DONE     已分勝負    讓武 ✗  下注 ✗
+//
+// 讓武要早收(對手需要時間適應被施加的限制),下注可以開到開賽前一刻。
+enum MatchStatus {
+  MATCH_STATUS_UNSPECIFIED = 0;
+  MATCH_STATUS_PENDING = 1;
+  MATCH_STATUS_READY = 2;
+  MATCH_STATUS_LOCKED = 3;
+  MATCH_STATUS_LIVE = 4;
+  MATCH_STATUS_DONE = 5;
+}
+
+// MatchResultKind 區分正常分出勝負與不戰而勝。
+// WALKOVER 會讓該場所有注單作廢退款 —— 賠率是按「真的打一場」算的。
+enum MatchResultKind {
+  MATCH_RESULT_KIND_UNSPECIFIED = 0;
+  MATCH_RESULT_KIND_NORMAL = 1;
+  MATCH_RESULT_KIND_WALKOVER = 2;
+}
+
+// PlayerStatus 是參賽者在本屆的狀態。
+enum PlayerStatus {
+  PLAYER_STATUS_UNSPECIFIED = 0;
+  PLAYER_STATUS_ACTIVE = 1;
+  PLAYER_STATUS_ELIMINATED = 2;
+  PLAYER_STATUS_WITHDRAWN = 3;
+}
+
+// HandicapCategory 是讓武項目的六大分類。
+//
+// 系統**刻意不做互斥檢查**:只要 BP 夠就能買,同一項目也能重複買。
+// VICTORY 類同時選多項會互相矛盾(例如「撐過 90 秒即獲勝」+「時間結束即勝利」),
+// 那由裁判臨場判 —— 前端只給非阻擋式提示,不擋購買。
+enum HandicapCategory {
+  HANDICAP_CATEGORY_UNSPECIFIED = 0;
+  // 武器限制:指定/隨機武學、禁切武器、禁特效。
+  HANDICAP_CATEGORY_WEAPON = 1;
+  // 技能限制:禁技能、禁奇術、禁普攻、禁處決、改鍵位。
+  HANDICAP_CATEGORY_SKILL = 2;
+  // 防禦與位移限制:禁移動、禁解控、禁迴避、禁卸勢、禁防禦、禁跳躍。
+  HANDICAP_CATEGORY_DEFENSE = 3;
+  // 下毒:讓守關元、打亂方向鍵、互換按鍵、讓半血。
+  HANDICAP_CATEGORY_POISON = 4;
+  // 勝利條件:改寫本場的判定方式。
+  HANDICAP_CATEGORY_VICTORY = 5;
+  // 規則限制:禁追擊、待角落、先手權、外觀、台詞。
+  HANDICAP_CATEGORY_RULE = 6;
+}
+
+// ── 訊息 ────────────────────────────────────────────────────────
+
+// Tournament 是一屆賽事的公開檢視。
+message Tournament {
+  string public_id = 1;
+  // 網址用的短代號,如 2026-baiye-shifeng。
+  string slug = 2;
+  string name = 3;
+  TournamentPhase phase = 4;
+  // 每差一段給多少 BP。預設 8;差二段 16、差三段 24、同段 0。
+  int64 bp_per_rank_gap = 5;
+  // 目前報名人數。人數不設上限,也不假設是 2 的冪次。
+  int32 player_count = 6;
+  google.protobuf.Timestamp created_at = 7;
+}
+
+// RankInfo 是段位的顯示資料。名稱與境界描述存在 tournaments.config,
+// 逐屆可調措辭 —— 所以由伺服器給,前端不要自己寫死中文。
+message RankInfo {
+  Rank rank = 1;
+  // 「開山」。
+  string name = 2;
+  // 「初試之境」。
+  string title = 3;
+  // 該段位的完整描述,規則頁用。
+  string description = 4;
+}
+
+// Player 是一位參賽者的公開檢視。
+//
+// 刻意不含通行碼相關的任何東西 —— 連「是否已重新產生過」都不揭露。
+message Player {
+  string public_id = 1;
+  // 報名當下的顯示名快照。之後改名不影響已公布的對戰表。
+  string display_name = 2;
+  // 遊戲ID,場上辨識用。全服唯一,也是登入帳號。
+  string game_id = 3;
+  // 裁判評定的本屆段位;UNSPECIFIED = 尚未評定。
+  // 未評定者不得進入抽籤。
+  Rank rank = 4;
+  PlayerStatus status = 5;
+  // 抽籤後的籤位;0 = 未抽。
+  int32 seed_no = 6;
+  // 綁定的平台帳號;**空字串 = 未綁定**(純活動報名)。
+  // 領獎前必須綁定 —— 獎金走 Ledger,要有收款對象。
+  string user_public_id = 7;
+}
+
+// Match 是一場比賽的公開檢視。
+message Match {
+  string public_id = 1;
+  // 1 = 首輪。
+  int32 round = 2;
+  // 該輪內位置,0-based。
+  int32 slot = 3;
+  // 空 = 尚未確定(等上一輪)。輪空在建樹時直接晉級,不會產生一場空比賽。
+  string p1_player_public_id = 4;
+  string p2_player_public_id = 5;
+  string winner_player_public_id = 6;
+  MatchStatus status = 7;
+  MatchResultKind result_kind = 8;
+  // 讓武是否開盤(裁判手動,不綁時鐘)。
+  bool handicap_open = 9;
+  // 直播連結;空 = 無。對戰表上標 LIVE 的場次可直接點進去。
+  string stream_url = 10;
+  optional google.protobuf.Timestamp started_at = 11;
+  optional google.protobuf.Timestamp finished_at = 12;
+}
+
+// BracketRound 是對戰表的一輪。
+//
+// 手機版是**分輪檢視**而不是縮小的完整樹(視覺規範硬規則 3),
+// 所以資料本來就按輪分組回傳,前端不需要自己 group by。
+//
+// 放在 common 而不是 tournament.proto,是因為裁判抽籤的回應也要用它 ——
+// 讓 judge.proto 去 import tournament.proto 會把「公開讀取」與「後台操作」
+// 兩個服務綁在一起,那條依賴沒有理由存在。
+message BracketRound {
+  // 1 = 首輪。
+  int32 round = 1;
+  // 這一輪的名稱,如「首輪」「八強」「四強」「決賽」。
+  // 由伺服器算(依總輪數反推),前端不要自己寫死。
+  string label = 2;
+  repeated Match matches = 3;
+}
+
+// HandicapItem 是一個可購買的讓武項目。
+message HandicapItem {
+  string public_id = 1;
+  HandicapCategory category = 2;
+  string name = 3;
+  // 給選手看的說明。
+  string description = 4;
+  // BP 價格。
+  int64 cost = 5;
+  // 原始清單標注「(可重複)」的項目。
+  // **僅供 UI 標示,不作強制** —— 目前所有項目都可重複購買。
+  bool repeatable = 6;
+  // 需要填寫指定內容的項目(如「指定對手武學」),前端要出一個輸入框。
+  bool requires_target_note = 7;
+  int32 sort_order = 8;
+}
+
+// HandicapSelection 是一次已成立的讓武選擇。
+//
+// 每買一次一列 —— 同一項目買三次就是三列,不是一列 qty=3。
+// 這樣每次購買都留有自己的價格快照與指定內容。
+message HandicapSelection {
+  string public_id = 1;
+  string item_public_id = 2;
+  // 項目名稱快照,避免前端為了顯示還要再查一次。
+  string item_name = 3;
+  HandicapCategory category = 4;
+  // 購買當下的價格快照。項目改價不影響已成立的選擇。
+  int64 cost = 5;
+  // 指定內容:「指定對手武學:XX」「互換的兩個按鍵:X 與 Y」。
+  string target_note = 6;
+  google.protobuf.Timestamp created_at = 7;
+}
+
+// BpBudget 是某人在某場的讓武預算。
+//
+// BP 不是貨幣:每輪依段位差重新發放,該場有效,**賽後作廢**,不跨輪累積、不找零。
+// 所以它不進平台帳本、不走 Ledger、不需冪等鍵。
+message BpBudget {
+  string match_public_id = 1;
+  string player_public_id = 2;
+  // 本場取得的 BP 總額 = (對手段位 − 自己段位) × bp_per_rank_gap。
+  // 0 = 同段或自己是高段位方,本場無讓武。
+  int64 budget = 3;
+  // 已花費。恆等於未作廢的 selections 的 cost 總和。
+  int64 spent = 4;
+  // 便利欄位 = budget − spent。伺服器算好給,避免前端各自算出不同答案。
+  int64 remaining = 5;
+}
+
+// MatchHandicaps 是一場比賽的讓武全貌,封盤後公開。
+//
+// 封盤前,選手只看得到自己買的;封盤後,雙方與觀眾都看得到全部 ——
+// 這正是「怕說明不夠清楚讓參加者混亂」的解方,所以這個訊息同時也是
+// Discord 公告的資料來源。
+message MatchHandicaps {
+  string match_public_id = 1;
+  MatchStatus status = 2;
+  // 施加者(低段位方)的預算與選擇。
+  BpBudget budget = 3;
+  repeated HandicapSelection selections = 4;
+  // 受限方(高段位方)。
+  string constrained_player_public_id = 5;
+  // 封盤時間;空 = 尚未封盤,此時 selections 只會包含請求者自己的。
+  optional google.protobuf.Timestamp locked_at = 6;
+}

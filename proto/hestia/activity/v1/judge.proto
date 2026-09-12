@@ -1,0 +1,257 @@
+syntax = "proto3";
+
+// 裁判後台(schemas/20、21)。御風羽幹部操作賽事的唯一入口。
+//
+// ── 這個服務的權限與留痕 ────────────────────────────────────────
+//
+// 全部 RPC 需要平台帳號 + 裁判權限,而且**每一支都寫 admin_audit_logs**。
+// 不是挑幾支寫 —— 賽事的公正性完全建立在「誰在什麼時候改了什麼」查得到。
+// 改段位、重抽籤、交換籤位、封盤、判賽果,每一項都有人會不服氣。
+//
+// ── 為什麼賽果只能裁判填 ────────────────────────────────────────
+//
+// 因為有下注。選手自報會直接變成派彩爭議,而派彩一旦發出去就很難收回。
+// 單一權威來源是這裡唯一可行的設計。
+//
+// ── 不可逆的兩個動作 ────────────────────────────────────────────
+//
+//   LockHandicap  封盤後選手不能再改讓武,且立刻公開並發 Discord 公告。
+//   ReportResult  判定勝負會觸發下注結算與派彩。
+//
+// 兩者都要求 confirm = true 作為二次確認。誤觸的代價由人承擔,不由系統吞掉。
+package hestia.activity.v1;
+
+import "hestia/activity/v1/common.proto";
+
+option go_package = "github.com/danicotech/hestia/gen/hestia/activity/v1;activityv1";
+
+// JudgeService 是裁判後台。全部需要裁判權限,全部進稽核紀錄。
+service JudgeService {
+  // 推進賽事階段(報名截止、開始評段、公布段位、開始抽籤……)。
+  rpc AdvancePhase(AdvancePhaseRequest) returns (AdvancePhaseResponse) {}
+
+  // 評定單一選手的段位。只在 RANKING 與 RANKED 階段可行。
+  rpc AssignRank(AssignRankRequest) returns (AssignRankResponse) {}
+  // 列出待評段的選手與他們的報名資料。
+  rpc ListUnranked(ListUnrankedRequest) returns (ListUnrankedResponse) {}
+
+  // 隨機抽籤排出梯狀表。確認前可重複呼叫以重抽。
+  rpc DrawBracket(DrawBracketRequest) returns (DrawBracketResponse) {}
+  // 交換兩人的籤位。應付臨時棄賽與時段衝突。
+  rpc SwapSeeds(SwapSeedsRequest) returns (SwapSeedsResponse) {}
+  // 確認對戰表並公布。確認後籤位鎖定,並發 Discord 公告。
+  rpc ConfirmBracket(ConfirmBracketRequest) returns (ConfirmBracketResponse) {}
+
+  // 開盤:讓該場的低段位方可以開始選讓武。
+  rpc OpenHandicap(OpenHandicapRequest) returns (OpenHandicapResponse) {}
+  // 封盤:選手不能再改,內容立刻公開並發 Discord 公告。**不可逆**。
+  rpc LockHandicap(LockHandicapRequest) returns (LockHandicapResponse) {}
+
+  // 設定直播連結。
+  rpc SetStreamUrl(SetStreamUrlRequest) returns (SetStreamUrlResponse) {}
+  // 標記開打(關閉下注)。
+  rpc StartMatch(StartMatchRequest) returns (StartMatchResponse) {}
+  // 判定勝負。觸發晉級與下注結算。**不可逆**。
+  rpc ReportResult(ReportResultRequest) returns (ReportResultResponse) {}
+
+  // 選手棄賽。對手不戰而勝,該場所有注單作廢退款。
+  rpc WithdrawPlayer(WithdrawPlayerRequest) returns (WithdrawPlayerResponse) {}
+  // 重新產生通行碼。舊碼立即失效,回傳的明碼要由裁判私訊給本人。
+  rpc RegeneratePasscode(RegeneratePasscodeRequest) returns (RegeneratePasscodeResponse) {}
+
+  // 發放賽事獎金。得獎者必須已綁定平台帳號。
+  rpc AwardPrizes(AwardPrizesRequest) returns (AwardPrizesResponse) {}
+}
+
+message AdvancePhaseRequest {
+  string tournament_slug = 1;
+  // 要推進到哪個階段。只能往前,唯一的例外是 DRAWING 退回 RANKED 以修正段位。
+  TournamentPhase to_phase = 2;
+  // 為什麼。進稽核紀錄。
+  string note = 3;
+}
+
+message AdvancePhaseResponse {
+  Tournament tournament = 1;
+}
+
+message AssignRankRequest {
+  string player_public_id = 1;
+  Rank rank = 2;
+  // 評定理由。進稽核紀錄,也是日後有人不服氣時的依據。
+  string note = 3;
+}
+
+message AssignRankResponse {
+  Player player = 1;
+}
+
+message ListUnrankedRequest {
+  string tournament_slug = 1;
+  // true = 連已評定的也列出(要複查或改段位時用)。
+  bool include_ranked = 2;
+}
+
+// PlayerDossier 是評段用的完整檢視 —— 只有裁判看得到報名表的內容。
+message PlayerDossier {
+  Player player = 1;
+  string discord_name = 2;
+  // 選手自評的段位。與裁判評定的差距本身就是資訊。
+  Rank self_rated_rank = 3;
+  string ladder_rank = 4;
+  int32 ladder_score = 5;
+  string arts_note = 6;
+  string availability_note = 7;
+  // 往屆最後一次評定的段位;UNSPECIFIED = 初次參賽。
+  Rank previous_rank = 8;
+  // 歷屆累計戰績。
+  int32 tournaments_played = 9;
+  int32 wins = 10;
+  int32 losses = 11;
+}
+
+message ListUnrankedResponse {
+  repeated PlayerDossier players = 1;
+}
+
+message DrawBracketRequest {
+  string tournament_slug = 1;
+  // 隨機種子。留 0 = 伺服器自己產。
+  // 指定同一個種子會排出同一張表 —— 需要向人證明「這張表確實是這個種子抽出來的」時用。
+  int64 seed = 2;
+}
+
+message DrawBracketResponse {
+  repeated BracketRound rounds = 1;
+  // 本次使用的種子,寫進稽核紀錄,也回給裁判存證。
+  int64 seed = 2;
+  // 輪空的選手。人數不是 2 的冪次時一定會有。
+  repeated string bye_player_public_ids = 3;
+}
+
+message SwapSeedsRequest {
+  string player_a_public_id = 1;
+  string player_b_public_id = 2;
+  // 為什麼要換。進稽核紀錄 —— 手動介入隨機抽籤是最需要解釋的動作。
+  string note = 3;
+}
+
+message SwapSeedsResponse {
+  repeated BracketRound rounds = 1;
+}
+
+message ConfirmBracketRequest {
+  string tournament_slug = 1;
+  // 二次確認。確認後籤位鎖定並公布。
+  bool confirm = 2;
+}
+
+message ConfirmBracketResponse {
+  Tournament tournament = 1;
+}
+
+message OpenHandicapRequest {
+  string match_public_id = 1;
+}
+
+message OpenHandicapResponse {
+  Match match = 1;
+}
+
+message LockHandicapRequest {
+  string match_public_id = 1;
+  // 二次確認。**不可逆**:封盤後選手不能再改,內容立刻公開並發公告。
+  bool confirm = 2;
+}
+
+message LockHandicapResponse {
+  Match match = 1;
+  // 封盤當下的完整讓武內容,即公告要發出去的東西。
+  MatchHandicaps handicaps = 2;
+}
+
+message SetStreamUrlRequest {
+  string match_public_id = 1;
+  // 空字串 = 清掉。
+  string stream_url = 2;
+}
+
+message SetStreamUrlResponse {
+  Match match = 1;
+}
+
+message StartMatchRequest {
+  string match_public_id = 1;
+}
+
+message StartMatchResponse {
+  Match match = 1;
+}
+
+message ReportResultRequest {
+  string match_public_id = 1;
+  string winner_player_public_id = 2;
+  // 二次確認。**不可逆**:會觸發晉級與派彩。
+  bool confirm = 3;
+  // 備註。爭議場次的裁決理由寫這裡,進稽核紀錄。
+  string note = 4;
+}
+
+message ReportResultResponse {
+  Match match = 1;
+  // 下一輪因此而成形的場次(勝者晉級後對手確定了)。
+  repeated Match advanced_matches = 2;
+  // 本次結算影響的注單數,給裁判一個「確實發生了」的回饋。
+  int32 settled_bet_count = 3;
+}
+
+message WithdrawPlayerRequest {
+  string player_public_id = 1;
+  // 為什麼棄賽。進稽核紀錄。
+  string note = 2;
+  bool confirm = 3;
+}
+
+message WithdrawPlayerResponse {
+  Player player = 1;
+  // 因此被判不戰而勝的場次。
+  repeated Match walkover_matches = 2;
+  // 因此作廢退款的注單數。
+  int32 voided_bet_count = 3;
+}
+
+message RegeneratePasscodeRequest {
+  string player_public_id = 1;
+}
+
+message RegeneratePasscodeResponse {
+  // 新的明碼通行碼。**只在這裡出現一次**,由裁判私訊給本人。
+  // 舊碼在此刻立即失效。
+  string passcode = 1;
+}
+
+message AwardPrizesRequest {
+  string tournament_slug = 1;
+  // 二次確認。會實際動平台代幣。
+  bool confirm = 2;
+  // 動錢的 RPC 一律要帶。重送同一把鍵不會重複發獎。
+  string idempotency_key = 3;
+}
+
+// PrizeAward 是一筆發獎結果。
+message PrizeAward {
+  string player_public_id = 1;
+  string display_name = 2;
+  // champion / runner_up / third / participation。
+  string prize_kind = 3;
+  int64 amount = 4;
+  // false = 沒發成。目前唯一的原因是得獎者尚未綁定平台帳號。
+  bool granted = 5;
+  // granted = false 時的人話說明。
+  string skipped_reason = 6;
+}
+
+message AwardPrizesResponse {
+  repeated PrizeAward awards = 1;
+  bool replayed = 2;
+}
