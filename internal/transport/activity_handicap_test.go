@@ -371,3 +371,40 @@ func TestBpBudgetRemainingNeverNegative(t *testing.T) {
 	}
 	_ = bp.DefaultPerRankGap
 }
+
+// 讓武項目總表是規則本身,沒報名的人與觀眾都要查得到。
+//
+// 這一頁是「選購時手邊查得到價目」的地方,而那正是這個系統最初要解決的混亂。
+// 清單裡沒有 referee_note(裁判怎麼確認對手遵守),那一欄從不離開裁判端。
+func TestListItemsIsPublicWithExplicitSlug(t *testing.T) {
+	deps, svc, _ := handicapDeps()
+	srv := newActivityServer(t, deps)
+	client := activityv1connect.NewHandicapServiceClient(srv.Client(), srv.URL)
+
+	// 完全沒有 session —— 一個還在考慮要不要報名的人。
+	got, err := client.ListItems(context.Background(),
+		connect.NewRequest(&activityv1.ListItemsRequest{TournamentSlug: testSlug}))
+	if err != nil {
+		t.Fatalf("匿名應該讀得到規則:%v", err)
+	}
+	if len(got.Msg.GetItems()) == 0 {
+		t.Fatal("回了空清單,規則頁會是一片空白")
+	}
+	if len(svc.itemsFor) != 1 {
+		t.Fatalf("應該真的去查了本屆:%v", svc.itemsFor)
+	}
+}
+
+// 沒帶 slug 又沒有身分,就真的無從得知要哪一屆。
+func TestListItemsWithoutSlugStillNeedsIdentity(t *testing.T) {
+	deps, svc, _ := handicapDeps()
+	srv := newActivityServer(t, deps)
+	client := activityv1connect.NewHandicapServiceClient(srv.Client(), srv.URL)
+
+	_, err := client.ListItems(context.Background(),
+		connect.NewRequest(&activityv1.ListItemsRequest{}))
+	requireCode(t, err, connect.CodeUnauthenticated)
+	if len(svc.itemsFor) != 0 {
+		t.Fatal("問不出是哪一屆就不該碰領域層")
+	}
+}

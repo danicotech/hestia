@@ -56,21 +56,36 @@ type activityHandicapHandler struct {
 }
 
 // ListItems 列出本屆所有可購買的讓武項目。
+//
+// # 為什麼帶了 slug 就不需要身分
+//
+// 這份清單**就是規則**:名稱、說明、BP 價格。規則頁要讓還沒報名的人、
+// 以及觀眾都查得到 —— 這場活動的目的本來就是「闔家觀賞」,而選手在選讓武
+// 的時候必須手邊就查得到價目,那是這個系統最初要解決的混亂。
+//
+// 它不含 referee_note(裁判怎麼確認對手遵守),那一欄從不離開裁判端。
+//
+// 沒帶 slug 時仍然需要身分:那是選手端的便利寫法(「我這一屆的項目」),
+// 而「我」只能從 session 來。
 func (h activityHandicapHandler) ListItems(
 	ctx context.Context, req *connect.Request[activityv1.ListItemsRequest],
 ) (*connect.Response[activityv1.ListItemsResponse], error) {
 	if h.svc == nil || h.tournaments == nil {
 		return nil, unimplemented("HandicapService.ListItems")
 	}
-	id, err := requireActivityIdentity(ctx, h.sessions, req.Header())
-	if err != nil {
-		return nil, err
-	}
 	slug := strings.TrimSpace(req.Msg.GetTournamentSlug())
-	if slug == "" {
+	// 有 session 就仍然比對它屬於哪一屆。這一道不是為了擋人 —— 沒有 session
+	// 的人本來就讀得到 —— 是為了擋**前端送錯 slug**:對一個已登入的選手
+	// 默默顯示另一屆的價格,是最難查的那種 bug。
+	id, idErr := requireActivityIdentity(ctx, h.sessions, req.Header())
+	switch {
+	case slug == "":
+		// 選手端的便利寫法(「我這一屆的項目」),而「我」只能從 session 來。
+		if idErr != nil {
+			return nil, idErr
+		}
 		slug = id.TournamentSlug
-	}
-	if slug != id.TournamentSlug {
+	case idErr == nil && slug != id.TournamentSlug:
 		return nil, connectError(connect.CodePermissionDenied, errActivitySessionWrongTournament)
 	}
 	view, err := h.tournaments.Get(ctx, slug)
