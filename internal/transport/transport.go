@@ -257,6 +257,7 @@ func New(deps Deps) (*Server, error) {
 	mux.Handle(platformv1connect.NewAuthServiceHandler(authHandler{
 		svc:     deps.Auth,
 		cookie:  stateCookie,
+		session: newSessionCookieConfig(basePath),
 		trusted: deps.TrustedProxies,
 	}, opts...))
 	mux.Handle(platformv1connect.NewMeServiceHandler(meHandler{

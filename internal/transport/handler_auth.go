@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/netip"
 	"strings"
+	"time"
 
 	"connectrpc.com/connect"
 
@@ -20,6 +21,7 @@ import (
 type authHandler struct {
 	svc     AuthService
 	cookie  stateCookieConfig
+	session sessionCookieConfig
 	trusted []netip.Prefix
 }
 
@@ -95,10 +97,22 @@ func (h authHandler) LocalLogin(
 	if err != nil {
 		return nil, toConnectError(err)
 	}
-	return connect.NewResponse(&platformv1.LocalLoginResponse{
+	res := connect.NewResponse(&platformv1.LocalLoginResponse{
 		Session: sessionToProto(session),
 		Profile: profileToProto(profile),
-	}), nil
+	})
+	// 瀏覽器要的是 cookie,不是 body 裡的 token。
+	//
+	// Discord 那條路是瀏覽器導向,cookie 在 /auth/discord/callback 設好;
+	// 本地登入沒有導向,所以 cookie 只能在這裡設。少了這兩行,裁判會看到
+	// 「登入成功」然後每一支 RPC 都回未認證 —— 而那種失敗沒有任何徵兆指向
+	// 這裡。同樣的做法見 SignupService.Login(選手的活動層 session)。
+	//
+	// 回應 body 仍然帶 token:服務端呼叫方(stentor 之類)沒有 cookie jar。
+	now := time.Now()
+	setCookie(res, h.session.issueAccess(session.AccessToken, session.AccessTokenExpiresAt, now))
+	setCookie(res, h.session.issueRefresh(session.RefreshToken, session.RefreshTokenExpiresAt, now))
+	return res, nil
 }
 
 func (h authHandler) RefreshSession(

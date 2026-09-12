@@ -3,6 +3,7 @@ package transport_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"connectrpc.com/connect"
@@ -140,5 +141,42 @@ func TestLocalLoginFailureCarriesStableReason(t *testing.T) {
 	}
 	if got := transport.ErrorReason(err); got != "local_invalid_credentials" {
 		t.Fatalf("reason = %q,要 local_invalid_credentials", got)
+	}
+}
+
+// 瀏覽器靠 cookie,不靠回應 body 裡的 token。
+//
+// Discord 那條路是瀏覽器導向,cookie 在 /auth/discord/callback 設;本地登入
+// 沒有導向,cookie 只能由這支 RPC 設。少了它,裁判會看到「登入成功」然後
+// 每一支 RPC 都回未認證 —— 那種失敗不會有任何徵兆指向這裡,所以要釘住。
+func TestLocalLoginSetsSessionCookies(t *testing.T) {
+	svc := &localAuth{}
+	srv, _ := newServer(t, transport.Deps{Auth: svc})
+	client := platformv1connect.NewAuthServiceClient(srv.Client(), srv.URL)
+
+	res, err := client.LocalLogin(context.Background(),
+		connect.NewRequest(&platformv1.LocalLoginRequest{LoginName: "lin", Passcode: "ABCD2345EFGH"}))
+	if err != nil {
+		t.Fatalf("LocalLogin: %v", err)
+	}
+
+	cookies := res.Header().Values("Set-Cookie")
+	if len(cookies) < 2 {
+		t.Fatalf("要同時發 access 與 refresh 兩個 cookie,得到 %v", cookies)
+	}
+	joined := strings.Join(cookies, "\n")
+	for _, want := range []string{"access", "refresh"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("cookie 裡沒有 %s:%v", want, cookies)
+		}
+	}
+	// 憑證不該被 JS 讀到,也不該被跨站的 POST 帶上。
+	if !strings.Contains(joined, "HttpOnly") {
+		t.Errorf("session cookie 必須 HttpOnly:%v", cookies)
+	}
+
+	// body 仍然帶 token:服務端呼叫方沒有 cookie jar。
+	if res.Msg.GetSession().GetAccessToken() == "" {
+		t.Error("回應 body 也要帶 session")
 	}
 }
