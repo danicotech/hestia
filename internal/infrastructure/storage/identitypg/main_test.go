@@ -31,6 +31,8 @@ const (
 	testClientID  = "test-client-id"
 	testSecret    = "test-client-secret"
 	testRedirect  = "https://example.test/auth/callback"
+	// testHashIterations 是本地登入通行碼的測試迭代數(見 Config.LocalHashIterations)。
+	testHashIterations = 32
 )
 
 var (
@@ -65,6 +67,10 @@ func TestMain(m *testing.M) {
 		Scopes:       []string{"identify", "email"},
 		Endpoints:    fake.endpoints(),
 		TokenEncKey:  []byte(testEncKey),
+		// 本地登入的雜湊調到測試等級。正式環境要慢(那是安全性的來源),
+		// 但每個失敗案例都等半秒的話,失敗路徑就不會被測滿 ——
+		// 而這裡最該被測滿的正是失敗路徑。
+		LocalHashIterations: testHashIterations,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "identitypg.New:", err)

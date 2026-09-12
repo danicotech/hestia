@@ -11,19 +11,28 @@
 // 報名**不需要**平台帳號。門檻要夠低:百業的成員未必都綁過 Discord OAuth,
 // 而「先去登入再回來報名」會直接勸退一部分人。
 //
-// 代價是活動層要自己發一組憑證,也就是通行碼。這造成雙軌身分:
-//   選手    → 遊戲ID + 通行碼 → 活動層 session
+// 代價是活動層要自己認一組身分。這造成雙軌:
+//   選手    → 遊戲ID → 活動層 session
 //   下注者  → 平台帳號 Bearer → 要動平台代幣
 // 兩者可以是同一人:選手事後 BindPlatformAccount 即可。領獎**必須**先綁。
 //
-// ── 通行碼的安全性 ──────────────────────────────────────────────
+// ── 登入只要遊戲ID(2026-09-13 定案,推翻先前的通行碼登入)──────
 //
-// 通行碼是 6 碼、排除易混淆字元(0/O、1/I/l)、DB 只存 hash。
-// 它只在 Register 的回應裡出現**一次**,之後任何 API 都不會再吐明碼 ——
-// 裁判後台也看不到,只能「重新產生」(舊碼立即失效,動作進稽核紀錄)。
+// 報名只有 game_id 必填,登入也只要 game_id —— 沒有通行碼這一步了。
 //
-// 這不是銀行等級的安全,也不需要是:它保護的是「別人不能改你的讓武選擇」,
-// 而所有破壞性操作都還有裁判這道人工關卡。
+// 代價是清楚的而且是被接受的:遊戲ID 全服唯一且公開(對戰表上就印著),
+// 所以任何人知道某位選手的遊戲ID 就能以他的身分登入、花掉他的 BP、
+// 改他的讓武選擇。換來的是報名到登入之間沒有任何要抄、會抄錯、會弄丟的東西。
+//
+// 唯一的門鎖是**狀態**:只有 status = ACTIVE 的選手登得進來。棄賽
+// (JudgeService.WithdrawPlayer)因此同時是「把這個人擋在外面」的手段,
+// 不只是賽程上的處置;已淘汰者同樣登不進來。三種失敗(查無此 ID、
+// 非 ACTIVE、格式不合)對呼叫端是**同一個**錯誤,不做任何區分。
+//
+// 通行碼沒有消失,只是不再是給選手看的東西:tournament_players.passcode_hash
+// 照舊產生並寫入(NOT NULL),它的同伴 passcode_issued_at 則是**已發出的
+// session 的作廢依據**。裁判的「重新產生通行碼」現在的意思是「把這個人
+// 現在所有的 session 全部踢掉」—— 棄賽之外的第二道槓桿。
 
 package activityv1
 
@@ -44,8 +53,13 @@ const (
 
 // RegisterRequest 是一份報名表。
 //
-// 除了前四欄,其餘全是**給裁判評段用的參考資料** —— 御風羽要綜合論劍段位、
-// 積分、實戰經驗與整體 PVP 實力來評,所以表單問的比「你叫什麼」多。
+// **只有 game_id 是必填的**(2026-09-13 定案)。其餘每一欄留空都能報名成功 ——
+// 報名的門檻要低到「知道自己遊戲ID 就能報」,任何一個多出來的必填欄位
+// 都會在報名頁上攔掉一部分人。
+//
+// 選填的那些全是**給裁判評段用的參考資料** —— 御風羽要綜合論劍段位、積分、
+// 實戰經驗與整體 PVP 實力來評,所以表單問得比「你叫什麼」多;
+// 但問得多不等於要求得多,沒填就是裁判少一份參考。
 type RegisterRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// 要報名哪一屆,如 2026-baiye-shifeng。
@@ -53,19 +67,19 @@ type RegisterRequest struct {
 	// 遊戲ID。全服唯一,場上辨識與登入都用它。
 	// 若這個 ID 報過往屆,伺服器會自動接上既有的選手檔案。
 	GameId string `protobuf:"bytes,2,opt,name=game_id,json=gameId,proto3" json:"game_id,omitempty"`
-	// 顯示名。留空則沿用 game_id。
+	// 顯示名。選填,留空則沿用 game_id。
 	DisplayName string `protobuf:"bytes,3,opt,name=display_name,json=displayName,proto3" json:"display_name,omitempty"`
-	// Discord 名稱。裁判聯絡與公告 tag 用。
+	// Discord 名稱。選填 —— 裁判聯絡與公告 tag 用,沒填就只能在遊戲裡找人。
 	DiscordName string `protobuf:"bytes,4,opt,name=discord_name,json=discordName,proto3" json:"discord_name,omitempty"`
-	// 自評段位。除了當評段起點,也讓裁判看得出誰高估或低估自己。
+	// 自評段位。選填。除了當評段起點,也讓裁判看得出誰高估或低估自己。
 	SelfRatedRank Rank `protobuf:"varint,5,opt,name=self_rated_rank,json=selfRatedRank,proto3,enum=hestia.activity.v1.Rank" json:"self_rated_rank,omitempty"`
-	// 遊戲內論劍段位。
+	// 遊戲內論劍段位。選填。
 	LadderRank string `protobuf:"bytes,6,opt,name=ladder_rank,json=ladderRank,proto3" json:"ladder_rank,omitempty"`
-	// 遊戲內積分。
+	// 遊戲內積分。選填(0 = 沒填)。
 	LadderScore int32 `protobuf:"varint,7,opt,name=ladder_score,json=ladderScore,proto3" json:"ladder_score,omitempty"`
-	// 常用武學 / PVP 經驗描述。沒實際對過時的判斷依據,也能做選手介紹卡。
+	// 常用武學 / PVP 經驗描述。選填。沒實際對過時的判斷依據,也能做選手介紹卡。
 	ArtsNote string `protobuf:"bytes,8,opt,name=arts_note,json=artsNote,proto3" json:"arts_note,omitempty"`
-	// 可出賽時段 / 備註。裁判排輪次時程用。
+	// 可出賽時段 / 備註。選填。裁判排輪次時程用。
 	AvailabilityNote string `protobuf:"bytes,9,opt,name=availability_note,json=availabilityNote,proto3" json:"availability_note,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
@@ -164,13 +178,14 @@ func (x *RegisterRequest) GetAvailabilityNote() string {
 	return ""
 }
 
-// RegisterResponse 帶回**唯一一次**看得到明碼通行碼的機會。
+// RegisterResponse 是報名的結果。
+//
+// **刻意沒有通行碼**(2026-09-13):登入只要遊戲ID,所以回一組明碼通行碼
+// 只會讓人以為那是要保存的東西。欄位 2 保留不再使用,避免哪天被重新賦義
+// 而讓舊客戶端把新欄位當成通行碼顯示出來。
 type RegisterResponse struct {
 	state  protoimpl.MessageState `protogen:"open.v1"`
 	Player *Player                `protobuf:"bytes,1,opt,name=player,proto3" json:"player,omitempty"`
-	// 明碼通行碼。**只在這裡出現一次**,伺服器只存 hash。
-	// 前端必須明確提示使用者截圖或抄下來。
-	Passcode string `protobuf:"bytes,2,opt,name=passcode,proto3" json:"passcode,omitempty"`
 	// true = 這個遊戲ID 在往屆報過名,已接上既有檔案。
 	// 前端可據此顯示「歡迎回來,上屆你是斷水」。
 	ReturningFencer bool `protobuf:"varint,3,opt,name=returning_fencer,json=returningFencer,proto3" json:"returning_fencer,omitempty"`
@@ -218,13 +233,6 @@ func (x *RegisterResponse) GetPlayer() *Player {
 	return nil
 }
 
-func (x *RegisterResponse) GetPasscode() string {
-	if x != nil {
-		return x.Passcode
-	}
-	return ""
-}
-
 func (x *RegisterResponse) GetReturningFencer() bool {
 	if x != nil {
 		return x.ReturningFencer
@@ -239,13 +247,17 @@ func (x *RegisterResponse) GetPreviousRank() Rank {
 	return Rank_RANK_UNSPECIFIED
 }
 
+// LoginRequest 只要遊戲ID。
+//
+// 欄位 3 是原本的 passcode,保留不再使用:舊客戶端照送不會壞,但伺服器
+// 從此不看它,也不會有人把那個位置改成別的意思。
 type LoginRequest struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	TournamentSlug string                 `protobuf:"bytes,1,opt,name=tournament_slug,json=tournamentSlug,proto3" json:"tournament_slug,omitempty"`
-	GameId         string                 `protobuf:"bytes,2,opt,name=game_id,json=gameId,proto3" json:"game_id,omitempty"`
-	Passcode       string                 `protobuf:"bytes,3,opt,name=passcode,proto3" json:"passcode,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// 遊戲ID。查無、非 ACTIVE、格式不合一律回同一個錯誤(見檔頭)。
+	GameId        string `protobuf:"bytes,2,opt,name=game_id,json=gameId,proto3" json:"game_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *LoginRequest) Reset() {
@@ -288,13 +300,6 @@ func (x *LoginRequest) GetTournamentSlug() string {
 func (x *LoginRequest) GetGameId() string {
 	if x != nil {
 		return x.GameId
-	}
-	return ""
-}
-
-func (x *LoginRequest) GetPasscode() string {
-	if x != nil {
-		return x.Passcode
 	}
 	return ""
 }
@@ -612,16 +617,14 @@ const file_hestia_activity_v1_signup_proto_rawDesc = "" +
 	"ladderRank\x12!\n" +
 	"\fladder_score\x18\a \x01(\x05R\vladderScore\x12\x1b\n" +
 	"\tarts_note\x18\b \x01(\tR\bartsNote\x12+\n" +
-	"\x11availability_note\x18\t \x01(\tR\x10availabilityNote\"\xcc\x01\n" +
+	"\x11availability_note\x18\t \x01(\tR\x10availabilityNote\"\xc0\x01\n" +
 	"\x10RegisterResponse\x122\n" +
-	"\x06player\x18\x01 \x01(\v2\x1a.hestia.activity.v1.PlayerR\x06player\x12\x1a\n" +
-	"\bpasscode\x18\x02 \x01(\tR\bpasscode\x12)\n" +
+	"\x06player\x18\x01 \x01(\v2\x1a.hestia.activity.v1.PlayerR\x06player\x12)\n" +
 	"\x10returning_fencer\x18\x03 \x01(\bR\x0freturningFencer\x12=\n" +
-	"\rprevious_rank\x18\x04 \x01(\x0e2\x18.hestia.activity.v1.RankR\fpreviousRank\"l\n" +
+	"\rprevious_rank\x18\x04 \x01(\x0e2\x18.hestia.activity.v1.RankR\fpreviousRankJ\x04\b\x02\x10\x03R\bpasscode\"`\n" +
 	"\fLoginRequest\x12'\n" +
 	"\x0ftournament_slug\x18\x01 \x01(\tR\x0etournamentSlug\x12\x17\n" +
-	"\agame_id\x18\x02 \x01(\tR\x06gameId\x12\x1a\n" +
-	"\bpasscode\x18\x03 \x01(\tR\bpasscode\"C\n" +
+	"\agame_id\x18\x02 \x01(\tR\x06gameIdJ\x04\b\x03\x10\x04R\bpasscode\"C\n" +
 	"\rLoginResponse\x122\n" +
 	"\x06player\x18\x01 \x01(\v2\x1a.hestia.activity.v1.PlayerR\x06player\"\x0f\n" +
 	"\rLogoutRequest\"\x10\n" +

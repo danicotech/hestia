@@ -16,7 +16,10 @@ import (
 //
 // # 明碼通行碼的流向
 //
-// 明碼只存在於兩個回傳值裡:Register 與 RegeneratePasscode。
+// 明碼只存在於**一個**回傳值裡:RegeneratePasscode(給裁判)。
+// Register 也會產生一組(passcode_hash 是 NOT NULL),但**不回傳** ——
+// 登入用不到它,吐一組沒有用途的密碼只會讓人以為那是要保存的東西。
+//
 // 它不進參數、不進 Repo、不進錯誤訊息、**不進任何日誌** ——
 // 這個套件裡沒有任何一行會把通行碼寫到 return 以外的地方,
 // 而這是刻意維持的性質,不是碰巧。加日誌前請先想清楚這一句。
@@ -32,14 +35,21 @@ func NewService(repo Repo, hasher *Hasher) *Service {
 
 // RegisterParams 是一份報名表。
 //
-// 除了前三欄,其餘全是**給裁判評段用的參考資料** —— 評段要綜合論劍段位、
-// 積分、實戰經驗與整體 PVP 實力,所以表單問的比「你叫什麼」多。
+// **只有 GameID 是必填的**(2026-09-13 定案,推翻了 Discord 名稱必填)。
+// 其餘每一欄留空都能報名成功 —— 報名的門檻要低到「知道自己遊戲ID 就能報」,
+// 每多一個必填欄位就在報名頁上攔掉一部分人。
+//
+// 選填的那些是**給裁判評段用的參考資料**:評段要綜合論劍段位、積分、實戰經驗與
+// 整體 PVP 實力,所以表單問得比「你叫什麼」多;問得多不等於要求得多,
+// 沒填就是裁判少一份參考。
 type RegisterParams struct {
 	TournamentSlug string
-	// GameID 全服唯一。報過往屆的話會自動接上既有的選手檔案。
+	// GameID 全服唯一,**唯一必填欄位**。報過往屆的話會自動接上既有的選手檔案。
 	GameID string
 	// DisplayName 留空則沿用 GameID。
 	DisplayName string
+	// DiscordName 選填。裁判聯絡選手(排輪次、通知封盤)用,沒填就只能在遊戲裡找人 ——
+	// 那是報名者自己的取捨,不是把他擋在門外的理由。
 	DiscordName string
 	// SelfRatedRank 自評段位;RankUnspecified = 沒填。
 	// 除了當評段起點,也讓裁判看得出誰高估或低估自己。
@@ -50,13 +60,15 @@ type RegisterParams struct {
 	AvailabilityNote string
 }
 
-// RegisterResult 帶回**唯一一次**看得到明碼通行碼的機會。
+// RegisterResult 是報名的結果。
+//
+// **刻意沒有通行碼欄位**(2026-09-13):Register 仍然會產生並存一組雜湊
+// (passcode_hash 是 NOT NULL,而 passcode_issued_at 是 session 作廢的依據),
+// 但登入只要遊戲ID,明碼對選手沒有任何用途。結構裡沒有這個欄位,
+// 就不可能有人在 transport 那端「順手」把它放進回應。
 type RegisterResult struct {
 	Player tournament.Player
 	Fencer Fencer
-	// Passcode 是明碼通行碼。只在這裡出現一次,資料庫只存 hash,
-	// 裁判後台也看不到。前端必須明確提示使用者抄下來。
-	Passcode string
 	// ReturningFencer = 這個遊戲ID 在往屆報過名,已接上既有檔案。
 	ReturningFencer bool
 	// PreviousRank 是往屆最後一次的評定段位;RankUnspecified = 初次參賽。
@@ -77,10 +89,10 @@ func (s *Service) Register(ctx context.Context, p RegisterParams) (*RegisterResu
 	if err != nil {
 		return nil, err
 	}
+	// Discord 名稱選填(2026-09-13)。空字串是合法值,照樣寫進去 ——
+	// discord_name 是 NOT NULL,而 adapter 那句 NULLIF/COALESCE 會處理
+	// 「沒填就別洗掉跨屆檔案上原有的那一份」。
 	discordName := strings.TrimSpace(p.DiscordName)
-	if discordName == "" {
-		return nil, ErrDiscordNameRequired
-	}
 	displayName := strings.TrimSpace(p.DisplayName)
 	if displayName == "" {
 		displayName = gameID
@@ -115,6 +127,9 @@ func (s *Service) Register(ctx context.Context, p RegisterParams) (*RegisterResu
 		return nil, err
 	}
 
+	// 明碼產生了但**不回傳**:passcode_hash 是 NOT NULL,而與它同時寫下的
+	// passcode_issued_at 是日後作廢 session 的依據。登入用不到明碼,
+	// 所以它在這個函式結束時就沒有任何副本留下來(見 RegisterResult)。
 	passcode, err := GeneratePasscode()
 	if err != nil {
 		return nil, err
@@ -144,69 +159,72 @@ func (s *Service) Register(ctx context.Context, p RegisterParams) (*RegisterResu
 	return &RegisterResult{
 		Player:          reg.Player,
 		Fencer:          reg.Fencer,
-		Passcode:        passcode,
 		ReturningFencer: reg.ReturningFencer,
 		PreviousRank:    reg.PreviousRank,
 	}, nil
 }
 
-// LoginParams 是一次選手登入。
+// LoginParams 是一次選手登入。**沒有通行碼欄位**,見 Login。
 type LoginParams struct {
 	TournamentSlug string
 	GameID         string
-	Passcode       string
 }
 
-// Login 用遊戲ID + 通行碼驗明選手身分。
+// Login 用遊戲ID 驗明選手身分。
 //
-// # 兩條失敗路徑必須長得一模一樣
+// # 沒有通行碼(2026-09-13 定案)
 //
-// 「查無此遊戲ID」與「通行碼錯誤」回同一個 ErrInvalidCredentials,
-// 訊息裡沒有任何能分辨兩者的線索(schemas/20 明訂)。否則登入頁就成了
-// 一份「誰報了名」的查詢介面,而報名期間那不是公開資訊。
+// 給對遊戲ID 就能登入。代價是已知且被接受的:遊戲ID 全服唯一且公開
+// (對戰表上就印著),所以任何人知道某位選手的遊戲ID 就能以他的身分登入、
+// 花掉他的 BP、改他的讓武選擇。換來的是報名到登入之間沒有任何要抄寫的東西。
 //
-// 光是回同一個錯誤還不夠:查無此人時若直接返回,它會比「查到人但驗證失敗」
-// 快上幾十毫秒,而那個時間差一樣答得出「這個 ID 存不存在」。
-// 所以查無此人時照樣跑一次完整的雜湊比對(VerifyDummy),把兩條路徑的
-// 工作量拉平。這是本函式唯一看起來「多餘」的一行,不要刪。
+// # 狀態是唯一的門鎖
+//
+// 既然沒有密碼可以換,「把某個人擋在外面」就只剩他的狀態這一個槓桿:
+// **只有 PlayerActive 登得進來**,棄賽與已淘汰都不行。所以裁判的
+// WithdrawPlayer 不只是賽程上的處置,它同時是「鎖住這個帳號」的手段
+// (要連現在還活著的 session 一起踢掉,再做一次 RegeneratePasscode)。
+//
+// # 三條失敗路徑必須長得一模一樣
+//
+// 查無此遊戲ID、非 active、格式不合 —— 全部回同一個 ErrInvalidCredentials,
+// 訊息裡沒有任何能分辨它們的線索。分得出來的話,登入頁就成了一支
+// 「這個 ID 報名了沒 / 他是不是被裁判擋掉了」的查詢介面,而後者絕不該由
+// 一個匿名請求問得出來。
+//
+// 時序上也不再有可利用的差異:三條路徑最多各做一次同樣的索引查詢,
+// 沒有雜湊比對那種數量級的成本差(原本那行誘餌雜湊隨通行碼一起走了)。
+// 至於「登入成功」本身洩漏了這個 ID 存在且 active —— 那正是這次決策接受的代價,
+// 不是可以在這裡補起來的洞。
 //
 // 這裡**不發 session** —— 換發 cookie 是 transport 的事,見套件註解。
 func (s *Service) Login(ctx context.Context, p LoginParams) (*tournament.Player, error) {
-	gameID := strings.TrimSpace(p.GameID)
-	passcode := NormalizePasscode(p.Passcode)
-
 	// 賽事 slug 查不到是真正的 404:slug 本來就在網址列上,不是秘密。
 	t, err := s.repo.TournamentBySlug(ctx, p.TournamentSlug)
 	if err != nil {
 		return nil, err
 	}
 
-	if gameID == "" {
-		s.hasher.VerifyDummy(passcode)
+	gameID, err := cleanGameID(p.GameID)
+	if err != nil {
+		// 格式不合也走同一個出口:回 ErrInvalidGameID 等於告訴對方
+		// 「這串字連查都不必查」,那是一個可以拿來縮小猜測範圍的訊號。
 		return nil, ErrInvalidCredentials
 	}
 
-	cred, err := s.repo.CredentialByGameID(ctx, t.ID, gameID)
+	player, err := s.repo.PlayerByGameID(ctx, t.ID, gameID)
 	if err != nil {
 		if errors.Is(err, tournament.ErrPlayerNotFound) {
-			s.hasher.VerifyDummy(passcode)
 			return nil, ErrInvalidCredentials
 		}
+		// 資料庫掛了不是憑證問題。折成登入失敗的話,一次故障會表現成
+		// 「全場選手的遊戲ID 突然都不對了」,而所有人重試只會讓故障更嚴重。
 		return nil, err
 	}
-
-	ok, err := s.hasher.Verify(cred.PasscodeHash, passcode)
-	if err != nil {
-		// 存下來的雜湊壞了是系統問題,但**不能**讓使用者知道 ——
-		// 「這個 ID 的雜湊格式不對」等於承認這個 ID 存在。
-		// 對外仍是同一個錯誤;現場的症狀是這位選手永遠登不進去,
-		// 裁判用「重新產生通行碼」就能修好。
+	if player.Status != tournament.PlayerActive {
 		return nil, ErrInvalidCredentials
 	}
-	if !ok {
-		return nil, ErrInvalidCredentials
-	}
-	return &cred.Player, nil
+	return &player, nil
 }
 
 // RegenerateParams 是裁判為某位選手重新產生通行碼。
@@ -215,9 +233,10 @@ type RegenerateParams struct {
 	PlayerPublicID string
 	// ActorUserID 是執行的裁判,必填。
 	//
-	// 刻意**沒有**選手自助重取這條路:遊戲ID 是公開資訊(對戰表上就有),
-	// 自助重取等於「輸入任何人的遊戲ID 就能把他的通行碼換掉」——
-	// 那是一鍵帳號接管,而且原持有人只會覺得自己抄錯了碼。
+	// 刻意**沒有**選手自助重取這條路。理由隨著通行碼登入取消而換了一個,
+	// 但結論沒變:換發現在等於「把這個人所有 session 踢掉」,而遊戲ID 是
+	// 公開資訊 —— 自助等於「輸入任何人的遊戲ID 就能把他登出」。
+	// 何況 admin_audit_logs.actor_user_id 是 NOT NULL,這個動作本來就要有人署名。
 	ActorUserID int64
 	Reason      string
 }
@@ -225,16 +244,24 @@ type RegenerateParams struct {
 // RegenerateResult 是重新產生的結果。
 type RegenerateResult struct {
 	Player tournament.Player
-	// Passcode 是新的明碼通行碼,同樣只出現這一次。
+	// Passcode 是新的明碼通行碼。
+	//
+	// 登入用不到它(2026-09-13 起只要遊戲ID),所以它現在是給裁判的一張收據 ——
+	// 「這個人的秘密真的被換掉了」。要不要繼續回傳由裁判端的契約決定,
+	// 這一層只負責不把它寫到 return 以外的任何地方。
 	Passcode string
 }
 
-// RegeneratePasscode 換發通行碼,舊碼立即失效。
+// RegeneratePasscode 換發通行碼 —— 現在真正的用途是**踢掉這位選手所有的 session**。
 //
-// 「立即失效」不需要額外的撤銷機制:passcode_hash 被覆寫的那一刻,
-// 舊碼就再也比對不過。少一張撤銷清單就少一個會忘記清的地方。
+// 登入不再比對通行碼,所以「舊碼立即失效」已經不是重點;起作用的是一起被推進的
+// passcode_issued_at:已簽發的 token 裡帶著簽發當下的值,對不上就當場失效
+// (見 internal/core/activity/session)。
 //
-// 不限階段 —— 選手可能在任何時候把碼弄丟,包含開賽當天。
+// 它與 WithdrawPlayer 是兩道互補的槓桿:棄賽擋住**之後**的登入,
+// 換發踢掉**現在**還活著的 session。要立刻把一個人完全隔離,兩個都要做。
+//
+// 不限階段 —— 需要把某人踢出去的時機不會挑階段,包含開賽當天。
 func (s *Service) RegeneratePasscode(ctx context.Context, p RegenerateParams) (*RegenerateResult, error) {
 	if p.ActorUserID == 0 {
 		return nil, tournament.ErrActorRequired

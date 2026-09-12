@@ -97,6 +97,8 @@ func TestToConnectError(t *testing.T) {
 		{identity.ErrProviderExchange, connect.CodeUnavailable},
 		{identity.ErrAccountDeleted, connect.CodePermissionDenied},
 		{identity.ErrInvalidConfig, connect.CodeInternal},
+		// 本地登入(裁判):與 signup 的那一個一樣刻意不分「查無此人」與「碼錯」。
+		{identity.ErrInvalidCredentials, connect.CodeUnauthenticated},
 
 		// 通知拉取:參數不合法(一次 Ack 太多筆)。
 		{notification.ErrInvalidRequest, connect.CodeInvalidArgument},
@@ -108,7 +110,6 @@ func TestToConnectError(t *testing.T) {
 		{signup.ErrAlreadyRegistered, connect.CodeAlreadyExists},
 		{signup.ErrGameIDRequired, connect.CodeInvalidArgument},
 		{signup.ErrInvalidGameID, connect.CodeInvalidArgument},
-		{signup.ErrDiscordNameRequired, connect.CodeInvalidArgument},
 		{signup.ErrFieldTooLong, connect.CodeInvalidArgument},
 		{signup.ErrAlreadyBound, connect.CodeFailedPrecondition},
 		{signup.ErrUserAlreadyBound, connect.CodeFailedPrecondition},

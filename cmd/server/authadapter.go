@@ -24,7 +24,14 @@ type authAdapter struct {
 	dir      transport.Directory
 }
 
-var _ transport.AuthService = (*authAdapter)(nil)
+var (
+	_ transport.AuthService = (*authAdapter)(nil)
+	// 本地登入是選配的能力(見 transport.LocalAuthService)。入口層對注入進來的
+	// AuthService 做型別斷言,所以這一行就是「這個部署有開裁判的本地登入」的
+	// 唯一開關 —— 少了它不會編譯失敗,只會在線上回 Unimplemented,
+	// 所以這個斷言要留著:它讓「忘了接」變成編譯期的事。
+	_ transport.LocalAuthService = (*authAdapter)(nil)
+)
 
 func (a *authAdapter) StartDiscordLogin(_ context.Context, redirectURI string) (string, string, error) {
 	return a.svc.StartLogin(redirectURI)
@@ -34,6 +41,25 @@ func (a *authAdapter) CompleteDiscordLogin(
 	ctx context.Context, code, state, stateFromCookie string, dev transport.DeviceInfo,
 ) (*transport.SessionView, *readmodel.ProfileView, error) {
 	sess, err := a.svc.CompleteLogin(ctx, code, state, stateFromCookie, toIdentityDevice(dev))
+	if err != nil {
+		return nil, nil, err
+	}
+	profile, err := a.profiles.Profile(ctx, sess.UserID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("讀登入後的使用者檔案: %w", err)
+	}
+	return toSessionView(sess), profile, nil
+}
+
+// LocalLogin 讓裁判用登入名 + 通行碼進來,不必經過 Discord。
+//
+// 拿到的 session 與 Discord 登入完全同型 —— 之後每一支 RPC、每一筆稽核都
+// 不必分辨這個人是怎麼進來的,而裁判動作本來就必須記在平台帳號上
+// (admin_audit_logs.actor_user_id 是 NOT NULL 的外鍵)。
+func (a *authAdapter) LocalLogin(
+	ctx context.Context, loginName, passcode string, dev transport.DeviceInfo,
+) (*transport.SessionView, *readmodel.ProfileView, error) {
+	sess, err := a.svc.LocalLogin(ctx, loginName, passcode, toIdentityDevice(dev))
 	if err != nil {
 		return nil, nil, err
 	}

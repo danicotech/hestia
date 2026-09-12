@@ -4,7 +4,8 @@
 // 	protoc        (unknown)
 // source: hestia/platform/v1/auth.proto
 
-// 登入:OAuth2(第一個 provider 是 Discord),無密碼(schemas/02-identity.md)。
+// 登入:OAuth2(第一個 provider 是 Discord)為主,另有一條本地憑證的路
+// (LocalLogin,identities.provider = 'local'),見 schemas/02-identity.md。
 // 本檔只是契約——handler 目前一律回 unimplemented,實作由 identity 層補上。
 
 package platformv1
@@ -318,6 +319,121 @@ func (x *CompleteDiscordLoginResponse) GetProfile() *UserProfile {
 	return nil
 }
 
+// LocalLogin:不經 Discord 的登入(identities.provider = 'local')。
+//
+// 為什麼需要:裁判的每一個動作(評段、抽籤、判勝負、發獎)都必須記在平台
+// 帳號上(admin_audit_logs.actor_user_id 是 NOT NULL,權限走 user_roles),
+// 但辦一場賽事不該被迫先去接 Discord。所以這不是「繞過平台帳號」,
+// 是給平台帳號第二種登入方式 —— 發出來的 Session 與 Discord 登入的**完全同型**,
+// 之後每一支 RPC、每一筆稽核都不必分辨來源。
+//
+// 帳號**沒有自助註冊**:local 身分只由 `admin create-judge` 建立。
+type LocalLoginRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 登入名。伺服器會去空白並轉小寫後比對,所以大小寫不敏感。
+	LoginName string `protobuf:"bytes,1,opt,name=login_name,json=loginName,proto3" json:"login_name,omitempty"`
+	// 通行碼。字元集已排除易混淆字元(0/O、1/I/l),比對前會去空白並轉大寫。
+	Passcode      string `protobuf:"bytes,2,opt,name=passcode,proto3" json:"passcode,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LocalLoginRequest) Reset() {
+	*x = LocalLoginRequest{}
+	mi := &file_hestia_platform_v1_auth_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LocalLoginRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LocalLoginRequest) ProtoMessage() {}
+
+func (x *LocalLoginRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_platform_v1_auth_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LocalLoginRequest.ProtoReflect.Descriptor instead.
+func (*LocalLoginRequest) Descriptor() ([]byte, []int) {
+	return file_hestia_platform_v1_auth_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *LocalLoginRequest) GetLoginName() string {
+	if x != nil {
+		return x.LoginName
+	}
+	return ""
+}
+
+func (x *LocalLoginRequest) GetPasscode() string {
+	if x != nil {
+		return x.Passcode
+	}
+	return ""
+}
+
+type LocalLoginResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Session       *Session               `protobuf:"bytes,1,opt,name=session,proto3" json:"session,omitempty"`
+	Profile       *UserProfile           `protobuf:"bytes,2,opt,name=profile,proto3" json:"profile,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LocalLoginResponse) Reset() {
+	*x = LocalLoginResponse{}
+	mi := &file_hestia_platform_v1_auth_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LocalLoginResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LocalLoginResponse) ProtoMessage() {}
+
+func (x *LocalLoginResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_platform_v1_auth_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LocalLoginResponse.ProtoReflect.Descriptor instead.
+func (*LocalLoginResponse) Descriptor() ([]byte, []int) {
+	return file_hestia_platform_v1_auth_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *LocalLoginResponse) GetSession() *Session {
+	if x != nil {
+		return x.Session
+	}
+	return nil
+}
+
+func (x *LocalLoginResponse) GetProfile() *UserProfile {
+	if x != nil {
+		return x.Profile
+	}
+	return nil
+}
+
 type RefreshSessionRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	RefreshToken  string                 `protobuf:"bytes,1,opt,name=refresh_token,json=refreshToken,proto3" json:"refresh_token,omitempty"`
@@ -327,7 +443,7 @@ type RefreshSessionRequest struct {
 
 func (x *RefreshSessionRequest) Reset() {
 	*x = RefreshSessionRequest{}
-	mi := &file_hestia_platform_v1_auth_proto_msgTypes[5]
+	mi := &file_hestia_platform_v1_auth_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -339,7 +455,7 @@ func (x *RefreshSessionRequest) String() string {
 func (*RefreshSessionRequest) ProtoMessage() {}
 
 func (x *RefreshSessionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_platform_v1_auth_proto_msgTypes[5]
+	mi := &file_hestia_platform_v1_auth_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -352,7 +468,7 @@ func (x *RefreshSessionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RefreshSessionRequest.ProtoReflect.Descriptor instead.
 func (*RefreshSessionRequest) Descriptor() ([]byte, []int) {
-	return file_hestia_platform_v1_auth_proto_rawDescGZIP(), []int{5}
+	return file_hestia_platform_v1_auth_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *RefreshSessionRequest) GetRefreshToken() string {
@@ -371,7 +487,7 @@ type RefreshSessionResponse struct {
 
 func (x *RefreshSessionResponse) Reset() {
 	*x = RefreshSessionResponse{}
-	mi := &file_hestia_platform_v1_auth_proto_msgTypes[6]
+	mi := &file_hestia_platform_v1_auth_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -383,7 +499,7 @@ func (x *RefreshSessionResponse) String() string {
 func (*RefreshSessionResponse) ProtoMessage() {}
 
 func (x *RefreshSessionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_platform_v1_auth_proto_msgTypes[6]
+	mi := &file_hestia_platform_v1_auth_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -396,7 +512,7 @@ func (x *RefreshSessionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RefreshSessionResponse.ProtoReflect.Descriptor instead.
 func (*RefreshSessionResponse) Descriptor() ([]byte, []int) {
-	return file_hestia_platform_v1_auth_proto_rawDescGZIP(), []int{6}
+	return file_hestia_platform_v1_auth_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *RefreshSessionResponse) GetSession() *Session {
@@ -416,7 +532,7 @@ type LogoutRequest struct {
 
 func (x *LogoutRequest) Reset() {
 	*x = LogoutRequest{}
-	mi := &file_hestia_platform_v1_auth_proto_msgTypes[7]
+	mi := &file_hestia_platform_v1_auth_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -428,7 +544,7 @@ func (x *LogoutRequest) String() string {
 func (*LogoutRequest) ProtoMessage() {}
 
 func (x *LogoutRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_platform_v1_auth_proto_msgTypes[7]
+	mi := &file_hestia_platform_v1_auth_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -441,7 +557,7 @@ func (x *LogoutRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogoutRequest.ProtoReflect.Descriptor instead.
 func (*LogoutRequest) Descriptor() ([]byte, []int) {
-	return file_hestia_platform_v1_auth_proto_rawDescGZIP(), []int{7}
+	return file_hestia_platform_v1_auth_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *LogoutRequest) GetRefreshToken() string {
@@ -459,7 +575,7 @@ type LogoutResponse struct {
 
 func (x *LogoutResponse) Reset() {
 	*x = LogoutResponse{}
-	mi := &file_hestia_platform_v1_auth_proto_msgTypes[8]
+	mi := &file_hestia_platform_v1_auth_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -471,7 +587,7 @@ func (x *LogoutResponse) String() string {
 func (*LogoutResponse) ProtoMessage() {}
 
 func (x *LogoutResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_platform_v1_auth_proto_msgTypes[8]
+	mi := &file_hestia_platform_v1_auth_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -484,7 +600,7 @@ func (x *LogoutResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogoutResponse.ProtoReflect.Descriptor instead.
 func (*LogoutResponse) Descriptor() ([]byte, []int) {
-	return file_hestia_platform_v1_auth_proto_rawDescGZIP(), []int{8}
+	return file_hestia_platform_v1_auth_proto_rawDescGZIP(), []int{10}
 }
 
 var File_hestia_platform_v1_auth_proto protoreflect.FileDescriptor
@@ -508,6 +624,13 @@ const file_hestia_platform_v1_auth_proto_rawDesc = "" +
 	"\x05state\x18\x02 \x01(\tR\x05state\"\x90\x01\n" +
 	"\x1cCompleteDiscordLoginResponse\x125\n" +
 	"\asession\x18\x01 \x01(\v2\x1b.hestia.platform.v1.SessionR\asession\x129\n" +
+	"\aprofile\x18\x02 \x01(\v2\x1f.hestia.platform.v1.UserProfileR\aprofile\"N\n" +
+	"\x11LocalLoginRequest\x12\x1d\n" +
+	"\n" +
+	"login_name\x18\x01 \x01(\tR\tloginName\x12\x1a\n" +
+	"\bpasscode\x18\x02 \x01(\tR\bpasscode\"\x86\x01\n" +
+	"\x12LocalLoginResponse\x125\n" +
+	"\asession\x18\x01 \x01(\v2\x1b.hestia.platform.v1.SessionR\asession\x129\n" +
 	"\aprofile\x18\x02 \x01(\v2\x1f.hestia.platform.v1.UserProfileR\aprofile\"<\n" +
 	"\x15RefreshSessionRequest\x12#\n" +
 	"\rrefresh_token\x18\x01 \x01(\tR\frefreshToken\"O\n" +
@@ -515,10 +638,12 @@ const file_hestia_platform_v1_auth_proto_rawDesc = "" +
 	"\asession\x18\x01 \x01(\v2\x1b.hestia.platform.v1.SessionR\asession\"4\n" +
 	"\rLogoutRequest\x12#\n" +
 	"\rrefresh_token\x18\x01 \x01(\tR\frefreshToken\"\x10\n" +
-	"\x0eLogoutResponse2\xb4\x03\n" +
+	"\x0eLogoutResponse2\x91\x04\n" +
 	"\vAuthService\x12p\n" +
 	"\x11StartDiscordLogin\x12,.hestia.platform.v1.StartDiscordLoginRequest\x1a-.hestia.platform.v1.StartDiscordLoginResponse\x12y\n" +
-	"\x14CompleteDiscordLogin\x12/.hestia.platform.v1.CompleteDiscordLoginRequest\x1a0.hestia.platform.v1.CompleteDiscordLoginResponse\x12g\n" +
+	"\x14CompleteDiscordLogin\x12/.hestia.platform.v1.CompleteDiscordLoginRequest\x1a0.hestia.platform.v1.CompleteDiscordLoginResponse\x12[\n" +
+	"\n" +
+	"LocalLogin\x12%.hestia.platform.v1.LocalLoginRequest\x1a&.hestia.platform.v1.LocalLoginResponse\x12g\n" +
 	"\x0eRefreshSession\x12).hestia.platform.v1.RefreshSessionRequest\x1a*.hestia.platform.v1.RefreshSessionResponse\x12O\n" +
 	"\x06Logout\x12!.hestia.platform.v1.LogoutRequest\x1a\".hestia.platform.v1.LogoutResponseB@Z>github.com/danicotech/hestia/gen/hestia/platform/v1;platformv1b\x06proto3"
 
@@ -534,39 +659,45 @@ func file_hestia_platform_v1_auth_proto_rawDescGZIP() []byte {
 	return file_hestia_platform_v1_auth_proto_rawDescData
 }
 
-var file_hestia_platform_v1_auth_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_hestia_platform_v1_auth_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
 var file_hestia_platform_v1_auth_proto_goTypes = []any{
 	(*Session)(nil),                      // 0: hestia.platform.v1.Session
 	(*StartDiscordLoginRequest)(nil),     // 1: hestia.platform.v1.StartDiscordLoginRequest
 	(*StartDiscordLoginResponse)(nil),    // 2: hestia.platform.v1.StartDiscordLoginResponse
 	(*CompleteDiscordLoginRequest)(nil),  // 3: hestia.platform.v1.CompleteDiscordLoginRequest
 	(*CompleteDiscordLoginResponse)(nil), // 4: hestia.platform.v1.CompleteDiscordLoginResponse
-	(*RefreshSessionRequest)(nil),        // 5: hestia.platform.v1.RefreshSessionRequest
-	(*RefreshSessionResponse)(nil),       // 6: hestia.platform.v1.RefreshSessionResponse
-	(*LogoutRequest)(nil),                // 7: hestia.platform.v1.LogoutRequest
-	(*LogoutResponse)(nil),               // 8: hestia.platform.v1.LogoutResponse
-	(*timestamppb.Timestamp)(nil),        // 9: google.protobuf.Timestamp
-	(*UserProfile)(nil),                  // 10: hestia.platform.v1.UserProfile
+	(*LocalLoginRequest)(nil),            // 5: hestia.platform.v1.LocalLoginRequest
+	(*LocalLoginResponse)(nil),           // 6: hestia.platform.v1.LocalLoginResponse
+	(*RefreshSessionRequest)(nil),        // 7: hestia.platform.v1.RefreshSessionRequest
+	(*RefreshSessionResponse)(nil),       // 8: hestia.platform.v1.RefreshSessionResponse
+	(*LogoutRequest)(nil),                // 9: hestia.platform.v1.LogoutRequest
+	(*LogoutResponse)(nil),               // 10: hestia.platform.v1.LogoutResponse
+	(*timestamppb.Timestamp)(nil),        // 11: google.protobuf.Timestamp
+	(*UserProfile)(nil),                  // 12: hestia.platform.v1.UserProfile
 }
 var file_hestia_platform_v1_auth_proto_depIdxs = []int32{
-	9,  // 0: hestia.platform.v1.Session.access_token_expires_at:type_name -> google.protobuf.Timestamp
-	9,  // 1: hestia.platform.v1.Session.refresh_token_expires_at:type_name -> google.protobuf.Timestamp
+	11, // 0: hestia.platform.v1.Session.access_token_expires_at:type_name -> google.protobuf.Timestamp
+	11, // 1: hestia.platform.v1.Session.refresh_token_expires_at:type_name -> google.protobuf.Timestamp
 	0,  // 2: hestia.platform.v1.CompleteDiscordLoginResponse.session:type_name -> hestia.platform.v1.Session
-	10, // 3: hestia.platform.v1.CompleteDiscordLoginResponse.profile:type_name -> hestia.platform.v1.UserProfile
-	0,  // 4: hestia.platform.v1.RefreshSessionResponse.session:type_name -> hestia.platform.v1.Session
-	1,  // 5: hestia.platform.v1.AuthService.StartDiscordLogin:input_type -> hestia.platform.v1.StartDiscordLoginRequest
-	3,  // 6: hestia.platform.v1.AuthService.CompleteDiscordLogin:input_type -> hestia.platform.v1.CompleteDiscordLoginRequest
-	5,  // 7: hestia.platform.v1.AuthService.RefreshSession:input_type -> hestia.platform.v1.RefreshSessionRequest
-	7,  // 8: hestia.platform.v1.AuthService.Logout:input_type -> hestia.platform.v1.LogoutRequest
-	2,  // 9: hestia.platform.v1.AuthService.StartDiscordLogin:output_type -> hestia.platform.v1.StartDiscordLoginResponse
-	4,  // 10: hestia.platform.v1.AuthService.CompleteDiscordLogin:output_type -> hestia.platform.v1.CompleteDiscordLoginResponse
-	6,  // 11: hestia.platform.v1.AuthService.RefreshSession:output_type -> hestia.platform.v1.RefreshSessionResponse
-	8,  // 12: hestia.platform.v1.AuthService.Logout:output_type -> hestia.platform.v1.LogoutResponse
-	9,  // [9:13] is the sub-list for method output_type
-	5,  // [5:9] is the sub-list for method input_type
-	5,  // [5:5] is the sub-list for extension type_name
-	5,  // [5:5] is the sub-list for extension extendee
-	0,  // [0:5] is the sub-list for field type_name
+	12, // 3: hestia.platform.v1.CompleteDiscordLoginResponse.profile:type_name -> hestia.platform.v1.UserProfile
+	0,  // 4: hestia.platform.v1.LocalLoginResponse.session:type_name -> hestia.platform.v1.Session
+	12, // 5: hestia.platform.v1.LocalLoginResponse.profile:type_name -> hestia.platform.v1.UserProfile
+	0,  // 6: hestia.platform.v1.RefreshSessionResponse.session:type_name -> hestia.platform.v1.Session
+	1,  // 7: hestia.platform.v1.AuthService.StartDiscordLogin:input_type -> hestia.platform.v1.StartDiscordLoginRequest
+	3,  // 8: hestia.platform.v1.AuthService.CompleteDiscordLogin:input_type -> hestia.platform.v1.CompleteDiscordLoginRequest
+	5,  // 9: hestia.platform.v1.AuthService.LocalLogin:input_type -> hestia.platform.v1.LocalLoginRequest
+	7,  // 10: hestia.platform.v1.AuthService.RefreshSession:input_type -> hestia.platform.v1.RefreshSessionRequest
+	9,  // 11: hestia.platform.v1.AuthService.Logout:input_type -> hestia.platform.v1.LogoutRequest
+	2,  // 12: hestia.platform.v1.AuthService.StartDiscordLogin:output_type -> hestia.platform.v1.StartDiscordLoginResponse
+	4,  // 13: hestia.platform.v1.AuthService.CompleteDiscordLogin:output_type -> hestia.platform.v1.CompleteDiscordLoginResponse
+	6,  // 14: hestia.platform.v1.AuthService.LocalLogin:output_type -> hestia.platform.v1.LocalLoginResponse
+	8,  // 15: hestia.platform.v1.AuthService.RefreshSession:output_type -> hestia.platform.v1.RefreshSessionResponse
+	10, // 16: hestia.platform.v1.AuthService.Logout:output_type -> hestia.platform.v1.LogoutResponse
+	12, // [12:17] is the sub-list for method output_type
+	7,  // [7:12] is the sub-list for method input_type
+	7,  // [7:7] is the sub-list for extension type_name
+	7,  // [7:7] is the sub-list for extension extendee
+	0,  // [0:7] is the sub-list for field type_name
 }
 
 func init() { file_hestia_platform_v1_auth_proto_init() }
@@ -581,7 +712,7 @@ func file_hestia_platform_v1_auth_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_hestia_platform_v1_auth_proto_rawDesc), len(file_hestia_platform_v1_auth_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   9,
+			NumMessages:   11,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

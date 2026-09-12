@@ -414,6 +414,17 @@ func (s *Service[TX]) ReportResult(ctx context.Context, p ReportResultParams) (*
 // 刻意**不設階段閘門**:報名期、評段期都可能有人退出,而抽籤前棄賽
 // 根本沒有場次要判。對手未確定的場次也刻意不動 —— 那一場要等勝者產生,
 // 到時候由晉級鏈接手判成不戰而勝(見 resolve)。
+//
+// # 它同時是「鎖住這個人」的手段
+//
+// 2026-09-13 起選手登入只要遊戲ID,沒有密碼可換,所以把一個人擋在系統外面的
+// 唯一槓桿就是他的狀態 —— signup.Service.Login 只放行 status = active。
+// 標成 withdrawn 的那一刻,這個遊戲ID 就再也登不進來了。
+//
+// 所以這支不只影響賽程:對「有人冒用某個遊戲ID」的檢舉,棄賽是第一道處置。
+// 它只擋**之後**的登入;對方現在還活著的 session 要靠裁判再做一次
+// 「重新產生通行碼」才會斷(那會推進 passcode_issued_at,見
+// internal/core/activity/session)。兩件事一起做才算真的隔離一個人。
 func (s *Service[TX]) WithdrawPlayer(ctx context.Context, p WithdrawPlayerParams) (*WithdrawResult, error) {
 	switch {
 	case p.PlayerPublicID == "":

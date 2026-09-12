@@ -18,11 +18,25 @@ import (
 	"time"
 )
 
-// Provider 是外部身分來源。M1 只有 Discord,路線圖有 Twitch / YouTube。
+// Provider 是身分來源。外部的 M1 只有 Discord(路線圖有 Twitch / YouTube),
+// 另有一個內建的 local。
 type Provider string
 
-// ProviderDiscord 是 M1 唯一啟用的 provider。
-const ProviderDiscord Provider = "discord"
+const (
+	// ProviderDiscord 是 M1 唯一啟用的外部 provider。
+	ProviderDiscord Provider = "discord"
+	// ProviderLocal 是平台自己保管憑證的登入方式(identities.secret_hash)。
+	//
+	// 存在理由只有一個:裁判的動作必須記在平台帳號上
+	// (admin_audit_logs.actor_user_id NOT NULL,權限走 user_roles),
+	// 但辦賽事的人不該為此被迫去接 Discord。所以不是「繞過平台帳號」,
+	// 是給平台帳號第二種登入方式 —— 發出來的 session 與 Discord 登入
+	// 完全相同,後續每一支 RPC、每一筆稽核都不必分辨來源。
+	//
+	// **沒有自助註冊**:local 身分只由 cmd/admin 建立。開放自助等於
+	// 開一條不經任何外部驗證的建帳通道,而這個系統的帳號背著代幣餘額。
+	ProviderLocal Provider = "local"
+)
 
 // AccessTokenTTL / RefreshTokenTTL / StateTTL 是 schemas/02 增補 F 定的壽命。
 // 公開成常數是為了讓呼叫端(cookie Max-Age、前端排程換發)有唯一權威可讀,
@@ -126,6 +140,16 @@ var (
 	ErrAccountDeleted = errors.New("帳號已刪除")
 	// ErrInvalidConfig 是經濟設定缺失或不合法(如 signup_bonus)。
 	ErrInvalidConfig = errors.New("經濟設定不合法")
+	// ErrInvalidCredentials 是本地登入失敗。
+	//
+	// **查無此登入名、沒有本地憑證、通行碼錯誤、帳號已註銷回的都是這一個**,
+	// 訊息裡不含任何能分辨它們的線索。分得出來的話,登入頁就變成一份
+	// 「誰是裁判」的查詢介面 —— 而裁判帳號握有評段、判勝負與發獎的能力,
+	// 知道它存在就是攻擊的第一步。
+	//
+	// 時序上的差異由 secret.Hasher.VerifyDummy 補平(見實作的 LocalLogin):
+	// 只對回應內容保密而不補平時間,等於留了一個慢一點的列舉器。
+	ErrInvalidCredentials = errors.New("登入名或通行碼不正確")
 )
 
 // Service 是身分層的對外介面。
@@ -144,6 +168,15 @@ type Service interface {
 	// stateFromCookie 是入口層從 HttpOnly + SameSite=Lax cookie 讀回的同一個 state,
 	// 必填且必須與 state 相符,否則回 ErrStateMismatch(見 Signer.VerifyState)。
 	CompleteLogin(ctx context.Context, code, state, stateFromCookie string, dev DeviceInfo) (*Session, error)
+
+	// LocalLogin 以登入名 + 通行碼換一個 session(provider='local')。
+	//
+	// 回傳的 Session 與 CompleteLogin 的**完全同型**:同一種 access/refresh
+	// token、同一張 sessions 表、同一條輪替鏈。這是刻意的 —— 登入方式的差別
+	// 到此為止,後續沒有任何一支 RPC 需要知道這個人是怎麼進來的。
+	//
+	// 失敗一律 ErrInvalidCredentials,不區分「查無此人」與「碼錯了」。
+	LocalLogin(ctx context.Context, loginName, passcode string, dev DeviceInfo) (*Session, error)
 
 	// Refresh 以 refresh token 換一組新的 access + refresh(輪替)。
 	// 已輪替過的 token 再度被使用會撤銷整條鏈並回 ErrTokenReuseDetected。

@@ -9,21 +9,30 @@
 // 報名**不需要**平台帳號。門檻要夠低:百業的成員未必都綁過 Discord OAuth,
 // 而「先去登入再回來報名」會直接勸退一部分人。
 //
-// 代價是活動層要自己發一組憑證,也就是通行碼。這造成雙軌身分:
+// 代價是活動層要自己認一組身分。這造成雙軌:
 //
-//	選手    → 遊戲ID + 通行碼 → 活動層 session
+//	選手    → 遊戲ID → 活動層 session
 //	下注者  → 平台帳號 Bearer → 要動平台代幣
 //
 // 兩者可以是同一人:選手事後 BindPlatformAccount 即可。領獎**必須**先綁。
 //
-// ── 通行碼的安全性 ──────────────────────────────────────────────
+// ── 登入只要遊戲ID(2026-09-13 定案,推翻先前的通行碼登入)──────
 //
-// 通行碼是 6 碼、排除易混淆字元(0/O、1/I/l)、DB 只存 hash。
-// 它只在 Register 的回應裡出現**一次**,之後任何 API 都不會再吐明碼 ——
-// 裁判後台也看不到,只能「重新產生」(舊碼立即失效,動作進稽核紀錄)。
+// 報名只有 game_id 必填,登入也只要 game_id —— 沒有通行碼這一步了。
 //
-// 這不是銀行等級的安全,也不需要是:它保護的是「別人不能改你的讓武選擇」,
-// 而所有破壞性操作都還有裁判這道人工關卡。
+// 代價是清楚的而且是被接受的:遊戲ID 全服唯一且公開(對戰表上就印著),
+// 所以任何人知道某位選手的遊戲ID 就能以他的身分登入、花掉他的 BP、
+// 改他的讓武選擇。換來的是報名到登入之間沒有任何要抄、會抄錯、會弄丟的東西。
+//
+// 唯一的門鎖是**狀態**:只有 status = ACTIVE 的選手登得進來。棄賽
+// (JudgeService.WithdrawPlayer)因此同時是「把這個人擋在外面」的手段,
+// 不只是賽程上的處置;已淘汰者同樣登不進來。三種失敗(查無此 ID、
+// 非 ACTIVE、格式不合)對呼叫端是**同一個**錯誤,不做任何區分。
+//
+// 通行碼沒有消失,只是不再是給選手看的東西:tournament_players.passcode_hash
+// 照舊產生並寫入(NOT NULL),它的同伴 passcode_issued_at 則是**已發出的
+// session 的作廢依據**。裁判的「重新產生通行碼」現在的意思是「把這個人
+// 現在所有的 session 全部踢掉」—— 棄賽之外的第二道槓桿。
 package activityv1connect
 
 import (
@@ -73,7 +82,7 @@ const (
 type SignupServiceClient interface {
 	// 報名。只在賽事處於 SIGNUP 階段時開放。
 	Register(context.Context, *connect.Request[v1.RegisterRequest]) (*connect.Response[v1.RegisterResponse], error)
-	// 用遊戲ID + 通行碼換發活動層 session。
+	// 用遊戲ID 換發活動層 session。沒有通行碼,只有 ACTIVE 的選手登得進來(見檔頭)。
 	Login(context.Context, *connect.Request[v1.LoginRequest]) (*connect.Response[v1.LoginResponse], error)
 	// 結束活動層 session。
 	Logout(context.Context, *connect.Request[v1.LogoutRequest]) (*connect.Response[v1.LogoutResponse], error)
@@ -165,7 +174,7 @@ func (c *signupServiceClient) BindPlatformAccount(ctx context.Context, req *conn
 type SignupServiceHandler interface {
 	// 報名。只在賽事處於 SIGNUP 階段時開放。
 	Register(context.Context, *connect.Request[v1.RegisterRequest]) (*connect.Response[v1.RegisterResponse], error)
-	// 用遊戲ID + 通行碼換發活動層 session。
+	// 用遊戲ID 換發活動層 session。沒有通行碼,只有 ACTIVE 的選手登得進來(見檔頭)。
 	Login(context.Context, *connect.Request[v1.LoginRequest]) (*connect.Response[v1.LoginResponse], error)
 	// 結束活動層 session。
 	Logout(context.Context, *connect.Request[v1.LogoutRequest]) (*connect.Response[v1.LogoutResponse], error)

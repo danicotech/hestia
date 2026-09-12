@@ -10,8 +10,11 @@ import (
 	platformv1 "github.com/danicotech/hestia/gen/hestia/platform/v1"
 )
 
-// authHandler 只是契約的落點:svc 未注入時四個 RPC 一律回 Unimplemented,
-// 實作(Discord OAuth、session 簽發)由 identity 層補上並在 main 注入。
+// authHandler 只是契約的落點:svc 未注入時全部 RPC 一律回 Unimplemented,
+// 實作(Discord OAuth、本地憑證、session 簽發)由 identity 層補上並在 main 注入。
+//
+// LocalLogin 多一道門檻:svc 還要滿足 LocalAuthService(選配能力),
+// 沒有就跟未注入一樣是 Unimplemented。
 //
 // 認證攔截器對本服務整體豁免(publicProcedures),因為登入前本來就沒有 token。
 type authHandler struct {
@@ -67,6 +70,35 @@ func (h authHandler) CompleteDiscordLogin(
 	})
 	setCookie(res, clear)
 	return res, nil
+}
+
+// LocalLogin 是不經 Discord 的登入(裁判用,見 LocalAuthService)。
+//
+// 參數檢查刻意只到「兩個都不是空的」為止:再往下驗(長度、字元集)會讓
+// 「這個登入名不可能存在」比「這個登入名不存在」早回、而且回不同的錯誤,
+// 那就是一支不必猜密碼的帳號列舉器。形狀的判定留給實作端,它會連同
+// 誘餌雜湊一起走完等量的路。
+func (h authHandler) LocalLogin(
+	ctx context.Context, req *connect.Request[platformv1.LocalLoginRequest],
+) (*connect.Response[platformv1.LocalLoginResponse], error) {
+	svc, ok := h.svc.(LocalAuthService)
+	if h.svc == nil || !ok {
+		return nil, unimplemented("AuthService.LocalLogin")
+	}
+	name := strings.TrimSpace(req.Msg.GetLoginName())
+	passcode := strings.TrimSpace(req.Msg.GetPasscode())
+	if name == "" || passcode == "" {
+		return nil, invalidArgument("login_name 與 passcode 必填")
+	}
+	session, profile, err := svc.LocalLogin(ctx, name, passcode,
+		deviceInfo(req.Peer().Addr, req.Header(), h.trusted))
+	if err != nil {
+		return nil, toConnectError(err)
+	}
+	return connect.NewResponse(&platformv1.LocalLoginResponse{
+		Session: sessionToProto(session),
+		Profile: profileToProto(profile),
+	}), nil
 }
 
 func (h authHandler) RefreshSession(

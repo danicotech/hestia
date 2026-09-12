@@ -26,10 +26,19 @@
 -- 4. 跨 schema(報名獎金走 Ledger.ApplyInTx)時,activity 的鎖永遠先取、
 --    platform 的鎖後取(users → user_balances,與 shop/daily 同向)。
 --
--- ── passcode_hash 的流向 ───────────────────────────────────────
--- 只有 GetCredentialByGameID 會 SELECT passcode_hash。其餘回傳選手的 query
--- 一律列舉欄位、刻意漏掉它 —— tournament.Player 結構本身也沒有這個欄位,
--- 一個查都沒查出來的值,不可能被誰不小心序列化到對戰表 API 上。
+-- ── passcode_hash 的流向(2026-09-13 起只寫不讀)────────────────
+-- **全檔沒有任何一句 SELECT 讀 passcode_hash**,只有兩句寫:
+-- InsertTournamentPlayer 建一份、UpdatePlayerPasscode 換一份。
+-- 登入從那天起只要 game_id,沒有東西需要比對雜湊。
+--
+-- 那這個 NOT NULL 欄位現在在幹嘛?它自己不幹嘛,幹活的是它的同伴:
+-- passcode_issued_at 是**已發出的 session 的作廢依據**(選手 session 把它寫進
+-- token,每次請求逐微秒比對,見 internal/core/activity/session)。
+-- UpdatePlayerPasscode 兩欄一起改,所以裁判的「重新產生通行碼」= 把這位選手
+-- 現在所有的 session 一次踢掉。
+--
+-- **不要因為沒人讀就把它清空或拿掉**:它是「這次換發真的換掉了一個秘密」的
+-- 證據,也是哪天要把通行碼登入加回來時,唯一還留在原地的東西。
 
 -- ═══ 賽事(tournaments)═══════════════════════════════════════
 
@@ -158,19 +167,24 @@ WHERE tp.tournament_id = sqlc.arg(tournament_id)::bigint
   AND tp.id = sqlc.arg(id)::bigint
 FOR UPDATE OF tp;
 
--- name: GetCredentialByGameID :one
--- **全檔唯一會讀出 passcode_hash 的地方**。選手與雜湊同一列一次讀出,
--- 不拆成兩支:拆了就會讀兩次同一張表,中間有機會讀到不一致的狀態
--- (裁判剛好在這一瞬重新產生通行碼)。
--- 查無此 game_id 與通行碼錯誤在上層是同一個錯誤,這裡不做任何區分。
+-- name: GetPlayerByGameID :one
+-- 登入用:以遊戲ID 取本屆的選手。欄位與 GetPlayerByPublicID 逐字相同
+-- (adapter 靠 Go 的結構轉換共用同一份映射,錯位在編譯期就爆)。
+--
+-- **刻意不在這裡過濾 status。** 只有 active 登得進來,但那條規則的權威在
+-- signup.Service.Login —— 它要把「查無此人」與「非 active」折成同一個錯誤,
+-- 而那件事只能在一個地方做。寫進 WHERE 看起來更嚴，實際上是把「為什麼登不進去」
+-- 拆成兩個權威位置,日後改規則(例如淘汰者仍可登入看戰績)會漏改其中一個。
+--
+-- 這一支曾經叫 GetCredentialByGameID 並讀出 passcode_hash;通行碼登入取消後
+-- 沒有東西要比對,欄位一起拿掉(見檔頭)。
 SELECT tp.id, tp.public_id, tp.tournament_id, tp.fencer_id, tp.user_id,
        tp.display_name, tp.discord_name,
        tp.rank_level, tp.ranked_at, tp.ranked_by,
        tp.self_rated_level, tp.ladder_rank, tp.ladder_score,
        tp.arts_note, tp.availability_note,
        tp.seed_no, tp.status, tp.created_at, tp.updated_at,
-       f.game_id,
-       tp.passcode_hash, tp.passcode_issued_at
+       f.game_id
 FROM activity.tournament_players tp
 JOIN activity.fencers f ON f.id = tp.fencer_id
 WHERE tp.tournament_id = sqlc.arg(tournament_id)::bigint
@@ -284,8 +298,9 @@ RETURNING id, public_id, game_id, user_id, discord_name,
 -- ═══ 身分維護(通行碼、綁定)═════════════════════════════════
 
 -- name: UpdatePlayerPasscode :execrows
--- 「舊碼立即失效」不需要撤銷清單 —— passcode_hash 被覆寫的那一刻,
--- 舊碼就再也比對不過。
+-- 這句現在的用途是**把一位選手現有的 session 全部作廢**(2026-09-13 起登入
+-- 只要 game_id,沒有人在比對 passcode_hash)。名字裡的「passcode」留著是因為
+-- 它改的確實是那兩欄,而換掉的雜湊是「這次換發真的換掉了一個秘密」的證據。
 --
 -- ⚠ passcode_issued_at **不是**給人看的痕跡,它是已簽發 session 的失效依據:
 -- 選手 session 的 token 裡帶著簽發當下的這個值,驗證時逐微秒比對,不相等
@@ -306,14 +321,24 @@ WHERE id = sqlc.arg(player_id)::bigint
 -- 選手 session 驗證用:取這一列目前的 passcode_issued_at。
 --
 -- 走 slug + 選手 public_id 而不是內部 id,因為呼叫端是 token 的驗證路徑,
--- 而 token 裡只會有對外識別字(鐵則 5)。查無回 0 列 —— 包含「slug 不存在」
--- 與「這個 public_id 不屬於這一屆」,adapter 一律折成同一個錯誤,
--- 不讓未認證的呼叫端分辨得出哪一種。
+-- 而 token 裡只會有對外識別字(鐵則 5)。查無回 0 列 —— 包含「slug 不存在」、
+-- 「這個 public_id 不屬於這一屆」與「這個人已經不是參賽中」,adapter 一律
+-- 折成同一個錯誤,不讓未認證的呼叫端分辨得出哪一種。
+--
+-- **status = 'active' 是這裡的重點,不是順手加的條件。** 登入已經不需要任何
+-- 秘密(2026-09-13 定案:只要遊戲ID),所以「把某個人擋在外面」唯一剩下的
+-- 手段就是改他的狀態。狀態如果只擋新登入、不影響已發出的 session,那道鎖
+-- 要等到 token 過期(12 小時)才生效 —— 而裁判按下棄賽的時候,要的是現在。
+--
+-- 代價是已淘汰的選手也會一起被登出。那是可以接受的:session 代表的是
+-- 「以參賽者身分動作」的權利(選讓武、看自己的預算),而淘汰者沒有那種
+-- 動作可做;對戰表與戰績本來就是公開的,不需要 session 才看得到。
 SELECT tp.passcode_issued_at
 FROM activity.tournament_players tp
 JOIN activity.tournaments t ON t.id = tp.tournament_id
 WHERE t.slug = sqlc.arg(slug)::text
-  AND tp.public_id = sqlc.arg(player_public_id)::text;
+  AND tp.public_id = sqlc.arg(player_public_id)::text
+  AND tp.status = 'active';
 
 -- name: BindPlayerUser :one
 -- 綁定的第一支(依鎖序 tournament_players 先於 fencers)。

@@ -14,7 +14,7 @@ const createIdentity = `-- name: CreateIdentity :one
 INSERT INTO platform.identities
   (user_id, provider, provider_user_id, username, access_token_enc, refresh_token_enc, scope, expires_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-RETURNING id, user_id, provider, provider_user_id, username, access_token_enc, refresh_token_enc, scope, expires_at, linked_at
+RETURNING id, user_id, provider, provider_user_id, username, access_token_enc, refresh_token_enc, scope, expires_at, linked_at, secret_hash
 `
 
 type CreateIdentityParams struct {
@@ -51,6 +51,7 @@ func (q *Queries) CreateIdentity(ctx context.Context, arg CreateIdentityParams) 
 		&i.Scope,
 		&i.ExpiresAt,
 		&i.LinkedAt,
+		&i.SecretHash,
 	)
 	return i, err
 }

@@ -782,7 +782,6 @@ func TestActivitySentinelsMapToStableReasons(t *testing.T) {
 		{signup.ErrAlreadyRegistered, connect.CodeAlreadyExists, "activity_already_registered"},
 		{signup.ErrGameIDRequired, connect.CodeInvalidArgument, "activity_game_id_required"},
 		{signup.ErrInvalidGameID, connect.CodeInvalidArgument, "activity_invalid_game_id"},
-		{signup.ErrDiscordNameRequired, connect.CodeInvalidArgument, "activity_discord_name_required"},
 		{signup.ErrFieldTooLong, connect.CodeInvalidArgument, "activity_field_too_long"},
 		{signup.ErrAlreadyBound, connect.CodeFailedPrecondition, "activity_player_already_bound"},
 		{signup.ErrUserAlreadyBound, connect.CodeFailedPrecondition, "activity_user_already_bound"},

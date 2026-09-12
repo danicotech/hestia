@@ -392,6 +392,8 @@ type PlatformIdentity struct {
 	Scope           *string
 	ExpiresAt       *time.Time
 	LinkedAt        time.Time
+	// 本地登入的通行碼雜湊(PBKDF2-HMAC-SHA256)。只有 provider='local' 會有值;OAuth 身分一律 NULL。
+	SecretHash *string
 }
 
 type PlatformItemDefinition struct {

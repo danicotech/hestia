@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/danicotech/hestia/internal/core/activity/bp"
 	"github.com/danicotech/hestia/internal/core/activity/tournament"
@@ -18,10 +17,12 @@ const (
 )
 
 // regRow 是 fakeRepo 裡的一列報名(tournament_players 的記憶體版本)。
+//
+// **刻意不放 passcode_hash 與 passcode_issued_at**:這一層沒有任何東西讀它們
+// (登入只要遊戲ID),放進來就是一份永遠不會被檢查的假資料。那兩欄真的被寫對了
+// 沒有,由 signuppg 的測試直接對 Postgres 驗。
 type regRow struct {
 	player tournament.Player
-	hash   string
-	issued time.Time
 }
 
 // fakeRepo 是 Repo 的記憶體實作,行為刻意貼著 adapter 被要求做的事:
@@ -36,6 +37,8 @@ type fakeRepo struct {
 	createCalls []CreateRegistrationParams
 	updateCalls []UpdatePasscodeParams
 	bindCalls   []BindParams
+	// lookups 數 PlayerByGameID 被叫了幾次:格式不合的登入不該打到資料庫。
+	lookups int
 }
 
 func newFakeRepo(phase tournament.Phase) *fakeRepo {
@@ -100,8 +103,6 @@ func (f *fakeRepo) CreateRegistration(_ context.Context, p CreateRegistrationPar
 			AvailabilityNote: p.AvailabilityNote,
 			Status:           tournament.PlayerActive,
 		},
-		hash:   p.PasscodeHash,
-		issued: time.Now(),
 	}
 	f.rows = append(f.rows, row)
 
@@ -116,13 +117,24 @@ func (f *fakeRepo) CreateRegistration(_ context.Context, p CreateRegistrationPar
 	}, nil
 }
 
-func (f *fakeRepo) CredentialByGameID(_ context.Context, tournamentID int64, gameID string) (Credential, error) {
+// PlayerByGameID 刻意**不看 status** —— adapter 也不看(誰登得進來由 Service 決定)。
+func (f *fakeRepo) PlayerByGameID(_ context.Context, tournamentID int64, gameID string) (tournament.Player, error) {
+	f.lookups++
 	for _, r := range f.rows {
 		if r.player.TournamentID == tournamentID && r.player.GameID == gameID {
-			return Credential{Player: r.player, PasscodeHash: r.hash, PasscodeIssuedAt: r.issued}, nil
+			return r.player, nil
 		}
 	}
-	return Credential{}, tournament.ErrPlayerNotFound
+	return tournament.Player{}, tournament.ErrPlayerNotFound
+}
+
+// setStatus 讓測試模擬裁判把某人標成棄賽 / 淘汰。
+func (f *fakeRepo) setStatus(gameID string, status tournament.PlayerStatus) {
+	for _, r := range f.rows {
+		if r.player.GameID == gameID {
+			r.player.Status = status
+		}
+	}
 }
 
 func (f *fakeRepo) PlayerByPublicID(_ context.Context, tournamentID int64, publicID string) (tournament.Player, error) {
@@ -134,12 +146,12 @@ func (f *fakeRepo) PlayerByPublicID(_ context.Context, tournamentID int64, publi
 	return tournament.Player{}, tournament.ErrPlayerNotFound
 }
 
+// UpdatePasscode 只記下這次呼叫:換發的效果(雜湊被換掉、issued_at 前進)
+// 全部發生在資料庫那一層,而這裡沒有讀者 —— 見 regRow 的註解。
 func (f *fakeRepo) UpdatePasscode(_ context.Context, p UpdatePasscodeParams) error {
 	f.updateCalls = append(f.updateCalls, p)
 	for _, r := range f.rows {
 		if r.player.ID == p.PlayerID {
-			r.hash = p.PasscodeHash
-			r.issued = time.Now()
 			return nil
 		}
 	}
@@ -193,16 +205,16 @@ func validRegistration(gameID string) RegisterParams {
 	}
 }
 
-func TestRegisterReturnsPlaintextOnce(t *testing.T) {
+// TestRegisterStoresHashButReturnsNoPasscode:通行碼照樣產生並存進去
+// (passcode_hash 是 NOT NULL,而 passcode_issued_at 是 session 作廢的依據),
+// 但**不回給選手** —— 登入用不到它,吐一組沒用的密碼只會讓人以為要保存。
+func TestRegisterStoresHashButReturnsNoPasscode(t *testing.T) {
 	t.Parallel()
 
 	s, repo := newTestService(t, tournament.PhaseSignup)
 	res, err := s.Register(context.Background(), validRegistration("御風羽"))
 	if err != nil {
 		t.Fatal(err)
-	}
-	if len(res.Passcode) != PasscodeLength {
-		t.Fatalf("明碼通行碼長度 = %d,要 %d", len(res.Passcode), PasscodeLength)
 	}
 	if res.ReturningFencer {
 		t.Error("初次報名不該標成回鍋選手")
@@ -211,17 +223,22 @@ func TestRegisterReturnsPlaintextOnce(t *testing.T) {
 		t.Errorf("初次報名的往屆段位應為未評定,得到 %s", res.PreviousRank)
 	}
 
-	// 明碼絕不進資料庫 —— 存的必須是驗得過但長得不一樣的雜湊。
 	if len(repo.createCalls) != 1 {
 		t.Fatalf("應寫入一次,得到 %d", len(repo.createCalls))
 	}
 	stored := repo.createCalls[0].PasscodeHash
-	if stored == res.Passcode || strings.Contains(stored, res.Passcode) {
-		t.Fatalf("明碼流進了資料庫:%q 在 %q 裡", res.Passcode, stored)
+	if stored == "" {
+		t.Fatal("passcode_hash 是 NOT NULL,報名仍必須存一份雜湊")
 	}
-	ok, err := s.hasher.Verify(stored, res.Passcode)
-	if err != nil || !ok {
-		t.Errorf("存下來的雜湊要驗得過剛剛發出去的明碼:ok=%v err=%v", ok, err)
+	// 存的必須是雜湊而不是明碼:雜湊字串本身看得出演算法標籤。
+	if !strings.HasPrefix(stored, "pbkdf2-sha256$") {
+		t.Fatalf("存進去的不像雜湊:%q", stored)
+	}
+
+	// 結構裡根本沒有 Passcode 欄位,所以「回應含通行碼」在編譯期就不可能。
+	// 這裡再從序列化的角度確認一次:整個結果裡不該出現任何通行碼字元組合。
+	if strings.Contains(fmt.Sprintf("%+v", *res), stored) {
+		t.Error("報名結果不該帶出任何通行碼相關的東西")
 	}
 }
 
@@ -305,9 +322,9 @@ func TestRegisterReturningFencerLinksHistory(t *testing.T) {
 	if fencer.TournamentsPlayed != 2 {
 		t.Errorf("參賽屆數 = %d,要 2", fencer.TournamentsPlayed)
 	}
-	// 兩屆的通行碼是各自發的,不該共用。
-	if first.Passcode == second.Passcode {
-		t.Error("兩屆的通行碼不該相同")
+	// 兩屆的通行碼雜湊是各自發的,不該共用(逐屆一份,換發也只影響一屆)。
+	if repo.createCalls[0].PasscodeHash == repo.createCalls[1].PasscodeHash {
+		t.Error("兩屆的通行碼雜湊不該相同")
 	}
 }
 
@@ -338,7 +355,6 @@ func TestRegisterValidation(t *testing.T) {
 		{"遊戲ID 空白", func(p *RegisterParams) { p.GameID = "   " }, ErrGameIDRequired},
 		{"遊戲ID 含控制字元", func(p *RegisterParams) { p.GameID = "御風" + string(rune(0)) + "羽" }, ErrInvalidGameID},
 		{"遊戲ID 過長", func(p *RegisterParams) { p.GameID = strings.Repeat("字", 65) }, ErrInvalidGameID},
-		{"Discord 名稱空白", func(p *RegisterParams) { p.DiscordName = "  " }, ErrDiscordNameRequired},
 		{"自評段位超出範圍", func(p *RegisterParams) { p.SelfRatedRank = bp.Rank(9) }, tournament.ErrInvalidRank},
 		{"武學描述過長", func(p *RegisterParams) { p.ArtsNote = strings.Repeat("字", 2001) }, ErrFieldTooLong},
 	}
@@ -378,8 +394,41 @@ func TestRegisterTrimsAndDefaults(t *testing.T) {
 	}
 }
 
-// TestLoginSucceeds 正常登入。
-func TestLoginSucceeds(t *testing.T) {
+// TestRegisterNeedsOnlyGameID 是這次決策的正面:報名表只有遊戲ID 必填,
+// 其餘每一欄留空都要能報成功 —— 多一個必填欄位就在報名頁攔掉一部分人。
+func TestRegisterNeedsOnlyGameID(t *testing.T) {
+	t.Parallel()
+
+	s, repo := newTestService(t, tournament.PhaseSignup)
+	res, err := s.Register(context.Background(), RegisterParams{
+		TournamentSlug: testSlug,
+		GameID:         "御風羽",
+	})
+	if err != nil {
+		t.Fatalf("只填遊戲ID 應該報得成:%v", err)
+	}
+	got := repo.createCalls[0]
+	if got.DiscordName != "" {
+		t.Errorf("Discord 名稱留空要原樣寫入,得到 %q", got.DiscordName)
+	}
+	if got.DisplayName != "御風羽" {
+		t.Errorf("顯示名留空要沿用遊戲ID,得到 %q", got.DisplayName)
+	}
+	if got.SelfRatedRank != bp.RankUnspecified || got.LadderRank != "" ||
+		got.LadderScore != 0 || got.ArtsNote != "" || got.AvailabilityNote != "" {
+		t.Errorf("選填欄位留空不該被填上任何東西:%+v", got)
+	}
+	// 選填欄位留空的人照樣是一位正常的參賽者。
+	if res.Player.Status != tournament.PlayerActive {
+		t.Errorf("狀態 = %s,要 active", res.Player.Status)
+	}
+	if res.Player.PublicID == "" {
+		t.Error("報名結果要帶回選手的 public_id")
+	}
+}
+
+// TestLoginSucceedsWithGameIDAlone 登入只要遊戲ID(2026-09-13 定案)。
+func TestLoginSucceedsWithGameIDAlone(t *testing.T) {
 	t.Parallel()
 
 	s, _ := newTestService(t, tournament.PhaseSignup)
@@ -389,7 +438,7 @@ func TestLoginSucceeds(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	player, err := s.Login(ctx, LoginParams{TournamentSlug: testSlug, GameID: "御風羽", Passcode: reg.Passcode})
+	player, err := s.Login(ctx, LoginParams{TournamentSlug: testSlug, GameID: "御風羽"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -398,28 +447,9 @@ func TestLoginSucceeds(t *testing.T) {
 	}
 }
 
-// TestLoginAcceptsNormalizedPasscode 小寫與前後空白要能登入。
-// 通行碼是手抄的,大小寫敏感只會製造客訴。
-func TestLoginAcceptsNormalizedPasscode(t *testing.T) {
-	t.Parallel()
-
-	s, _ := newTestService(t, tournament.PhaseSignup)
-	ctx := context.Background()
-	reg, err := s.Register(ctx, validRegistration("御風羽"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	messy := "  " + strings.ToLower(reg.Passcode) + " "
-	if _, err := s.Login(ctx, LoginParams{TournamentSlug: testSlug, GameID: "御風羽", Passcode: messy}); err != nil {
-		t.Errorf("小寫加空白的通行碼應該能登入:%v", err)
-	}
-}
-
-// TestLoginDoesNotRevealWhetherGameIDExists 是整個套件最重要的一條測試。
-//
-// 「查無此遊戲ID」與「通行碼錯誤」必須回**完全相同**的錯誤,連訊息都一樣。
-// 分得出來的話,登入頁就成了一份「誰報了名」的查詢介面(schemas/20 明訂)。
-func TestLoginDoesNotRevealWhetherGameIDExists(t *testing.T) {
+// TestLoginTrimsGameID 前後空白要與報名時同一套整理,否則「貼上時多一個空白」
+// 的人會被擋在門外,而畫面上那兩個字串長得一模一樣。
+func TestLoginTrimsGameID(t *testing.T) {
 	t.Parallel()
 
 	s, _ := newTestService(t, tournament.PhaseSignup)
@@ -427,29 +457,46 @@ func TestLoginDoesNotRevealWhetherGameIDExists(t *testing.T) {
 	if _, err := s.Register(ctx, validRegistration("御風羽")); err != nil {
 		t.Fatal(err)
 	}
-
-	_, wrongPass := s.Login(ctx, LoginParams{TournamentSlug: testSlug, GameID: "御風羽", Passcode: "ZZZZZZ"})
-	_, noSuchUser := s.Login(ctx, LoginParams{TournamentSlug: testSlug, GameID: "查無此人", Passcode: "ZZZZZZ"})
-	_, emptyUser := s.Login(ctx, LoginParams{TournamentSlug: testSlug, GameID: "", Passcode: "ZZZZZZ"})
-
-	for name, err := range map[string]error{"通行碼錯誤": wrongPass, "查無此人": noSuchUser, "遊戲ID 空白": emptyUser} {
-		if !errors.Is(err, ErrInvalidCredentials) {
-			t.Fatalf("%s 要回 ErrInvalidCredentials,得到 %v", name, err)
-		}
-	}
-	if wrongPass.Error() != noSuchUser.Error() {
-		t.Errorf("兩條失敗路徑的訊息必須一模一樣:\n  通行碼錯誤:%q\n  查無此人:%q",
-			wrongPass.Error(), noSuchUser.Error())
-	}
-	// 訊息裡不得出現遊戲ID —— 把輸入回顯出來也是一種洩漏(而且是 XSS 的溫床)。
-	if strings.Contains(noSuchUser.Error(), "查無此人") {
-		t.Errorf("錯誤訊息不該回顯使用者輸入的遊戲ID:%q", noSuchUser.Error())
+	if _, err := s.Login(ctx, LoginParams{TournamentSlug: testSlug, GameID: "  御風羽 "}); err != nil {
+		t.Errorf("前後空白應該被清掉:%v", err)
 	}
 }
 
-// TestLoginMalformedHashLooksLikeWrongPasscode 資料庫裡的雜湊壞掉時,
-// 對外仍是同一個錯誤 —— 「這個 ID 的雜湊格式不對」等於承認這個 ID 存在。
-func TestLoginMalformedHashLooksLikeWrongPasscode(t *testing.T) {
+// TestLoginRejectsNonActivePlayers 是這次決策**唯一的補救**,所以是這個套件
+// 最重要的一條測試:沒有密碼可以換,把一個人擋在外面的唯一槓桿就是他的狀態。
+//
+// 而且失敗的樣子必須與「查無此人」一模一樣 —— 分得出來的話,任何人都能問出
+// 「某某是不是被裁判棄賽了」,那不該由一個匿名請求答得出來。
+func TestLoginRejectsNonActivePlayers(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []tournament.PlayerStatus{tournament.PlayerWithdrawn, tournament.PlayerEliminated} {
+		s, repo := newTestService(t, tournament.PhaseSignup)
+		ctx := context.Background()
+		if _, err := s.Register(ctx, validRegistration("御風羽")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Login(ctx, LoginParams{TournamentSlug: testSlug, GameID: "御風羽"}); err != nil {
+			t.Fatalf("%s:標記之前應該登得進來,%v", status, err)
+		}
+
+		repo.setStatus("御風羽", status)
+
+		_, blocked := s.Login(ctx, LoginParams{TournamentSlug: testSlug, GameID: "御風羽"})
+		if !errors.Is(blocked, ErrInvalidCredentials) {
+			t.Fatalf("%s 要回 ErrInvalidCredentials,得到 %v", status, blocked)
+		}
+		_, unknown := s.Login(ctx, LoginParams{TournamentSlug: testSlug, GameID: "查無此人"})
+		if blocked.Error() != unknown.Error() {
+			t.Errorf("%s 與查無此人的錯誤必須逐字相同:\n  %q\n  %q",
+				status, blocked.Error(), unknown.Error())
+		}
+	}
+}
+
+// TestLoginFailuresAreIndistinguishable:查無、非 active、空白、格式不合
+// 必須回**完全相同**的錯誤,連訊息都一樣。
+func TestLoginFailuresAreIndistinguishable(t *testing.T) {
 	t.Parallel()
 
 	s, repo := newTestService(t, tournament.PhaseSignup)
@@ -457,59 +504,52 @@ func TestLoginMalformedHashLooksLikeWrongPasscode(t *testing.T) {
 	if _, err := s.Register(ctx, validRegistration("御風羽")); err != nil {
 		t.Fatal(err)
 	}
-	repo.rows[0].hash = "這不是一個合法的雜湊"
-
-	_, err := s.Login(ctx, LoginParams{TournamentSlug: testSlug, GameID: "御風羽", Passcode: "ABC234"})
-	if !errors.Is(err, ErrInvalidCredentials) {
-		t.Fatalf("要回 ErrInvalidCredentials,得到 %v", err)
+	if _, err := s.Register(ctx, validRegistration("聽雪樓")); err != nil {
+		t.Fatal(err)
 	}
-	if errors.Is(err, ErrMalformedHash) {
-		t.Error("對外不得洩漏「這個 ID 的雜湊壞了」—— 那等於承認這個 ID 存在")
+	repo.setStatus("聽雪樓", tournament.PlayerWithdrawn)
+
+	_, withdrawn := s.Login(ctx, LoginParams{TournamentSlug: testSlug, GameID: "聽雪樓"})
+	_, noSuchUser := s.Login(ctx, LoginParams{TournamentSlug: testSlug, GameID: "查無此人"})
+	_, emptyUser := s.Login(ctx, LoginParams{TournamentSlug: testSlug, GameID: "   "})
+	_, ctrl := s.Login(ctx, LoginParams{TournamentSlug: testSlug, GameID: "御風" + string(rune(0)) + "羽"})
+	_, tooLong := s.Login(ctx, LoginParams{TournamentSlug: testSlug, GameID: strings.Repeat("字", 65)})
+
+	all := map[string]error{
+		"棄賽": withdrawn, "查無此人": noSuchUser, "遊戲ID 空白": emptyUser,
+		"含控制字元": ctrl, "過長": tooLong,
+	}
+	for name, err := range all {
+		if !errors.Is(err, ErrInvalidCredentials) {
+			t.Fatalf("%s 要回 ErrInvalidCredentials,得到 %v", name, err)
+		}
+		if err.Error() != noSuchUser.Error() {
+			t.Errorf("%s 的訊息與查無此人不同:\n  %q\n  %q", name, err.Error(), noSuchUser.Error())
+		}
+		// 格式錯誤特別容易漏:回 ErrInvalidGameID 等於告訴對方「這串字連查都不必查」。
+		if errors.Is(err, ErrInvalidGameID) || errors.Is(err, ErrGameIDRequired) {
+			t.Errorf("%s 洩漏了格式判斷:%v", name, err)
+		}
+	}
+	// 訊息裡不得出現遊戲ID —— 把輸入回顯出來也是一種洩漏(而且是 XSS 的溫床)。
+	if strings.Contains(noSuchUser.Error(), "查無此人") {
+		t.Errorf("錯誤訊息不該回顯使用者輸入的遊戲ID:%q", noSuchUser.Error())
 	}
 }
 
-// TestLoginSpendsEqualWorkOnUnknownUser 是時序攻擊的防線。
-//
-// 回同一個錯誤還不夠:查無此人時若直接返回,它會比「查到人但驗證失敗」
-// 快上一個數量級,而那個時間差一樣答得出「這個 ID 存不存在」。
-//
-// 門檻刻意放寬到 30%(不是要求兩者相等):這裡要抓的是「完全沒做雜湊」
-// 那種數量級的差距,而不是幾微秒的抖動 —— 後者在共用 CI 上測不準。
-func TestLoginSpendsEqualWorkOnUnknownUser(t *testing.T) {
+// TestLoginDoesNotTouchRepoOnBadGameID:格式不合的輸入連查都不該查。
+// 這既是上一條的實作面,也讓「送一串垃圾就叫我們打一次資料庫」不成立。
+func TestLoginDoesNotTouchRepoOnBadGameID(t *testing.T) {
 	t.Parallel()
 
-	// 迭代數要夠高,雜湊的成本才會蓋過其他雜訊。
-	hasher, err := NewHasher(40000)
-	if err != nil {
-		t.Fatal(err)
+	s, repo := newTestService(t, tournament.PhaseSignup)
+	if _, err := s.Login(context.Background(), LoginParams{
+		TournamentSlug: testSlug, GameID: strings.Repeat("字", 65),
+	}); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("要回 ErrInvalidCredentials,得到 %v", err)
 	}
-	repo := newFakeRepo(tournament.PhaseSignup)
-	s := NewService(repo, hasher)
-	ctx := context.Background()
-	if _, err := s.Register(ctx, validRegistration("御風羽")); err != nil {
-		t.Fatal(err)
-	}
-
-	measure := func(gameID string) time.Duration {
-		best := time.Duration(1<<62 - 1)
-		for range 3 {
-			start := time.Now()
-			if _, err := s.Login(ctx, LoginParams{TournamentSlug: testSlug, GameID: gameID, Passcode: "ZZZZZZ"}); err == nil {
-				t.Fatal("這幾次登入都應該失敗")
-			}
-			// 取最小值:最小值最接近純計算成本,受排程干擾最小。
-			if d := time.Since(start); d < best {
-				best = d
-			}
-		}
-		return best
-	}
-
-	known := measure("御風羽")
-	unknown := measure("查無此人")
-	if unknown*10 < known*3 {
-		t.Errorf("查無此人的耗時(%v)遠低於通行碼錯誤(%v),代表沒有跑誘餌雜湊 —— "+
-			"登入頁會變成可枚舉的選手名單", unknown, known)
+	if repo.lookups != 0 {
+		t.Errorf("格式不合不該打資料庫,查了 %d 次", repo.lookups)
 	}
 }
 
@@ -517,10 +557,10 @@ func TestLoginUnknownTournamentIsA404(t *testing.T) {
 	t.Parallel()
 
 	// 賽事 slug 在網址列上,不是秘密 —— 它查不到就是真的 404,
-	// 沒有理由偽裝成憑證錯誤。
+	// 沒有理由偽裝成登入失敗。
 	s, _ := newTestService(t, tournament.PhaseSignup)
 	_, err := s.Login(context.Background(), LoginParams{
-		TournamentSlug: "不存在的賽事", GameID: "御風羽", Passcode: "ABC234",
+		TournamentSlug: "不存在的賽事", GameID: "御風羽",
 	})
 	if !errors.Is(err, tournament.ErrTournamentNotFound) {
 		t.Errorf("要回 ErrTournamentNotFound,得到 %v", err)
@@ -533,22 +573,26 @@ func TestLoginWorksInEveryPhase(t *testing.T) {
 
 	s, repo := newTestService(t, tournament.PhaseSignup)
 	ctx := context.Background()
-	reg, err := s.Register(ctx, validRegistration("御風羽"))
-	if err != nil {
+	if _, err := s.Register(ctx, validRegistration("御風羽")); err != nil {
 		t.Fatal(err)
 	}
 	for _, phase := range tournament.Phases() {
 		repo.tourn.Phase = phase
 		if _, err := s.Login(ctx, LoginParams{
-			TournamentSlug: testSlug, GameID: "御風羽", Passcode: reg.Passcode,
+			TournamentSlug: testSlug, GameID: "御風羽",
 		}); err != nil {
 			t.Errorf("%s 階段應可登入:%v", phase, err)
 		}
 	}
 }
 
-// TestRegeneratePasscodeInvalidatesOld 換發之後舊碼立即失效。
-func TestRegeneratePasscodeInvalidatesOld(t *testing.T) {
+// TestRegeneratePasscodeRotatesSecretWithoutLockingOut
+//
+// 換發現在的用途是**踢掉已發出的 session**(passcode_issued_at 一起前進,
+// 那一半在 internal/core/activity/session 測)。這裡守住兩件事:
+// 真的換掉了一個秘密,以及**沒有把人鎖在外面** —— 登入只要遊戲ID,
+// 一個被踢下線的選手應該能立刻再登入,不然這個按鈕就變成了永久封鎖。
+func TestRegeneratePasscodeRotatesSecretWithoutLockingOut(t *testing.T) {
 	t.Parallel()
 
 	s, repo := newTestService(t, tournament.PhaseSignup)
@@ -557,29 +601,25 @@ func TestRegeneratePasscodeInvalidatesOld(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	oldHash := repo.createCalls[0].PasscodeHash
 
 	fresh, err := s.RegeneratePasscode(ctx, RegenerateParams{
 		TournamentSlug: testSlug, PlayerPublicID: reg.Player.PublicID,
-		ActorUserID: testActor, Reason: "選手回報通行碼遺失",
+		ActorUserID: testActor, Reason: "疑似有人冒用,先把他踢下線",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fresh.Passcode == reg.Passcode {
-		t.Fatal("換發應產生不同的通行碼")
+	if fresh.Passcode == "" || len(fresh.Passcode) != PasscodeLength {
+		t.Fatalf("裁判那張收據要是一組真的通行碼,得到 %q", fresh.Passcode)
+	}
+	if repo.updateCalls[0].PasscodeHash == oldHash {
+		t.Error("雜湊沒換 —— 這次換發什麼也沒換掉")
 	}
 
-	// 舊碼不能再用。
-	if _, err := s.Login(ctx, LoginParams{
-		TournamentSlug: testSlug, GameID: "御風羽", Passcode: reg.Passcode,
-	}); !errors.Is(err, ErrInvalidCredentials) {
-		t.Errorf("舊碼應立即失效,得到 %v", err)
-	}
-	// 新碼可以用。
-	if _, err := s.Login(ctx, LoginParams{
-		TournamentSlug: testSlug, GameID: "御風羽", Passcode: fresh.Passcode,
-	}); err != nil {
-		t.Errorf("新碼應可登入:%v", err)
+	// 換發不是封鎖:同一個遊戲ID 照樣登得進來。
+	if _, err := s.Login(ctx, LoginParams{TournamentSlug: testSlug, GameID: "御風羽"}); err != nil {
+		t.Errorf("換發之後仍應登得進來(要擋人請用棄賽):%v", err)
 	}
 
 	if len(repo.updateCalls) != 1 {

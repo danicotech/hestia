@@ -27,6 +27,7 @@ import (
 	"github.com/danicotech/hestia/internal/core/platform/identity"
 	"github.com/danicotech/hestia/internal/core/platform/ledger"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/db"
+	"github.com/danicotech/hestia/internal/shared/secret"
 	"github.com/danicotech/hestia/internal/shared/ulid"
 )
 
@@ -68,6 +69,12 @@ type Config struct {
 	// TokenEncKey 是 identities.*_token_enc 的 AES-256 金鑰,必須 32 bytes
 	// (PLATFORM_TOKEN_ENC_KEY)。
 	TokenEncKey []byte
+	// LocalHashIterations 是本地登入通行碼的 PBKDF2 迭代數;
+	// <= 0 用 secret.DefaultHashIterations(正式環境一律留空)。
+	//
+	// 只在測試裡調低:預設值刻意很慢(那是安全性的來源),但每個登入案例
+	// 都等半秒的話,失敗路徑就不會被測滿 —— 而這裡最該被測滿的正是失敗路徑。
+	LocalHashIterations int
 	// Logger 預設 slog.Default();目前只用來記「偵測到重用但撤鏈失敗」這個安全事件。
 	Logger *slog.Logger
 }
@@ -81,6 +88,11 @@ type Service struct {
 	prov   oauthProvider
 	enc    *tokenCipher
 	log    *slog.Logger
+	// hasher 是本地登入(provider='local')的通行碼雜湊器,與活動層的選手
+	// 通行碼共用同一份實作(internal/shared/secret)。在建構時就建好,
+	// 因為它的誘餌雜湊必須在第一次登入失敗**之前**算完 ——
+	// 延後算的話,那一次會比後續都慢,而那本身就是一個可觀測的訊號。
+	hasher *secret.Hasher
 }
 
 var _ identity.Service = (*Service)(nil)
@@ -121,6 +133,10 @@ func New(pool *pgxpool.Pool, led txLedger, signer *identity.Signer, cfg Config) 
 	if logger == nil {
 		logger = slog.Default()
 	}
+	hasher, err := secret.NewHasher(cfg.LocalHashIterations)
+	if err != nil {
+		return nil, fmt.Errorf("建立本地登入雜湊器: %w", err)
+	}
 	return &Service{
 		pool:   pool,
 		q:      db.New(pool),
@@ -128,6 +144,7 @@ func New(pool *pgxpool.Pool, led txLedger, signer *identity.Signer, cfg Config) 
 		signer: signer,
 		enc:    enc,
 		log:    logger,
+		hasher: hasher,
 		prov: &discordProvider{
 			clientID:     cfg.ClientID,
 			clientSecret: cfg.ClientSecret,

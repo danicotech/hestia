@@ -1,6 +1,7 @@
 syntax = "proto3";
 
-// 登入:OAuth2(第一個 provider 是 Discord),無密碼(schemas/02-identity.md)。
+// 登入:OAuth2(第一個 provider 是 Discord)為主,另有一條本地憑證的路
+// (LocalLogin,identities.provider = 'local'),見 schemas/02-identity.md。
 // 本檔只是契約——handler 目前一律回 unimplemented,實作由 identity 層補上。
 package hestia.platform.v1;
 
@@ -53,6 +54,27 @@ message CompleteDiscordLoginResponse {
   UserProfile profile = 2;
 }
 
+// LocalLogin:不經 Discord 的登入(identities.provider = 'local')。
+//
+// 為什麼需要:裁判的每一個動作(評段、抽籤、判勝負、發獎)都必須記在平台
+// 帳號上(admin_audit_logs.actor_user_id 是 NOT NULL,權限走 user_roles),
+// 但辦一場賽事不該被迫先去接 Discord。所以這不是「繞過平台帳號」,
+// 是給平台帳號第二種登入方式 —— 發出來的 Session 與 Discord 登入的**完全同型**,
+// 之後每一支 RPC、每一筆稽核都不必分辨來源。
+//
+// 帳號**沒有自助註冊**:local 身分只由 `admin create-judge` 建立。
+message LocalLoginRequest {
+  // 登入名。伺服器會去空白並轉小寫後比對,所以大小寫不敏感。
+  string login_name = 1;
+  // 通行碼。字元集已排除易混淆字元(0/O、1/I/l),比對前會去空白並轉大寫。
+  string passcode = 2;
+}
+
+message LocalLoginResponse {
+  Session session = 1;
+  UserProfile profile = 2;
+}
+
 message RefreshSessionRequest {
   string refresh_token = 1;
 }
@@ -76,6 +98,9 @@ message LogoutResponse {}
 service AuthService {
   rpc StartDiscordLogin(StartDiscordLoginRequest) returns (StartDiscordLoginResponse);
   rpc CompleteDiscordLogin(CompleteDiscordLoginRequest) returns (CompleteDiscordLoginResponse);
+  // LocalLogin 不依賴 cookie(沒有 OAuth state 要綁瀏覽器),
+  // 但仍與其他登入 RPC 一樣對認證攔截器豁免 —— 登入前本來就沒有 token。
+  rpc LocalLogin(LocalLoginRequest) returns (LocalLoginResponse);
   rpc RefreshSession(RefreshSessionRequest) returns (RefreshSessionResponse);
   rpc Logout(LogoutRequest) returns (LogoutResponse);
 }

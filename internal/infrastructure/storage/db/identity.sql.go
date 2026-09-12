@@ -40,6 +40,46 @@ func (q *Queries) EnsurePrivacySettings(ctx context.Context, userID int64) error
 	return err
 }
 
+const getLocalIdentity = `-- name: GetLocalIdentity :one
+
+SELECT i.id         AS identity_id,
+       i.secret_hash,
+       u.id         AS user_id,
+       u.deleted_at AS user_deleted_at
+FROM platform.identities i
+JOIN platform.users u ON u.id = i.user_id
+WHERE i.provider = 'local' AND i.provider_user_id = $1
+`
+
+type GetLocalIdentityRow struct {
+	IdentityID    int64
+	SecretHash    *string
+	UserID        int64
+	UserDeletedAt *time.Time
+}
+
+// ── 本地登入(provider='local',migration 00031)────────────────────────────
+//
+// 只有 local 身分會有 secret_hash。OAuth 身分的那一欄永遠是 NULL,
+// 所以下面每一支都把 provider = 'local' 寫進 WHERE ——
+// 少了它,一個 Discord 帳號的 provider_user_id(snowflake)就成了可猜測的登入名。
+// 本地登入的唯一讀取點。
+//
+// 刻意不過濾 users.deleted_at:軟刪除的帳號必須讓應用層看見並走「憑證不正確」
+// 那條路(含誘餌雜湊),查不到就直接短路的話,已註銷的登入名會回得比較快,
+// 而那個時間差就是一支帳號列舉器。
+func (q *Queries) GetLocalIdentity(ctx context.Context, loginName string) (GetLocalIdentityRow, error) {
+	row := q.db.QueryRow(ctx, getLocalIdentity, loginName)
+	var i GetLocalIdentityRow
+	err := row.Scan(
+		&i.IdentityID,
+		&i.SecretHash,
+		&i.UserID,
+		&i.UserDeletedAt,
+	)
+	return i, err
+}
+
 const getLoginIdentity = `-- name: GetLoginIdentity :one
 
 SELECT i.id            AS identity_id,
@@ -176,6 +216,57 @@ func (q *Queries) GetUserPublicID(ctx context.Context, id int64) (string, error)
 	var public_id string
 	err := row.Scan(&public_id)
 	return public_id, err
+}
+
+const grantRoleByKey = `-- name: GrantRoleByKey :execrows
+INSERT INTO platform.user_roles (user_id, role_id, community_id, source)
+SELECT $1, r.id, NULL, 'manual'
+FROM platform.roles r
+WHERE r.key = $2
+ON CONFLICT (user_id, role_id, COALESCE(community_id, 0)) DO NOTHING
+`
+
+type GrantRoleByKeyParams struct {
+	UserID  int64
+	RoleKey string
+}
+
+// 授予全域角色(community_id IS NULL)。source='manual':之後同步 Discord
+// 身分組時只撤 provider_sync,手動授予不受影響(migration 00004 的設計)。
+// ON CONFLICT DO NOTHING 對齊 user_roles_uniq,重跑不炸。
+func (q *Queries) GrantRoleByKey(ctx context.Context, arg GrantRoleByKeyParams) (int64, error) {
+	result, err := q.db.Exec(ctx, grantRoleByKey, arg.UserID, arg.RoleKey)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const insertLocalIdentity = `-- name: InsertLocalIdentity :one
+INSERT INTO platform.identities (user_id, provider, provider_user_id, username, secret_hash)
+VALUES ($1, 'local', $2, $3, $4::text)
+RETURNING id
+`
+
+type InsertLocalIdentityParams struct {
+	UserID     int64
+	LoginName  string
+	Username   *string
+	SecretHash string
+}
+
+// 建立本地身分。撞 UNIQUE(provider, provider_user_id) = 這個登入名已被用掉,
+// 那是唯一權威(不靠先查後寫)。
+func (q *Queries) InsertLocalIdentity(ctx context.Context, arg InsertLocalIdentityParams) (int64, error) {
+	row := q.db.QueryRow(ctx, insertLocalIdentity,
+		arg.UserID,
+		arg.LoginName,
+		arg.Username,
+		arg.SecretHash,
+	)
+	var id int64
+	err := row.Scan(&id)
+	return id, err
 }
 
 const insertLoginIdentity = `-- name: InsertLoginIdentity :one
@@ -464,6 +555,27 @@ UPDATE platform.users SET last_seen_at = now() WHERE id = $1
 func (q *Queries) TouchLoginUser(ctx context.Context, id int64) error {
 	_, err := q.db.Exec(ctx, touchLoginUser, id)
 	return err
+}
+
+const updateLocalSecret = `-- name: UpdateLocalSecret :execrows
+UPDATE platform.identities
+SET secret_hash = $1::text
+WHERE provider = 'local' AND provider_user_id = $2
+`
+
+type UpdateLocalSecretParams struct {
+	SecretHash string
+	LoginName  string
+}
+
+// 重新產生通行碼(裁判忘記時的唯一修復路徑 —— 雜湊格式手寫不出來)。
+// 回傳列數要檢查:0 列 = 這個登入名沒有本地身分,不能無聲當成成功。
+func (q *Queries) UpdateLocalSecret(ctx context.Context, arg UpdateLocalSecretParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateLocalSecret, arg.SecretHash, arg.LoginName)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const updateLoginIdentity = `-- name: UpdateLoginIdentity :exec

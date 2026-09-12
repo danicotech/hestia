@@ -2,15 +2,15 @@
 //
 // # 它在雙軌身分裡的位置
 //
-// 報名不需要平台帳號(grill Q12),所以選手的憑證不是 Discord OAuth 而是
-// 遊戲ID + 通行碼。signup.Service.Login 只回答「你是不是這位選手」,
-// **換發憑證是這個套件的事**:
+// 報名不需要平台帳號(grill Q12),所以選手的憑證不是 Discord OAuth,而是
+// 遊戲ID(2026-09-13 起連通行碼都不用了)。signup.Service.Login 只回答
+// 「你是不是這位選手、現在還能不能登入」,**換發憑證是這個套件的事**:
 //
-//	signup.Login  證明身分(比對通行碼雜湊)
-//	session.Issue 簽發 session token(本套件)
+//	signup.Login   證明身分(遊戲ID 存在且 status = active)
+//	session.Issue  簽發 session token(本套件)
 //	session.Verify 每次請求驗證(本套件)
 //
-// 分成兩個套件是刻意的:通行碼驗證本來就能在沒有任何簽章金鑰的情況下被測完,
+// 分成兩個套件是刻意的:登入判斷本來就能在沒有任何簽章金鑰的情況下被測完,
 // 把簽發塞進 signup 會讓它平白多一個相依。
 //
 // # 這裡不寫第二套 HMAC
@@ -24,8 +24,13 @@
 //
 // session 不落任何儲存:沒有 session 表就沒有清理 job、沒有重啟遺失。
 // 撤銷靠的是 claims 裡的 pat 與 tournament_players.passcode_issued_at 對帳
-// (見 Service.Verify)—— 裁判重新產生通行碼的那一刻,用舊碼登入拿到的
-// session 就失效了,不需要一張會被忘記清的撤銷清單。
+// (見 Service.Verify)—— 裁判按下「重新產生通行碼」的那一刻,這位選手
+// **已經發出去的 session 全部作廢**,不需要一張會被忘記清的撤銷清單。
+//
+// 登入不再用通行碼之後,那個按鈕的意義就只剩這一件事:它是把一個人
+// 從線上踢下來的唯一手段。另一半是 signup.Login 的狀態檢查(只有 active
+// 登得進來)—— 棄賽擋住之後的登入,換發處理現在還活著的 session,
+// 兩個都做才算真的把一個人隔離。
 package session
 
 import (
@@ -47,11 +52,11 @@ const TokenType = "activity_player_session"
 // TTL 是選手 session 的壽命。
 //
 // 12 小時的尺度是「一個賽事晚上」:選手傍晚登入選讓武、打完決賽大概就是這個
-// 長度。再長沒有意義(通行碼隨時能重新登入),再短會讓人在第三輪之間被登出。
+// 長度。再長沒有意義(遊戲ID 隨時能重新登入),再短會讓人在第三輪之間被登出。
 //
 // 刻意**沒有** refresh 那一半:平台 session 需要輪替是因為它的 refresh token
-// 活 30 天,而這裡最長效的憑證是通行碼本身,由裁判掌握。少一個長效憑證就少
-// 一個要保護的東西。
+// 活 30 天,而這裡根本沒有長效憑證可言 —— 登入用的是公開的遊戲ID。
+// 這張 12 小時的 token 反而是整條路徑上唯一需要保護的東西,別再加第二個。
 //
 // 這是 token 壽命的唯一權威。transport 那個同名的 fallback 常數只在
 // 「實作沒回到期時間」時才會被用到,兩者不是同一個概念。
@@ -61,8 +66,16 @@ const TTL = 12 * time.Hour
 //
 // 兩個欄位都是**對外識別字**,沒有任何內部 BIGINT id(專案鐵則 5):
 // token 由瀏覽器持有,內部 id 進 token 就等於進了對外契約。
-// 內部 id 由呼叫端每次用 public_id 反查 —— 那也順便讓「選手被刪掉/棄賽後
-// 舊 token 還能用」不可能發生。
+// 內部 id 由呼叫端每次用 public_id 反查 —— 選手被刪掉或換屆之後,舊 token
+// 會在那一步自然失效。
+//
+// **棄賽會立刻失效**:登入已經不需要任何秘密,所以狀態是唯一能把人擋在
+// 外面的東西 —— PlayerPasscodeIssuedAt 只回 status='active' 的列,非參賽中
+// 的人在這裡就會被折成 ErrPlayerGone。裁判按下棄賽的那一刻就斷線,不必
+// 再多按一次換發通行碼。
+//
+// 已淘汰的人也一起被登出,那是這個取捨的一部分:session 代表的是「以參賽者
+// 身分動作」的權利,而對戰表與戰績本來就公開,不需要 session 才看得到。
 //
 // 這個型別與 transport.ActivityIdentity 長得一樣但刻意各自宣告:
 // core 不 import transport(那是反向依賴),而活動層遲早搬去 themis。
@@ -70,7 +83,7 @@ const TTL = 12 * time.Hour
 type Identity struct {
 	// TournamentSlug 是這個 session 屬於哪一屆。
 	//
-	// 必要而不是冗餘:通行碼是逐屆發的,一個 session 只該對一屆有效。
+	// 必要而不是冗餘:報名是逐屆的,一個 session 只該對一屆有效。
 	// 少了它,舊屆的 token 就能拿來操作新一屆的讓武。
 	TournamentSlug string
 	// PlayerPublicID 是選手的 public_id(ULID)。
@@ -110,7 +123,8 @@ type claims struct {
 var (
 	// ErrPasscodeRotated 是這張 session 簽發之後,通行碼被重新產生過。
 	ErrPasscodeRotated = fmt.Errorf("通行碼已重新產生,舊 session 失效: %w", identity.ErrInvalidToken)
-	// ErrPlayerGone 是 token 裡的選手在這一屆已經查不到(棄賽、被刪、換屆)。
+	// ErrPlayerGone 是 token 裡的選手在這一屆已經查不到(被刪、換屆、slug 不存在)。
+	// **棄賽不算**:那只改 status,列還在,見 Identity 的註解。
 	ErrPlayerGone = fmt.Errorf("選手不在這一屆: %w", identity.ErrInvalidToken)
 	// ErrInvalidIdentity 是簽發時給了不完整的身分。
 	//

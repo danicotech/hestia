@@ -49,20 +49,21 @@ func New(signer *identity.Signer, repo Repo, opts ...Option) *Service {
 // Issue 簽發一張選手 session,回傳 token 與到期時間。
 //
 // 會多打一次資料庫讀 passcode_issued_at。這是划算的:登入一個晚上只發生
-// 一次,而換來的是每一張 token 都帶著「我是用哪一版通行碼換來的」這個事實。
+// 一次,而換來的是每一張 token 都帶著「我是哪一輪換發之後發出來的」這個事實。
 //
 // # 一個已知且刻意接受的窗口
 //
-// 呼叫端的流程是「signup.Login 驗通行碼 → session.Issue 讀 pat」,兩者之間
-// 裁判剛好按下重新產生的話,這張 token 會帶著**新**的 pat —— 用舊碼登入卻
-// 拿到一張活的 session。窗口是那兩次查詢之間的幾毫秒,而且要求攻擊者恰好
-// 在裁判按鈕的那一瞬間完成登入。
+// 呼叫端的流程是「signup.Login 查選手 → session.Issue 讀 pat」,兩者之間
+// 裁判剛好按下重新產生的話,這張 token 會帶著**新**的 pat —— 裁判以為自己把
+// 這個人踢光了,卻正好發了一張活的給他。窗口是那兩次查詢之間的幾毫秒,
+// 而且要求對方恰好在裁判按鈕的那一瞬間完成登入。
 //
-// 能關掉它的唯一辦法是讓驗證與簽發共用同一次讀取(把 pat 從 Login 的結果
+// 能關掉它的唯一辦法是讓登入與簽發共用同一次讀取(把 pat 從 Login 的結果
 // 一路傳到這裡),但那要求 transport 的 ActivitySessions port 多帶一個
 // 活動層專屬的欄位 —— 為了幾毫秒的窗口,把「簽發 session」這個介面綁死在
-// 「通行碼」這個實作細節上,不划算。寫在這裡是為了讓下一個人知道這是
-// 判斷過的取捨,不是漏掉的。
+// 「passcode_issued_at」這個實作細節上,不划算。真的要確保踢乾淨,
+// 裁判還有 WithdrawPlayer(擋住之後的登入)可以一起用。
+// 寫在這裡是為了讓下一個人知道這是判斷過的取捨,不是漏掉的。
 func (s *Service) Issue(ctx context.Context, id Identity) (string, time.Time, error) {
 	if !id.Valid() {
 		return "", time.Time{}, fmt.Errorf("%w: 缺 slug 或選手 public_id", ErrInvalidIdentity)
@@ -104,12 +105,12 @@ func (s *Service) Issue(ctx context.Context, id Identity) (string, time.Time, er
 // # 第 4 步就是「換發通行碼即失效」
 //
 // 裁判重新產生通行碼時,UPDATE 會同時改 passcode_hash 與 passcode_issued_at。
-// 舊碼從此比對不過(signup 那一半),而**已經發出去的 session** 靠這裡:
-// token 裡的 pat 是簽發當下的 issued_at,對不上現在這一列就當場失效。
+// 登入已經不比對雜湊了(2026-09-13 起只要遊戲ID),所以那個動作現在**全部**的
+// 效果就在這裡:token 裡的 pat 是簽發當下的 issued_at,對不上現在這一列就當場失效。
 //
 // 比「相等」而不是「不大於」:換發只會讓時間往前走,但萬一資料被改回舊值
 // (還原備份、手動改資料),那正是最需要保守的時候。相等的語意是
-// 「這張 token 對應的那一版通行碼還是現在這一版」,沒有第二種解釋。
+// 「這張 token 是現在這一輪換發之後發出來的」,沒有第二種解釋。
 func (s *Service) Verify(ctx context.Context, token string) (Identity, error) {
 	var c claims
 	if err := s.signer.Verify(TokenType, token, &c); err != nil {

@@ -20,9 +20,12 @@
 // 互斥 —— 「service 讀到 signup、寫入時裁判剛好封閉報名」這個時間差
 // 在 tx 期間就被消掉了。
 //
-// # 通行碼雜湊的流向
+// # 通行碼雜湊的流向(2026-09-13 起只寫不讀)
 //
-// 只有 CredentialByGameID 會讀出 passcode_hash,而它只被 Login 的比對用。
+// 這個檔案裡**沒有任何一支方法讀得到 passcode_hash**:登入只要遊戲ID,
+// 沒有東西要比對。寫入還在(報名建一份、UpdatePasscode 換一份),因為欄位是
+// NOT NULL,而且換發時一起前進的 passcode_issued_at 是選手 session 的作廢依據。
+//
 // 稽核紀錄裡**絕不**出現明碼或雜湊(port 明文要求):稽核紀錄是給人看的,
 // 而通行碼雜湊出現在任何一個給人看的地方都是多一個外洩面。
 package signuppg
@@ -102,8 +105,13 @@ func (s *Service) PlayerByPublicID(ctx context.Context, tournamentID int64, publ
 // PasscodeIssuedAt 取這位選手目前的 passcode_issued_at,供選手 session 驗證用
 // (session.Repo)。查無回 tournament.ErrPlayerNotFound。
 //
-// 「查無」把三種情況折成同一個錯誤:賽事不存在、選手不存在、public_id 不屬於
-// 這一屆。這條路徑跑在**未認證**的請求上,分辨得出哪一種就等於一支探測器。
+// 「查無」把四種情況折成同一個錯誤:賽事不存在、選手不存在、public_id 不屬於
+// 這一屆、**這個人已經不是參賽中**。這條路徑跑在未認證的請求上,分辨得出
+// 哪一種就等於一支探測器。
+//
+// 最後那一種是「棄賽 = 鎖住這個人」成立的地方:登入不需要秘密,所以狀態是
+// 唯一的門鎖,而只擋新登入的鎖要等 token 過期才生效。條件寫在 SQL 裡
+// (見 PlayerPasscodeIssuedAt 的註解)。
 //
 // 回傳的是 DB 的值,一微秒都不加工 —— 它會與 token 裡的值逐微秒比對,
 // 這裡若用本地時鐘補任何東西,結果是全屆選手隨機被登出。
@@ -262,32 +270,34 @@ func registrationError(err error, p signup.CreateRegistrationParams, lockedPhase
 	}
 }
 
-// ── 登入憑證 ──────────────────────────────────────────────────
+// ── 登入 ──────────────────────────────────────────────────────
 
-// CredentialByGameID 依遊戲ID 取本屆的選手與通行碼雜湊。
+// PlayerByGameID 依遊戲ID 取本屆的選手(登入用)。
+//
+// **不過濾 status**:只有 active 登得進來,但那條規則的權威在
+// signup.Service.Login —— 它同時要把「非 active」與「查無此人」折成同一個答案,
+// 而那件事只能有一個地方做得到(port 註解寫了同一句)。
 //
 // 查無回 ErrPlayerNotFound —— 呼叫端**不得**把這個錯誤原樣回給使用者
 // (Login 會一律轉成 ErrInvalidCredentials)。錯誤訊息裡不放 game_id:
 // 它最終會進伺服器日誌,而「誰報了名」在報名期間不是公開資訊。
-func (s *Service) CredentialByGameID(ctx context.Context, tournamentID int64, gameID string) (signup.Credential, error) {
-	row, err := s.q.GetCredentialByGameID(ctx, db.GetCredentialByGameIDParams{
+func (s *Service) PlayerByGameID(ctx context.Context, tournamentID int64, gameID string) (tournament.Player, error) {
+	row, err := s.q.GetPlayerByGameID(ctx, db.GetPlayerByGameIDParams{
 		TournamentID: tournamentID, GameID: gameID,
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return signup.Credential{}, fmt.Errorf("賽事 %d 查無此遊戲ID: %w",
+			return tournament.Player{}, fmt.Errorf("賽事 %d 查無此遊戲ID: %w",
 				tournamentID, tournament.ErrPlayerNotFound)
 		}
-		return signup.Credential{}, fmt.Errorf("讀賽事 %d 的登入憑證: %w", tournamentID, err)
+		return tournament.Player{}, fmt.Errorf("讀賽事 %d 的登入選手: %w", tournamentID, err)
 	}
-	return signup.Credential{
-		Player:           playerFromCredential(row),
-		PasscodeHash:     row.PasscodeHash,
-		PasscodeIssuedAt: row.PasscodeIssuedAt,
-	}, nil
+	// 欄位與 GetPlayerByPublicID 逐字相同,所以直接轉型交給唯一那份映射(鐵則 9)。
+	return tournamentpg.PlayerFromRow(db.GetPlayerByPublicIDRow(row)), nil
 }
 
-// UpdatePasscode 換發通行碼,舊碼在雜湊被覆寫的那一刻立即失效。
+// UpdatePasscode 換發通行碼 —— 現在的效果是把這位選手所有已發出的 session 踢掉
+// (passcode_issued_at 一起前進,見 queries/activity_tournament.sql 的檔頭)。
 func (s *Service) UpdatePasscode(ctx context.Context, p signup.UpdatePasscodeParams) error {
 	// ActorUserID 必為非 0:admin_audit_logs.actor_user_id 是 NOT NULL 且
 	// FK 到 platform.users,塞 0 會讓稽核 insert 失敗、把整筆換發一起 rollback。
@@ -459,36 +469,6 @@ func playerFromInsert(r db.InsertTournamentPlayerRow, gameID string) tournament.
 		CreatedAt:        r.CreatedAt,
 		UpdatedAt:        r.UpdatedAt,
 		GameID:           gameID,
-	})
-}
-
-// playerFromCredential 把登入憑證列的選手部分轉成 Player。
-//
-// 刻意逐欄列出而不是整個結構轉過去:這一列比別人多了 passcode_hash 與
-// passcode_issued_at,而 tournament.Player 沒有那兩個欄位 ——
-// 一個查得到卻沒有容身之處的雜湊,不可能被誰不小心序列化到 API 上。
-func playerFromCredential(r db.GetCredentialByGameIDRow) tournament.Player {
-	return tournamentpg.PlayerFromRow(db.GetPlayerByPublicIDRow{
-		ID:               r.ID,
-		PublicID:         r.PublicID,
-		TournamentID:     r.TournamentID,
-		FencerID:         r.FencerID,
-		UserID:           r.UserID,
-		DisplayName:      r.DisplayName,
-		DiscordName:      r.DiscordName,
-		RankLevel:        r.RankLevel,
-		RankedAt:         r.RankedAt,
-		RankedBy:         r.RankedBy,
-		SelfRatedLevel:   r.SelfRatedLevel,
-		LadderRank:       r.LadderRank,
-		LadderScore:      r.LadderScore,
-		ArtsNote:         r.ArtsNote,
-		AvailabilityNote: r.AvailabilityNote,
-		SeedNo:           r.SeedNo,
-		Status:           r.Status,
-		CreatedAt:        r.CreatedAt,
-		UpdatedAt:        r.UpdatedAt,
-		GameID:           r.GameID,
 	})
 }
 

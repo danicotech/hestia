@@ -7,7 +7,7 @@ Go server stub 由 buf 生成到 `gen/`,未來的 TS client 也從同一份 prot
 ```
 proto/hestia/platform/v1/
   common.proto          共用列舉與檢視型別(UserProfile / Balance / ShopItem / Entitlement / Redemption / LedgerAdjustment)
-  auth.proto            AuthService        Discord OAuth 登入、換發、登出(handler 目前 unimplemented)
+  auth.proto            AuthService        Discord OAuth 登入、本地憑證登入(LocalLogin,裁判用)、換發、登出
   me.proto              MeService          我的檔案 / 餘額(單一與全部)/ 權益 / 工單 / 改時區
   daily.proto           DailyService       每日簽到
   shop.proto            ShopService        商品列表 / 購買 / 自助退款 / 取消工單
@@ -178,6 +178,7 @@ catch (e) {
 | `provider_exchange_failed` | unavailable | 與 Discord 交換憑證失敗,稍後重試 |
 | `account_deleted` | permission_denied | 帳號已註銷 |
 | `identity_invalid_config` | internal | 身分服務設定有問題 |
+| `local_invalid_credentials` | unauthenticated | 本地登入(裁判)失敗 → **不區分查無此登入名與通行碼錯**,回應內容與時間都一樣 |
 | `oauth_denied` | permission_denied | 使用者在 Discord 授權頁按了取消 → **不是錯誤**,顯示「你取消了登入」 |
 | `oauth_callback_invalid` | invalid_argument | 回呼缺 `code` 或 `state`(不是我們發出去的那個流程) |
 | `login_failed` | internal | 登入失敗且成因不對外分類(未映射錯誤在導回網址上的統一代表) |
@@ -193,7 +194,6 @@ catch (e) {
 | `activity_already_registered` | already_exists | 這個遊戲ID 已報名本屆 |
 | `activity_game_id_required` | invalid_argument | 遊戲ID 必填 |
 | `activity_invalid_game_id` | invalid_argument | 遊戲ID 格式不正確 |
-| `activity_discord_name_required` | invalid_argument | 必須填寫 Discord 名稱 |
 | `activity_field_too_long` | invalid_argument | 某個報名欄位超長 |
 | `activity_player_already_bound` | failed_precondition | 這位選手已綁定**其他**平台帳號 → 要改綁請找裁判 |
 | `activity_user_already_bound` | failed_precondition | 這個平台帳號已綁在另一位選手身上 |

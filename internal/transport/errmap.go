@@ -84,7 +84,6 @@ var errorCodes = []struct {
 	{signup.ErrAlreadyRegistered, connect.CodeAlreadyExists, "activity_already_registered"},
 	{signup.ErrGameIDRequired, connect.CodeInvalidArgument, "activity_game_id_required"},
 	{signup.ErrInvalidGameID, connect.CodeInvalidArgument, "activity_invalid_game_id"},
-	{signup.ErrDiscordNameRequired, connect.CodeInvalidArgument, "activity_discord_name_required"},
 	{signup.ErrFieldTooLong, connect.CodeInvalidArgument, "activity_field_too_long"},
 	// 兩種「已綁」分開:前者要使用者先解綁自己的,後者是那個帳號被別人用了。
 	{signup.ErrAlreadyBound, connect.CodeFailedPrecondition, "activity_player_already_bound"},
@@ -254,6 +253,10 @@ var errorCodes = []struct {
 	// 外部 provider 掛了/超時:稍後重試有意義。
 	{identity.ErrProviderExchange, connect.CodeUnavailable, "provider_exchange_failed"},
 	{identity.ErrAccountDeleted, connect.CodePermissionDenied, "account_deleted"},
+	// 本地登入失敗。**刻意不區分**「查無此登入名」與「通行碼錯」——
+	// 分得出來的話,這支 RPC 就成了一份「誰是裁判」的名單,而裁判帳號
+	// 握有判勝負與發獎的能力。實作端連回應時間都補平(誘餌雜湊)。
+	{identity.ErrInvalidCredentials, connect.CodeUnauthenticated, "local_invalid_credentials"},
 	{identity.ErrInvalidConfig, connect.CodeInternal, "identity_invalid_config"},
 
 	// ── 通知拉取(notification)──────────────────────────────────

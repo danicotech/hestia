@@ -158,3 +158,47 @@ ORDER BY COALESCE(s.last_used_at, s.issued_at) DESC, s.id DESC;
 -- rotated_from 的子列指標由 FK 的 ON DELETE SET NULL 自動斷開,不會撞 FK。
 DELETE FROM platform.sessions
 WHERE COALESCE(revoked_at, expires_at) < now() - make_interval(days => sqlc.arg(retention_days)::int);
+
+-- ── 本地登入(provider='local',migration 00031)────────────────────────────
+--
+-- 只有 local 身分會有 secret_hash。OAuth 身分的那一欄永遠是 NULL,
+-- 所以下面每一支都把 provider = 'local' 寫進 WHERE ——
+-- 少了它,一個 Discord 帳號的 provider_user_id(snowflake)就成了可猜測的登入名。
+
+-- name: GetLocalIdentity :one
+-- 本地登入的唯一讀取點。
+--
+-- 刻意不過濾 users.deleted_at:軟刪除的帳號必須讓應用層看見並走「憑證不正確」
+-- 那條路(含誘餌雜湊),查不到就直接短路的話,已註銷的登入名會回得比較快,
+-- 而那個時間差就是一支帳號列舉器。
+SELECT i.id         AS identity_id,
+       i.secret_hash,
+       u.id         AS user_id,
+       u.deleted_at AS user_deleted_at
+FROM platform.identities i
+JOIN platform.users u ON u.id = i.user_id
+WHERE i.provider = 'local' AND i.provider_user_id = sqlc.arg(login_name);
+
+-- name: InsertLocalIdentity :one
+-- 建立本地身分。撞 UNIQUE(provider, provider_user_id) = 這個登入名已被用掉,
+-- 那是唯一權威(不靠先查後寫)。
+INSERT INTO platform.identities (user_id, provider, provider_user_id, username, secret_hash)
+VALUES (sqlc.arg(user_id), 'local', sqlc.arg(login_name), sqlc.narg(username), sqlc.arg(secret_hash)::text)
+RETURNING id;
+
+-- name: UpdateLocalSecret :execrows
+-- 重新產生通行碼(裁判忘記時的唯一修復路徑 —— 雜湊格式手寫不出來)。
+-- 回傳列數要檢查:0 列 = 這個登入名沒有本地身分,不能無聲當成成功。
+UPDATE platform.identities
+SET secret_hash = sqlc.arg(secret_hash)::text
+WHERE provider = 'local' AND provider_user_id = sqlc.arg(login_name);
+
+-- name: GrantRoleByKey :execrows
+-- 授予全域角色(community_id IS NULL)。source='manual':之後同步 Discord
+-- 身分組時只撤 provider_sync,手動授予不受影響(migration 00004 的設計)。
+-- ON CONFLICT DO NOTHING 對齊 user_roles_uniq,重跑不炸。
+INSERT INTO platform.user_roles (user_id, role_id, community_id, source)
+SELECT sqlc.arg(user_id), r.id, NULL, 'manual'
+FROM platform.roles r
+WHERE r.key = sqlc.arg(role_key)
+ON CONFLICT (user_id, role_id, COALESCE(community_id, 0)) DO NOTHING;

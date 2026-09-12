@@ -55,8 +55,10 @@ func recoverInterceptor(log *slog.Logger) connect.UnaryInterceptorFunc {
 var publicProcedures = map[string]struct{}{
 	platformv1connect.AuthServiceStartDiscordLoginProcedure:    {},
 	platformv1connect.AuthServiceCompleteDiscordLoginProcedure: {},
-	platformv1connect.AuthServiceRefreshSessionProcedure:       {},
-	platformv1connect.AuthServiceLogoutProcedure:               {},
+	// 本地登入(裁判用)。與 Discord 那兩支同一個理由:登入前沒有 token。
+	platformv1connect.AuthServiceLocalLoginProcedure:     {},
+	platformv1connect.AuthServiceRefreshSessionProcedure: {},
+	platformv1connect.AuthServiceLogoutProcedure:         {},
 	// 商品列表是公開型錄,未登入也要看得到(才有東西吸引人登入)。
 	platformv1connect.ShopServiceListItemsProcedure: {},
 

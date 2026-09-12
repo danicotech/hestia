@@ -207,6 +207,27 @@ type AuthService interface {
 	Logout(ctx context.Context, accessToken, refreshToken string) error
 }
 
+// LocalAuthService 是本地登入(identities.provider = 'local')的**選配**能力。
+//
+// 為什麼另立一個介面而不是加進 AuthService:本地登入是給裁判的後路,不是
+// 每個部署都要開。做成必要方法的話,任何一個只接 Discord 的組裝(以及所有
+// 既有的測試替身)都得為它生一個回 Unimplemented 的空方法 —— 那種方法會被
+// 複製貼上,然後其中一份哪天被填上真的實作。
+//
+// 入口層對注入進來的 AuthService 做一次型別斷言:支援就接上,不支援就是
+// Unimplemented,與其他未注入的服務同一種回應。
+type LocalAuthService interface {
+	// LocalLogin 以登入名 + 通行碼換一個 session。
+	//
+	// 回傳與 CompleteDiscordLogin 同型不是巧合:登入方式的差別到此為止,
+	// 之後沒有任何一支 RPC 需要知道這個人是怎麼進來的。
+	//
+	// 失敗一律是同一個錯誤(identity.ErrInvalidCredentials),
+	// **實作端**負責連時序都補平 —— 入口層沒有能力做這件事,
+	// 也不該在這裡多加任何會產生分支的檢查。
+	LocalLogin(ctx context.Context, loginName, passcode string, dev DeviceInfo) (*SessionView, *readmodel.ProfileView, error)
+}
+
 // CommunityResolver 回答「這次操作屬於哪個社群」。
 //
 // 目前只有一種答案:全庫唯一的那個社群。事件還沒帶發生地

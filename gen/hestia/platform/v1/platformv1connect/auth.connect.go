@@ -2,7 +2,8 @@
 //
 // Source: hestia/platform/v1/auth.proto
 
-// 登入:OAuth2(第一個 provider 是 Discord),無密碼(schemas/02-identity.md)。
+// 登入:OAuth2(第一個 provider 是 Discord)為主,另有一條本地憑證的路
+// (LocalLogin,identities.provider = 'local'),見 schemas/02-identity.md。
 // 本檔只是契約——handler 目前一律回 unimplemented,實作由 identity 層補上。
 package platformv1connect
 
@@ -41,6 +42,8 @@ const (
 	// AuthServiceCompleteDiscordLoginProcedure is the fully-qualified name of the AuthService's
 	// CompleteDiscordLogin RPC.
 	AuthServiceCompleteDiscordLoginProcedure = "/hestia.platform.v1.AuthService/CompleteDiscordLogin"
+	// AuthServiceLocalLoginProcedure is the fully-qualified name of the AuthService's LocalLogin RPC.
+	AuthServiceLocalLoginProcedure = "/hestia.platform.v1.AuthService/LocalLogin"
 	// AuthServiceRefreshSessionProcedure is the fully-qualified name of the AuthService's
 	// RefreshSession RPC.
 	AuthServiceRefreshSessionProcedure = "/hestia.platform.v1.AuthService/RefreshSession"
@@ -52,6 +55,9 @@ const (
 type AuthServiceClient interface {
 	StartDiscordLogin(context.Context, *connect.Request[v1.StartDiscordLoginRequest]) (*connect.Response[v1.StartDiscordLoginResponse], error)
 	CompleteDiscordLogin(context.Context, *connect.Request[v1.CompleteDiscordLoginRequest]) (*connect.Response[v1.CompleteDiscordLoginResponse], error)
+	// LocalLogin 不依賴 cookie(沒有 OAuth state 要綁瀏覽器),
+	// 但仍與其他登入 RPC 一樣對認證攔截器豁免 —— 登入前本來就沒有 token。
+	LocalLogin(context.Context, *connect.Request[v1.LocalLoginRequest]) (*connect.Response[v1.LocalLoginResponse], error)
 	RefreshSession(context.Context, *connect.Request[v1.RefreshSessionRequest]) (*connect.Response[v1.RefreshSessionResponse], error)
 	Logout(context.Context, *connect.Request[v1.LogoutRequest]) (*connect.Response[v1.LogoutResponse], error)
 }
@@ -79,6 +85,12 @@ func NewAuthServiceClient(httpClient connect.HTTPClient, baseURL string, opts ..
 			connect.WithSchema(authServiceMethods.ByName("CompleteDiscordLogin")),
 			connect.WithClientOptions(opts...),
 		),
+		localLogin: connect.NewClient[v1.LocalLoginRequest, v1.LocalLoginResponse](
+			httpClient,
+			baseURL+AuthServiceLocalLoginProcedure,
+			connect.WithSchema(authServiceMethods.ByName("LocalLogin")),
+			connect.WithClientOptions(opts...),
+		),
 		refreshSession: connect.NewClient[v1.RefreshSessionRequest, v1.RefreshSessionResponse](
 			httpClient,
 			baseURL+AuthServiceRefreshSessionProcedure,
@@ -98,6 +110,7 @@ func NewAuthServiceClient(httpClient connect.HTTPClient, baseURL string, opts ..
 type authServiceClient struct {
 	startDiscordLogin    *connect.Client[v1.StartDiscordLoginRequest, v1.StartDiscordLoginResponse]
 	completeDiscordLogin *connect.Client[v1.CompleteDiscordLoginRequest, v1.CompleteDiscordLoginResponse]
+	localLogin           *connect.Client[v1.LocalLoginRequest, v1.LocalLoginResponse]
 	refreshSession       *connect.Client[v1.RefreshSessionRequest, v1.RefreshSessionResponse]
 	logout               *connect.Client[v1.LogoutRequest, v1.LogoutResponse]
 }
@@ -110,6 +123,11 @@ func (c *authServiceClient) StartDiscordLogin(ctx context.Context, req *connect.
 // CompleteDiscordLogin calls hestia.platform.v1.AuthService.CompleteDiscordLogin.
 func (c *authServiceClient) CompleteDiscordLogin(ctx context.Context, req *connect.Request[v1.CompleteDiscordLoginRequest]) (*connect.Response[v1.CompleteDiscordLoginResponse], error) {
 	return c.completeDiscordLogin.CallUnary(ctx, req)
+}
+
+// LocalLogin calls hestia.platform.v1.AuthService.LocalLogin.
+func (c *authServiceClient) LocalLogin(ctx context.Context, req *connect.Request[v1.LocalLoginRequest]) (*connect.Response[v1.LocalLoginResponse], error) {
+	return c.localLogin.CallUnary(ctx, req)
 }
 
 // RefreshSession calls hestia.platform.v1.AuthService.RefreshSession.
@@ -126,6 +144,9 @@ func (c *authServiceClient) Logout(ctx context.Context, req *connect.Request[v1.
 type AuthServiceHandler interface {
 	StartDiscordLogin(context.Context, *connect.Request[v1.StartDiscordLoginRequest]) (*connect.Response[v1.StartDiscordLoginResponse], error)
 	CompleteDiscordLogin(context.Context, *connect.Request[v1.CompleteDiscordLoginRequest]) (*connect.Response[v1.CompleteDiscordLoginResponse], error)
+	// LocalLogin 不依賴 cookie(沒有 OAuth state 要綁瀏覽器),
+	// 但仍與其他登入 RPC 一樣對認證攔截器豁免 —— 登入前本來就沒有 token。
+	LocalLogin(context.Context, *connect.Request[v1.LocalLoginRequest]) (*connect.Response[v1.LocalLoginResponse], error)
 	RefreshSession(context.Context, *connect.Request[v1.RefreshSessionRequest]) (*connect.Response[v1.RefreshSessionResponse], error)
 	Logout(context.Context, *connect.Request[v1.LogoutRequest]) (*connect.Response[v1.LogoutResponse], error)
 }
@@ -149,6 +170,12 @@ func NewAuthServiceHandler(svc AuthServiceHandler, opts ...connect.HandlerOption
 		connect.WithSchema(authServiceMethods.ByName("CompleteDiscordLogin")),
 		connect.WithHandlerOptions(opts...),
 	)
+	authServiceLocalLoginHandler := connect.NewUnaryHandler(
+		AuthServiceLocalLoginProcedure,
+		svc.LocalLogin,
+		connect.WithSchema(authServiceMethods.ByName("LocalLogin")),
+		connect.WithHandlerOptions(opts...),
+	)
 	authServiceRefreshSessionHandler := connect.NewUnaryHandler(
 		AuthServiceRefreshSessionProcedure,
 		svc.RefreshSession,
@@ -167,6 +194,8 @@ func NewAuthServiceHandler(svc AuthServiceHandler, opts ...connect.HandlerOption
 			authServiceStartDiscordLoginHandler.ServeHTTP(w, r)
 		case AuthServiceCompleteDiscordLoginProcedure:
 			authServiceCompleteDiscordLoginHandler.ServeHTTP(w, r)
+		case AuthServiceLocalLoginProcedure:
+			authServiceLocalLoginHandler.ServeHTTP(w, r)
 		case AuthServiceRefreshSessionProcedure:
 			authServiceRefreshSessionHandler.ServeHTTP(w, r)
 		case AuthServiceLogoutProcedure:
@@ -186,6 +215,10 @@ func (UnimplementedAuthServiceHandler) StartDiscordLogin(context.Context, *conne
 
 func (UnimplementedAuthServiceHandler) CompleteDiscordLogin(context.Context, *connect.Request[v1.CompleteDiscordLoginRequest]) (*connect.Response[v1.CompleteDiscordLoginResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("hestia.platform.v1.AuthService.CompleteDiscordLogin is not implemented"))
+}
+
+func (UnimplementedAuthServiceHandler) LocalLogin(context.Context, *connect.Request[v1.LocalLoginRequest]) (*connect.Response[v1.LocalLoginResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("hestia.platform.v1.AuthService.LocalLogin is not implemented"))
 }
 
 func (UnimplementedAuthServiceHandler) RefreshSession(context.Context, *connect.Request[v1.RefreshSessionRequest]) (*connect.Response[v1.RefreshSessionResponse], error) {

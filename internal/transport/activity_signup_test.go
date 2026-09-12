@@ -81,8 +81,9 @@ func signupDeps() (ActivityDeps, *fakeActivitySignup, *fakeActivitySessions, *fa
 	player := testPlayer(testPlayerAID, bp.RankKaishan, nil)
 	svc := &fakeActivitySignup{
 		regResult: &signup.RegisterResult{
-			Player: player, Passcode: "K7M2PQ",
-			ReturningFencer: true, PreviousRank: bp.RankDuanshui,
+			Player:          player,
+			ReturningFencer: true,
+			PreviousRank:    bp.RankDuanshui,
 		},
 		loginRes: &player,
 	}
@@ -99,7 +100,11 @@ func signupDeps() (ActivityDeps, *fakeActivitySignup, *fakeActivitySessions, *fa
 }
 
 // 報名不需要任何憑證 —— 那是這條路徑存在的全部理由(門檻要夠低)。
-func TestRegisterIsAnonymousAndReturnsPasscodeOnce(t *testing.T) {
+//
+// 回應裡**不該有通行碼**(2026-09-13):登入只要遊戲ID,顯示一組沒有用途的
+// 密碼只會讓人以為要保存它。proto 那個欄位已經 reserved,所以這裡改用
+// 序列化後的內容確認 —— 有人把它加回來時,這條會紅。
+func TestRegisterIsAnonymousAndReturnsNoPasscode(t *testing.T) {
 	deps, svc, _, _ := signupDeps()
 	srv := newActivityServer(t, deps)
 	client := activityv1connect.NewSignupServiceClient(srv.Client(), srv.URL)
@@ -115,8 +120,8 @@ func TestRegisterIsAnonymousAndReturnsPasscodeOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Register(匿名): %v", err)
 	}
-	if got.Msg.GetPasscode() != "K7M2PQ" {
-		t.Fatalf("passcode = %q", got.Msg.GetPasscode())
+	if strings.Contains(got.Msg.String(), "passcode") {
+		t.Fatalf("報名回應不該提到通行碼:%s", got.Msg.String())
 	}
 	if !got.Msg.GetReturningFencer() {
 		t.Fatal("returning_fencer 應為 true")
@@ -139,6 +144,30 @@ func TestRegisterIsAnonymousAndReturnsPasscodeOnce(t *testing.T) {
 	}
 }
 
+// 只填遊戲ID 的報名要原樣送到領域層:入口層不補任何預設值,
+// 「哪些欄位必填」的權威只有 signup.Service 一處。
+func TestRegisterPassesThroughEmptyOptionalFields(t *testing.T) {
+	deps, svc, _, _ := signupDeps()
+	srv := newActivityServer(t, deps)
+	client := activityv1connect.NewSignupServiceClient(srv.Client(), srv.URL)
+
+	if _, err := client.Register(context.Background(), connect.NewRequest(&activityv1.RegisterRequest{
+		TournamentSlug: testSlug,
+		GameId:         "御風羽",
+	})); err != nil {
+		t.Fatalf("只填遊戲ID 的報名: %v", err)
+	}
+	got := svc.registered[0]
+	if got.GameID != "御風羽" {
+		t.Fatalf("game_id = %q", got.GameID)
+	}
+	if got.DiscordName != "" || got.DisplayName != "" || got.LadderRank != "" ||
+		got.ArtsNote != "" || got.AvailabilityNote != "" ||
+		got.LadderScore != 0 || got.SelfRatedRank != bp.RankUnspecified {
+		t.Fatalf("入口層不該替留空的欄位補值:%+v", got)
+	}
+}
+
 func TestRegisterRequiresSlug(t *testing.T) {
 	deps, _, _, _ := signupDeps()
 	srv := newActivityServer(t, deps)
@@ -158,13 +187,14 @@ func TestLoginIssuesHardenedCookieAndNoTokenInBody(t *testing.T) {
 	client := activityv1connect.NewSignupServiceClient(srv.Client(), srv.URL)
 
 	res, err := client.Login(context.Background(), connect.NewRequest(&activityv1.LoginRequest{
-		TournamentSlug: testSlug, GameId: "御風羽", Passcode: "k7m2pq",
+		TournamentSlug: testSlug, GameId: "御風羽",
 	}))
 	if err != nil {
 		t.Fatalf("Login: %v", err)
 	}
-	if len(svc.logins) != 1 || svc.logins[0].Passcode != "k7m2pq" {
-		t.Fatalf("通行碼未原樣傳到領域層:%+v", svc.logins)
+	// 登入只要遊戲ID(2026-09-13):原樣送到領域層,入口層不做任何整理。
+	if len(svc.logins) != 1 || svc.logins[0].GameID != "御風羽" {
+		t.Fatalf("遊戲ID 未原樣傳到領域層:%+v", svc.logins)
 	}
 	if len(sessions.issued) != 1 {
 		t.Fatalf("簽發次數 = %d", len(sessions.issued))
@@ -206,7 +236,7 @@ func TestLoginFailureIssuesNoCookie(t *testing.T) {
 	client := activityv1connect.NewSignupServiceClient(srv.Client(), srv.URL)
 
 	_, err := client.Login(context.Background(), connect.NewRequest(&activityv1.LoginRequest{
-		TournamentSlug: testSlug, GameId: "不存在", Passcode: "000000",
+		TournamentSlug: testSlug, GameId: "不存在",
 	}))
 	if err == nil {
 		t.Fatal("預期登入失敗")

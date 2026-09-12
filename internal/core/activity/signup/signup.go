@@ -5,18 +5,34 @@
 // 報名**不需要**平台帳號。門檻要夠低:百業的成員未必都綁過 Discord OAuth,
 // 而「先去登入再回來報名」會直接勸退一部分人(grill Q12)。
 //
-// 代價是活動層要自己發一組憑證,於是身分變成兩軌:
+// 代價是活動層要自己認一組身分,於是身分變成兩軌:
 //
-//	選手    → 遊戲ID + 通行碼 → 活動層 session
+//	選手    → 遊戲ID → 活動層 session
 //	下注者  → 平台帳號 Bearer → 因為要動平台代幣
 //
 // 兩者可以是同一人:選手事後 BindPlatformAccount 即可。**領獎必須先綁**
 // (grill Q24)—— 獎金走 Ledger,要有收款對象。
 //
+// # 報名只要遊戲ID,登入也只要遊戲ID(2026-09-13 定案)
+//
+// 這推翻了先前兩個決定:報名的必填欄位只剩 GameID,登入不再驗通行碼。
+//
+// 代價是清楚的、而且是被接受的:遊戲ID 全服唯一且公開(對戰表上就印著),
+// 所以任何人知道某位選手的遊戲ID 就能以他的身分登入、花掉他的 BP、
+// 改他的讓武選擇。換來的是報名到登入之間沒有任何要抄、會抄錯、會弄丟的東西。
+//
+// 既然沒有密碼可換,「把某個人擋在外面」的唯一槓桿就是他的狀態:
+// 只有 tournament.PlayerActive 登得進來(見 Service.Login)。
+//
+// 通行碼本身沒有消失,只是不再給選手看:passcode_hash 照舊產生並寫入
+// (NOT NULL),而它的同伴 passcode_issued_at 是已發出 session 的作廢依據。
+// 所以裁判的 RegeneratePasscode 現在的意思是「把這個人所有 session 踢掉」,
+// 見 UpdatePasscodeParams。
+//
 // # 這個套件不發 session
 //
 // Login 只負責「證明你是誰」,換發 cookie 是 transport 層的事。
-// 把簽發也塞進來會讓核心邏輯依賴簽章金鑰,而驗證通行碼這件事
+// 把簽發也塞進來會讓核心邏輯依賴簽章金鑰,而「這個遊戲ID 現在能不能登入」
 // 本來可以在沒有任何金鑰的情況下被測完。
 package signup
 
@@ -27,6 +43,7 @@ import (
 
 	"github.com/danicotech/hestia/internal/core/activity/bp"
 	"github.com/danicotech/hestia/internal/core/activity/tournament"
+	"github.com/danicotech/hestia/internal/shared/secret"
 )
 
 // Fencer 是 activity.fencers 的一列:跨屆選手檔案,以遊戲ID 為自然鍵。
@@ -56,12 +73,15 @@ type Fencer struct {
 var (
 	// ErrInvalidCredentials 是登入失敗。
 	//
-	// **查無此遊戲ID 與通行碼錯誤回的是同一個錯誤**,而且訊息裡不含任何
-	// 能分辨兩者的線索(schemas/20 明訂)。分得出來的話,登入頁就變成一份
-	// 「誰報了名」的查詢介面 —— 報名期間那並不是公開資訊。
+	// **三條失敗路徑回的是同一個錯誤**:查無此遊戲ID、這個人不是 active
+	// (棄賽或已淘汰)、遊戲ID 格式不合。訊息裡不含任何能分辨它們的線索。
 	//
-	// 時序上的差異由 Hasher.VerifyDummy 補平,見 Service.Login。
-	ErrInvalidCredentials = errors.New("遊戲ID 或通行碼不正確")
+	// 分得出來的代價比想像中大:登入頁會變成一支「這個 ID 報名了沒 / 他是不是
+	// 被棄賽了」的查詢介面,而被裁判擋在外面這件事不該由一個匿名請求問得出來。
+	//
+	// 名字保留 Credentials(而不是改成 ErrLoginRejected)是因為 errmap 那一列
+	// 與它的 reason 字串是對外契約的一部分,改名會動到別人的檔案而換不到任何東西。
+	ErrInvalidCredentials = errors.New("這個遊戲ID 目前無法登入")
 	// ErrAlreadyRegistered 是這個遊戲ID 在這一屆已經報過名了
 	// (UNIQUE (tournament_id, fencer_id) 撞鍵)。
 	ErrAlreadyRegistered = errors.New("這個遊戲ID 已報名本屆賽事")
@@ -69,9 +89,6 @@ var (
 	ErrGameIDRequired = errors.New("遊戲ID 必填")
 	// ErrInvalidGameID 是遊戲ID 含控制字元或過長。
 	ErrInvalidGameID = errors.New("遊戲ID 格式不正確")
-	// ErrDiscordNameRequired 是 Discord 名稱空白。
-	// 它是裁判聯絡選手的唯一管道(排輪次、通知封盤),空著等於報了名找不到人。
-	ErrDiscordNameRequired = errors.New("必須填寫 Discord 名稱")
 	// ErrFieldTooLong 是某個報名表欄位超長。
 	ErrFieldTooLong = errors.New("欄位過長")
 	// ErrAlreadyBound 是這位選手已經綁定到**另一個**平台帳號。
@@ -84,9 +101,13 @@ var (
 	ErrUserRequired = errors.New("綁定需要平台帳號")
 	// ErrMalformedHash 是資料庫裡的 passcode_hash 讀不懂。
 	//
-	// 這是系統問題不是使用者問題,所以它**不會**被回給使用者 ——
-	// Login 一律把它轉成 ErrInvalidCredentials,只在伺服器端留下痕跡。
-	ErrMalformedHash = errors.New("通行碼雜湊格式不正確")
+	// 這是系統問題不是使用者問題,所以它**不會**被回給使用者。
+	// 登入不再比對雜湊(見套件註解),所以現在只有換發那條路徑碰得到它。
+	//
+	// 值就是 secret.ErrMalformedHash 本人(不是同文字的第二個 sentinel):
+	// 雜湊實作搬進 shared 之後,Verify 回的是那一個,這裡另起一個會讓
+	// errors.Is(err, signup.ErrMalformedHash) 從此永遠是 false。
+	ErrMalformedHash = secret.ErrMalformedHash
 )
 
 // 報名表的欄位長度上限。
@@ -134,6 +155,10 @@ type CreateRegistrationParams struct {
 	DisplayName string
 	DiscordName string
 	// PasscodeHash 已經雜湊過。明碼永遠不進這一層。
+	//
+	// 登入不再用到它(2026-09-13),但這欄位仍然必填:passcode_hash 是 NOT NULL,
+	// 而它的同伴 passcode_issued_at 是選手 session 的作廢依據 —— 沒有這一份
+	// 初始值,RegeneratePasscode 就沒有東西可以「換掉」。
 	PasscodeHash string
 
 	SelfRatedRank    bp.Rank
@@ -154,23 +179,19 @@ type Registration struct {
 	PreviousRank bp.Rank
 }
 
-// Credential 是登入要比對的那一列:選手加上他的通行碼雜湊。
-//
-// 合成一個結構是因為它們來自同一列 —— 拆成兩個方法會讀兩次同一張表,
-// 而且中間有機會讀到不一致的狀態(裁判剛好在這時重新產生通行碼)。
-type Credential struct {
-	Player           tournament.Player
-	PasscodeHash     string
-	PasscodeIssuedAt time.Time
-}
-
 // UpdatePasscodeParams 是重新產生通行碼。
 //
-// 實作必須同時更新 passcode_hash 與 passcode_issued_at ——
-// 舊碼「立即失效」靠的是雜湊被覆寫;issued_at 則讓**已經簽發出去的
-// session** 一併失效(選手 session 把它寫進 token,驗證時逐微秒比對,
-// 見 internal/core/activity/session)。補發通行碼的情境就是「原本那組
-// 可能落到別人手上」,只換雜湊而留著舊 session 等於沒換。
+// **這支現在真正的用途是「把一位選手現有的 session 全部踢掉」。**
+// 登入只要遊戲ID,沒有人在比對通行碼,所以換掉的雜湊誰也不會讀到;
+// 真正起作用的是一起被推進的 passcode_issued_at —— 選手 session 把簽發當下的
+// 這個值寫進 token,驗證時逐微秒比對(見 internal/core/activity/session)。
+//
+// 它與 WithdrawPlayer 是「把人擋在外面」的兩道槓桿,管的時段不同:
+// 棄賽擋住**之後**的登入,換發踢掉**現在**還活著的 session。
+// 要立刻讓某人完全出不去也進不來,兩個都要做。
+//
+// 實作仍然必須同時更新兩欄:只改 issued_at 會讓那個欄位變成一支沒有意義的
+// 時鐘,而換掉的雜湊是「這次換發真的換掉了一個秘密」唯一的痕跡。
 // 這個動作要寫進 platform.admin_audit_logs(同一個 transaction),
 // 但**絕不可**把明碼或雜湊寫進稽核紀錄。
 type UpdatePasscodeParams struct {
@@ -180,8 +201,8 @@ type UpdatePasscodeParams struct {
 	// ActorUserID 是執行的裁判,**必為非 0**。
 	//
 	// 沒有「選手自助重取」這條路。遊戲ID 是公開資訊(對戰表上就有),
-	// 自助重取等於「輸入任何人的遊戲ID 就能換掉他的通行碼」,
-	// 而原持有人只會以為自己抄錯了。
+	// 而這個動作現在的效果是「把這個人所有 session 踢掉」——
+	// 自助等於「輸入任何人的遊戲ID 就能把他登出」。
 	//
 	// 這也是 adapter 的前提:admin_audit_logs.actor_user_id 是 NOT NULL
 	// 且 FK 到 platform.users,塞 0 進去會讓整筆 transaction 失敗。
@@ -213,9 +234,15 @@ type Repo interface {
 	// CreateRegistration 寫入一次報名,見 CreateRegistrationParams。
 	CreateRegistration(ctx context.Context, p CreateRegistrationParams) (Registration, error)
 
-	// CredentialByGameID 依遊戲ID 取本屆的選手與通行碼雜湊。
-	// 查無回 tournament.ErrPlayerNotFound —— 呼叫端**不得**把這個錯誤原樣回給使用者。
-	CredentialByGameID(ctx context.Context, tournamentID int64, gameID string) (Credential, error)
+	// PlayerByGameID 依遊戲ID 取本屆的選手(登入用)。
+	//
+	// 查無回 tournament.ErrPlayerNotFound —— 呼叫端**不得**把這個錯誤原樣回給
+	// 使用者,Login 會把它折成 ErrInvalidCredentials。
+	//
+	// 實作**不該**過濾 status:「誰登得進來」的權威只有 Service.Login 一處,
+	// 因為它同時要負責把「非 active」與「查無此人」折成同一個答案。
+	// 這也是它不回 Credential(通行碼雜湊)的原因 —— 沒有東西要比對了。
+	PlayerByGameID(ctx context.Context, tournamentID int64, gameID string) (tournament.Player, error)
 
 	// PlayerByPublicID 在指定賽事內以 public_id 查選手。查無回 tournament.ErrPlayerNotFound。
 	PlayerByPublicID(ctx context.Context, tournamentID int64, publicID string) (tournament.Player, error)

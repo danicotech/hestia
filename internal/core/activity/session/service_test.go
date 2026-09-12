@@ -311,8 +311,10 @@ func TestTokenTypeSeparation(t *testing.T) {
 	}
 }
 
-// 裁判按「重新產生通行碼」之後,用舊碼登入拿到的 session 必須當場失效。
-// 補發通行碼的情境就是「原本那組可能落到別人手上」,這不是 nice-to-have。
+// 裁判按「重新產生通行碼」之後,先前發出去的 session 必須當場失效。
+//
+// 登入只要遊戲ID(2026-09-13)之後,這就是那個按鈕**全部**的用途 ——
+// 也是把一個人從線上踢下來的唯一手段,不是 nice-to-have。
 func TestPasscodeRotationInvalidatesSession(t *testing.T) {
 	c := &clock{t: testNow}
 	repo := newRepo(testNow.Add(-24 * time.Hour))

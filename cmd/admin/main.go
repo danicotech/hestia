@@ -10,6 +10,7 @@
 //	go run ./cmd/admin list
 //	go run ./cmd/admin register-space   --guild <snowflake> --name "測試伺服器"
 //	go run ./cmd/admin register-channel --guild <snowflake> --channel <snowflake> --kind text --log-messages
+//	go run ./cmd/admin create-judge     --login lin --name "林裁判"
 //
 // 連線字串從 PLATFORM_DATABASE_URL 讀(與 migrate 同一個變數,
 // 不另外發明一個——一個概念一個位置)。
@@ -57,6 +58,17 @@ const usage = `用法:
         沒註冊的頻道照樣計 XP,只是內容不落地(白名單制)。
         重跑會以這次的旗標覆蓋。
 
+  admin create-judge --login <登入名> [--name <顯示名稱>] [--reset-passcode]
+        建立一個**不必經過 Discord** 就能登入的裁判帳號:
+        建 users → 建 identities(provider=local)→ 授予 judge 角色,
+        然後印出一組通行碼。**通行碼只會出現這一次**(資料庫只存雜湊)。
+
+        裁判的動作要記在平台帳號上(admin_audit_logs.actor_user_id 是 NOT NULL),
+        所以這不是繞過平台帳號,是給平台帳號第二種登入方式。
+
+        --reset-passcode:帳號已存在時改成重新產生通行碼(忘記時的唯一修復路徑
+        —— 雜湊格式手寫不出來)。不會踢掉既有 session,那是另一件事。
+
 環境變數:
   PLATFORM_DATABASE_URL   必填,與 cmd/migrate 相同`
 
@@ -96,6 +108,8 @@ func run() error {
 		return setChannel(ctx, pool, os.Args[2:])
 	case "clear-channel":
 		return clearChannel(ctx, pool, os.Args[2:])
+	case "create-judge":
+		return createJudge(ctx, pool, os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Println(usage)
 		return nil

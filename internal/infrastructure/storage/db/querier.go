@@ -292,11 +292,6 @@ type Querier interface {
 	// LEFT JOIN:community 存在但 xp_ruleset_id 為 NULL(M1 可能還沒建 ruleset)時
 	// 回 NULL config,呼叫端採安全預設(無冷卻、無 cap);community 不存在 → 無列(ErrNoRows)
 	GetCommunityXpConfig(ctx context.Context, id int64) ([]byte, error)
-	// **全檔唯一會讀出 passcode_hash 的地方**。選手與雜湊同一列一次讀出,
-	// 不拆成兩支:拆了就會讀兩次同一張表,中間有機會讀到不一致的狀態
-	// (裁判剛好在這一瞬重新產生通行碼)。
-	// 查無此 game_id 與通行碼錯誤在上層是同一個錯誤,這裡不做任何區分。
-	GetCredentialByGameID(ctx context.Context, arg GetCredentialByGameIDParams) (GetCredentialByGameIDRow, error)
 	// 經濟設定:不覆寫舊值,讀取取「生效時間最新」的一筆
 	GetCurrentConfig(ctx context.Context, key string) ([]byte, error)
 	GetDailyState(ctx context.Context, userID int64) (PlatformUserDailyState, error)
@@ -329,6 +324,17 @@ type Querier interface {
 	// 不加鎖:先讀出賣家是誰,才知道要鎖哪兩個 users 列(鎖序需要先知道鎖的集合)。
 	// 讀到的內容一律在取得列鎖後重新驗證,不當作判斷依據。
 	GetListingByPublicID(ctx context.Context, publicID string) (PlatformMarketListing, error)
+	// ── 本地登入(provider='local',migration 00031)────────────────────────────
+	//
+	// 只有 local 身分會有 secret_hash。OAuth 身分的那一欄永遠是 NULL,
+	// 所以下面每一支都把 provider = 'local' 寫進 WHERE ——
+	// 少了它,一個 Discord 帳號的 provider_user_id(snowflake)就成了可猜測的登入名。
+	// 本地登入的唯一讀取點。
+	//
+	// 刻意不過濾 users.deleted_at:軟刪除的帳號必須讓應用層看見並走「憑證不正確」
+	// 那條路(含誘餌雜湊),查不到就直接短路的話,已註銷的登入名會回得比較快,
+	// 而那個時間差就是一支帳號列舉器。
+	GetLocalIdentity(ctx context.Context, loginName string) (GetLocalIdentityRow, error)
 	// 身分層(schemas/02):OAuth2 登入、身分綁定、登入 session(增補 F)。
 	//
 	// 兩個 token 概念不要混:
@@ -372,6 +378,17 @@ type Querier interface {
 	// 查無列 = 從未設定 = false(不退出)。
 	GetOptOutLogging(ctx context.Context, userID int64) (bool, error)
 	GetPetByPublicID(ctx context.Context, publicID string) (GetPetByPublicIDRow, error)
+	// 登入用:以遊戲ID 取本屆的選手。欄位與 GetPlayerByPublicID 逐字相同
+	// (adapter 靠 Go 的結構轉換共用同一份映射,錯位在編譯期就爆)。
+	//
+	// **刻意不在這裡過濾 status。** 只有 active 登得進來,但那條規則的權威在
+	// signup.Service.Login —— 它要把「查無此人」與「非 active」折成同一個錯誤,
+	// 而那件事只能在一個地方做。寫進 WHERE 看起來更嚴，實際上是把「為什麼登不進去」
+	// 拆成兩個權威位置,日後改規則(例如淘汰者仍可登入看戰績)會漏改其中一個。
+	//
+	// 這一支曾經叫 GetCredentialByGameID 並讀出 passcode_hash;通行碼登入取消後
+	// 沒有東西要比對,欄位一起拿掉(見檔頭)。
+	GetPlayerByGameID(ctx context.Context, arg GetPlayerByGameIDParams) (GetPlayerByGameIDRow, error)
 	// 以**內部 id** 查選手,欄位與 GetPlayerByPublicID 逐字相同。
 	//
 	// 為什麼需要這一支:有兩處只拿得到內部 id,而不接受「猜」。
@@ -535,6 +552,10 @@ type Querier interface {
 	GrantItemByDefinitionPublicID(ctx context.Context, arg GrantItemByDefinitionPublicIDParams) (GrantItemByDefinitionPublicIDRow, error)
 	// 開箱與抽獎共用的發物品路徑。
 	GrantItemToUser(ctx context.Context, arg GrantItemToUserParams) (GrantItemToUserRow, error)
+	// 授予全域角色(community_id IS NULL)。source='manual':之後同步 Discord
+	// 身分組時只撤 provider_sync,手動授予不受影響(migration 00004 的設計)。
+	// ON CONFLICT DO NOTHING 對齊 user_roles_uniq,重跑不炸。
+	GrantRoleByKey(ctx context.Context, arg GrantRoleByKeyParams) (int64, error)
 	// source='level_reward':與 manual / provider_sync 分開,身分組同步撤銷時
 	// 不會誤刪里程碑發出去的角色。
 	GrantRoleByPublicID(ctx context.Context, arg GrantRoleByPublicIDParams) (int64, error)
@@ -653,6 +674,9 @@ type Querier interface {
 	// 無法走 sqlc,實作在 maintenance 套件內(partition.go)。
 	// 每次 job 執行寫一列 event_logs(schemas/13 的 job.run 在此兌現;失敗也要記)
 	InsertJobRunLog(ctx context.Context, arg InsertJobRunLogParams) error
+	// 建立本地身分。撞 UNIQUE(provider, provider_user_id) = 這個登入名已被用掉,
+	// 那是唯一權威(不靠先查後寫)。
+	InsertLocalIdentity(ctx context.Context, arg InsertLocalIdentityParams) (int64, error)
 	InsertLoginIdentity(ctx context.Context, arg InsertLoginIdentityParams) (int64, error)
 	// 首次 OAuth 登入建立內部使用者(內部 id 是唯一權威,provider 帳號只是掛在上面的憑證)。
 	InsertLoginUser(ctx context.Context, arg InsertLoginUserParams) (InsertLoginUserRow, error)
@@ -725,10 +749,19 @@ type Querier interface {
 	// 4. 跨 schema(報名獎金走 Ledger.ApplyInTx)時,activity 的鎖永遠先取、
 	//    platform 的鎖後取(users → user_balances,與 shop/daily 同向)。
 	//
-	// ── passcode_hash 的流向 ───────────────────────────────────────
-	// 只有 GetCredentialByGameID 會 SELECT passcode_hash。其餘回傳選手的 query
-	// 一律列舉欄位、刻意漏掉它 —— tournament.Player 結構本身也沒有這個欄位,
-	// 一個查都沒查出來的值,不可能被誰不小心序列化到對戰表 API 上。
+	// ── passcode_hash 的流向(2026-09-13 起只寫不讀)────────────────
+	// **全檔沒有任何一句 SELECT 讀 passcode_hash**,只有兩句寫:
+	// InsertTournamentPlayer 建一份、UpdatePlayerPasscode 換一份。
+	// 登入從那天起只要 game_id,沒有東西需要比對雜湊。
+	//
+	// 那這個 NOT NULL 欄位現在在幹嘛?它自己不幹嘛,幹活的是它的同伴:
+	// passcode_issued_at 是**已發出的 session 的作廢依據**(選手 session 把它寫進
+	// token,每次請求逐微秒比對,見 internal/core/activity/session)。
+	// UpdatePlayerPasscode 兩欄一起改,所以裁判的「重新產生通行碼」= 把這位選手
+	// 現在所有的 session 一次踢掉。
+	//
+	// **不要因為沒人讀就把它清空或拿掉**:它是「這次換發真的換掉了一個秘密」的
+	// 證據,也是哪天要把通行碼登入加回來時,唯一還留在原地的東西。
 	// ═══ 賽事(tournaments)═══════════════════════════════════════
 	// 開一屆新賽事。**階段固定 'signup'**,不由呼叫端指定 —— 一屆從「已經在評段中」
 	// 開始的賽事是沒有意義的資料,而要跳過報名期有 UpdateTournamentPhase 那條路,
@@ -1410,9 +1443,18 @@ type Querier interface {
 	// 選手 session 驗證用:取這一列目前的 passcode_issued_at。
 	//
 	// 走 slug + 選手 public_id 而不是內部 id,因為呼叫端是 token 的驗證路徑,
-	// 而 token 裡只會有對外識別字(鐵則 5)。查無回 0 列 —— 包含「slug 不存在」
-	// 與「這個 public_id 不屬於這一屆」,adapter 一律折成同一個錯誤,
-	// 不讓未認證的呼叫端分辨得出哪一種。
+	// 而 token 裡只會有對外識別字(鐵則 5)。查無回 0 列 —— 包含「slug 不存在」、
+	// 「這個 public_id 不屬於這一屆」與「這個人已經不是參賽中」,adapter 一律
+	// 折成同一個錯誤,不讓未認證的呼叫端分辨得出哪一種。
+	//
+	// **status = 'active' 是這裡的重點,不是順手加的條件。** 登入已經不需要任何
+	// 秘密(2026-09-13 定案:只要遊戲ID),所以「把某個人擋在外面」唯一剩下的
+	// 手段就是改他的狀態。狀態如果只擋新登入、不影響已發出的 session,那道鎖
+	// 要等到 token 過期(12 小時)才生效 —— 而裁判按下棄賽的時候,要的是現在。
+	//
+	// 代價是已淘汰的選手也會一起被登出。那是可以接受的:session 代表的是
+	// 「以參賽者身分動作」的權利(選讓武、看自己的預算),而淘汰者沒有那種
+	// 動作可做;對戰表與戰績本來就是公開的,不需要 session 才看得到。
 	PlayerPasscodeIssuedAt(ctx context.Context, arg PlayerPasscodeIssuedAtParams) (time.Time, error)
 	// 投影重算:xp ← SUM(events)、last_xp_at ← MAX(created_at),整個投影可從事實重建。
 	// 呼叫前必須已 LockUserXp,否則與並行 Award 有覆寫競態(先算 SUM、後拿鎖會蓋掉新事件)
@@ -1649,12 +1691,16 @@ type Querier interface {
 	UpdateLegResults(ctx context.Context, arg UpdateLegResultsParams) (int64, error)
 	// 呼叫前必須已鎖住掛單列;WHERE status='open' 是狀態機單向的最後防線。
 	UpdateListingStatus(ctx context.Context, arg UpdateListingStatusParams) (int64, error)
+	// 重新產生通行碼(裁判忘記時的唯一修復路徑 —— 雜湊格式手寫不出來)。
+	// 回傳列數要檢查:0 列 = 這個登入名沒有本地身分,不能無聲當成成功。
+	UpdateLocalSecret(ctx context.Context, arg UpdateLocalSecretParams) (int64, error)
 	// 既有綁定重新登入:更新 provider 側的顯示名與憑證(內部 users 的資料不覆蓋——
 	// display_name 之後可由使用者自訂,provider 的名字權威在 identities.username)。
 	UpdateLoginIdentity(ctx context.Context, arg UpdateLoginIdentityParams) error
 	// ═══ 身分維護(通行碼、綁定)═════════════════════════════════
-	// 「舊碼立即失效」不需要撤銷清單 —— passcode_hash 被覆寫的那一刻,
-	// 舊碼就再也比對不過。
+	// 這句現在的用途是**把一位選手現有的 session 全部作廢**(2026-09-13 起登入
+	// 只要 game_id,沒有人在比對 passcode_hash)。名字裡的「passcode」留著是因為
+	// 它改的確實是那兩欄,而換掉的雜湊是「這次換發真的換掉了一個秘密」的證據。
 	//
 	// ⚠ passcode_issued_at **不是**給人看的痕跡,它是已簽發 session 的失效依據:
 	// 選手 session 的 token 裡帶著簽發當下的這個值,驗證時逐微秒比對,不相等

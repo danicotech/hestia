@@ -125,6 +125,33 @@ func fencerRow(t *testing.T, id int64) (gameID string, played int32, userID *int
 	return gameID, played, userID
 }
 
+// passcodeRow 直接用 SQL 讀 passcode_hash 與 passcode_issued_at。
+//
+// 刻意繞過 adapter:2026-09-13 起沒有任何 query 讀得到 passcode_hash(登入只要
+// 遊戲ID),但那兩欄仍然要被寫對 —— 雜湊是「這次換發真的換掉了一個秘密」的證據,
+// issued_at 是已發出 session 的作廢依據。測試是它們現在唯一的讀者。
+func passcodeRow(t *testing.T, playerID int64) (hash string, issuedAt time.Time) {
+	t.Helper()
+	if err := pool.QueryRow(context.Background(),
+		`SELECT passcode_hash, passcode_issued_at FROM activity.tournament_players WHERE id = $1`,
+		playerID,
+	).Scan(&hash, &issuedAt); err != nil {
+		t.Fatalf("讀通行碼欄位: %v", err)
+	}
+	return hash, issuedAt
+}
+
+// setStatus 模擬裁判把某位選手標成棄賽 / 淘汰。
+func setStatus(t *testing.T, playerID int64, status tournament.PlayerStatus) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE activity.tournament_players SET status = $2 WHERE id = $1`,
+		playerID, string(status),
+	); err != nil {
+		t.Fatalf("改狀態: %v", err)
+	}
+}
+
 func countFencers(t *testing.T, id string) int {
 	t.Helper()
 	var n int
@@ -346,42 +373,118 @@ func TestConcurrentRegistrationSameFencerTwoTournaments(t *testing.T) {
 	}
 }
 
-// ── 登入憑證與換發通行碼 ──────────────────────────────────────
+// ── 登入查詢與換發通行碼 ──────────────────────────────────────
 
-func TestCredentialByGameID(t *testing.T) {
+func TestPlayerByGameID(t *testing.T) {
 	setup(t)
 	ctx := context.Background()
 	tid := newTournament(t, tournament.PhaseSignup)
-	id := gameID("憑證")
+	id := gameID("登入")
 	reg, err := svc.CreateRegistration(ctx, regParams(tid, id))
 	if err != nil {
 		t.Fatalf("報名: %v", err)
 	}
 
-	cred, err := svc.CredentialByGameID(ctx, tid, id)
+	player, err := svc.PlayerByGameID(ctx, tid, id)
 	if err != nil {
-		t.Fatalf("讀憑證: %v", err)
+		t.Fatalf("查選手: %v", err)
 	}
-	if cred.Player.ID != reg.Player.ID || cred.PasscodeHash != "argon2-hash-"+id {
-		t.Fatalf("憑證不對: %+v", cred)
+	if player.ID != reg.Player.ID || player.GameID != id {
+		t.Fatalf("查到的不是同一位: %+v", player)
 	}
-	if cred.PasscodeIssuedAt.IsZero() {
-		t.Fatal("passcode_issued_at 應有值")
+	if player.Status != tournament.PlayerActive {
+		t.Fatalf("狀態 = %s,要 active", player.Status)
 	}
 
-	// 查無此遊戲ID 與通行碼錯誤在上層是同一個錯誤,這裡只負責回「查不到」。
-	if _, err := svc.CredentialByGameID(ctx, tid, "不存在的ID"); !errors.Is(err, tournament.ErrPlayerNotFound) {
+	// 查無此遊戲ID 與「非 active」在上層是同一個錯誤,這裡只負責回「查不到」。
+	if _, err := svc.PlayerByGameID(ctx, tid, "不存在的ID"); !errors.Is(err, tournament.ErrPlayerNotFound) {
 		t.Fatalf("查無應回 ErrPlayerNotFound,得到 %v", err)
 	}
 	// 別屆的遊戲ID 在這屆也查不到。
 	other := newTournament(t, tournament.PhaseSignup)
-	if _, err := svc.CredentialByGameID(ctx, other, id); !errors.Is(err, tournament.ErrPlayerNotFound) {
+	if _, err := svc.PlayerByGameID(ctx, other, id); !errors.Is(err, tournament.ErrPlayerNotFound) {
 		t.Fatalf("跨屆應回 ErrPlayerNotFound,得到 %v", err)
 	}
 }
 
-// TestUpdatePasscodeInvalidatesOldHash:舊碼「立即失效」靠的就是雜湊被覆寫,
-// 不需要另一張撤銷清單。
+// TestPlayerByGameIDDoesNotFilterStatus:棄賽者這一層照樣查得到,狀態原樣帶出。
+//
+// 「誰登得進來」的權威只有 signup.Service.Login 一處 —— 它要把「非 active」與
+// 「查無此人」折成同一個答案。這裡先偷偷過濾掉的話,那個判斷就有兩個家,
+// 而日後改規則(例如淘汰者仍可登入看戰績)只會有人改到其中一個。
+func TestPlayerByGameIDDoesNotFilterStatus(t *testing.T) {
+	setup(t)
+	ctx := context.Background()
+	tid := newTournament(t, tournament.PhaseSignup)
+	id := gameID("棄賽")
+	reg, err := svc.CreateRegistration(ctx, regParams(tid, id))
+	if err != nil {
+		t.Fatalf("報名: %v", err)
+	}
+
+	for _, status := range []tournament.PlayerStatus{tournament.PlayerWithdrawn, tournament.PlayerEliminated} {
+		setStatus(t, reg.Player.ID, status)
+		player, err := svc.PlayerByGameID(ctx, tid, id)
+		if err != nil {
+			t.Fatalf("%s 的選手仍應查得到: %v", status, err)
+		}
+		if player.Status != status {
+			t.Fatalf("狀態沒帶出來: %s,要 %s", player.Status, status)
+		}
+	}
+}
+
+// TestRegistrationWithOnlyGameID:選填欄位全部留空也要寫得進去。
+//
+// 報名只有遊戲ID 必填(2026-09-13),而空字串在 SQL 那層要變成 NULL ——
+// 「沒填」如果同時有 ” 與 NULL 兩種表示法,之後每個讀取端都得各判一次。
+func TestRegistrationWithOnlyGameID(t *testing.T) {
+	setup(t)
+	ctx := context.Background()
+	tid := newTournament(t, tournament.PhaseSignup)
+	id := gameID("只有ID")
+
+	reg, err := svc.CreateRegistration(ctx, signup.CreateRegistrationParams{
+		TournamentID: tid,
+		RequirePhase: tournament.PhaseSignup,
+		GameID:       id,
+		DisplayName:  id, // service 已把留空的顯示名補成 game_id
+		PasscodeHash: "pbkdf2-sha256$1$x$y",
+	})
+	if err != nil {
+		t.Fatalf("只填遊戲ID 的報名應該寫得進去: %v", err)
+	}
+	if reg.Player.DiscordName != "" || reg.Player.LadderRank != "" || reg.Player.ArtsNote != "" {
+		t.Fatalf("選填欄位不該被填上東西: %+v", reg.Player)
+	}
+	if reg.Player.SelfRatedRank != bp.RankUnspecified || reg.Player.LadderScore != 0 {
+		t.Fatalf("沒填的數值欄位應為零值: %+v", reg.Player)
+	}
+
+	var ladderRank, artsNote *string
+	if err := pool.QueryRow(ctx,
+		`SELECT ladder_rank, arts_note FROM activity.tournament_players WHERE id = $1`,
+		reg.Player.ID,
+	).Scan(&ladderRank, &artsNote); err != nil {
+		t.Fatalf("讀選填欄位: %v", err)
+	}
+	if ladderRank != nil || artsNote != nil {
+		t.Fatalf("空字串要被 NULLIF 成 NULL,得到 %v / %v", ladderRank, artsNote)
+	}
+	// 沒填 Discord 名稱時,跨屆檔案那一欄維持原樣(COALESCE(NULLIF(...)))。
+	if reg.Fencer.DiscordName != "" {
+		t.Fatalf("初次報名沒填 Discord 名稱,跨屆檔案不該有值: %q", reg.Fencer.DiscordName)
+	}
+
+	// 登入這條路走得通:只填遊戲ID 的人照樣是一位正常的參賽者。
+	if _, err := svc.PlayerByGameID(ctx, tid, id); err != nil {
+		t.Fatalf("查得到才登得進去: %v", err)
+	}
+}
+
+// TestUpdatePasscodeInvalidatesOldHash:換發把 passcode_hash 與
+// passcode_issued_at 一起換掉 —— 後者是已發出 session 的作廢依據,
+// 也是這個動作現在全部的效果(登入不再比對雜湊)。
 func TestUpdatePasscodeInvalidatesOldHash(t *testing.T) {
 	setup(t)
 	ctx := context.Background()
@@ -392,10 +495,7 @@ func TestUpdatePasscodeInvalidatesOldHash(t *testing.T) {
 	if err != nil {
 		t.Fatalf("報名: %v", err)
 	}
-	before, err := svc.CredentialByGameID(ctx, tid, id)
-	if err != nil {
-		t.Fatalf("讀舊憑證: %v", err)
-	}
+	beforeHash, beforeIssued := passcodeRow(t, reg.Player.ID)
 
 	time.Sleep(2 * time.Millisecond) // issued_at 要看得出前後
 	const newHash = "argon2-hash-新的"
@@ -406,18 +506,20 @@ func TestUpdatePasscodeInvalidatesOldHash(t *testing.T) {
 		t.Fatalf("換發通行碼: %v", err)
 	}
 
-	after, err := svc.CredentialByGameID(ctx, tid, id)
-	if err != nil {
-		t.Fatalf("讀新憑證: %v", err)
+	afterHash, afterIssued := passcodeRow(t, reg.Player.ID)
+	if afterHash != newHash {
+		t.Fatalf("雜湊應被覆寫,得到 %s", afterHash)
 	}
-	if after.PasscodeHash != newHash {
-		t.Fatalf("雜湊應被覆寫,得到 %s", after.PasscodeHash)
+	if afterHash == beforeHash {
+		t.Fatal("舊雜湊還在,這次換發什麼也沒換掉")
 	}
-	if after.PasscodeHash == before.PasscodeHash {
-		t.Fatal("舊雜湊還在,舊碼不會失效")
+	if !afterIssued.After(beforeIssued) {
+		t.Fatalf("issued_at 應往前走: %v → %v", beforeIssued, afterIssued)
 	}
-	if !after.PasscodeIssuedAt.After(before.PasscodeIssuedAt) {
-		t.Fatalf("issued_at 應往前走: %v → %v", before.PasscodeIssuedAt, after.PasscodeIssuedAt)
+
+	// 換發不是封鎖:這位選手照樣登得進來(要擋人請用棄賽)。
+	if _, err := svc.PlayerByGameID(ctx, tid, id); err != nil {
+		t.Fatalf("換發之後仍應查得到: %v", err)
 	}
 
 	// 稽核紀錄要寫,而且**絕不可**含明碼或雜湊。
@@ -460,12 +562,8 @@ func TestUpdatePasscodeRejects(t *testing.T) {
 		t.Fatalf("查無選手應回 ErrPlayerNotFound,得到 %v", err)
 	}
 	// 兩次失敗都不該改到任何東西。
-	cred, err := svc.CredentialByGameID(ctx, tid, id)
-	if err != nil {
-		t.Fatalf("讀憑證: %v", err)
-	}
-	if cred.PasscodeHash != "argon2-hash-"+id {
-		t.Fatalf("雜湊不該被改動,得到 %s", cred.PasscodeHash)
+	if hash, _ := passcodeRow(t, reg.Player.ID); hash != "argon2-hash-"+id {
+		t.Fatalf("雜湊不該被改動,得到 %s", hash)
 	}
 }
 
@@ -600,5 +698,47 @@ func TestConcurrentBindSameUser(t *testing.T) {
 	}
 	if _, _, fencerUser := fencerRow(t, reg.Fencer.ID); fencerUser == nil || *fencerUser != user {
 		t.Fatalf("跨屆檔案應綁到 %d,得到 %v", user, fencerUser)
+	}
+}
+
+// TestPasscodeIssuedAtRequiresActivePlayer:非參賽中的選手,session 驗證當場失效。
+//
+// 這條是「棄賽 = 鎖住這個人」成立的前提。登入不再需要任何秘密(只要遊戲ID),
+// 所以狀態是唯一能把人擋在外面的東西 —— 如果它只擋新登入、不影響已發出的
+// token,那道鎖要等 12 小時才生效,而裁判按下棄賽的時候要的是現在。
+//
+// 已淘汰者一起被擋是刻意的:session 代表「以參賽者身分動作」的權利,
+// 而對戰表與戰績本來就公開。
+func TestPasscodeIssuedAtRequiresActivePlayer(t *testing.T) {
+	setup(t)
+	ctx := context.Background()
+	tid := newTournament(t, tournament.PhaseSignup)
+
+	var slug string
+	if err := pool.QueryRow(ctx,
+		`SELECT slug FROM activity.tournaments WHERE id = $1`, tid).Scan(&slug); err != nil {
+		t.Fatalf("讀 slug: %v", err)
+	}
+
+	reg, err := svc.CreateRegistration(ctx, regParams(tid, gameID("狀態")))
+	if err != nil {
+		t.Fatalf("報名: %v", err)
+	}
+	if _, err := svc.PasscodeIssuedAt(ctx, slug, reg.Player.PublicID); err != nil {
+		t.Fatalf("參賽中的人應該通得過: %v", err)
+	}
+
+	for _, status := range []string{"withdrawn", "eliminated"} {
+		t.Run(status, func(t *testing.T) {
+			if _, err := pool.Exec(ctx,
+				`UPDATE activity.tournament_players SET status = $1 WHERE id = $2`,
+				status, reg.Player.ID); err != nil {
+				t.Fatalf("改狀態: %v", err)
+			}
+			_, err := svc.PasscodeIssuedAt(ctx, slug, reg.Player.PublicID)
+			if !errors.Is(err, tournament.ErrPlayerNotFound) {
+				t.Fatalf("狀態 %s 應該與查無此人同一個錯誤,得到 %v", status, err)
+			}
+		})
 	}
 }

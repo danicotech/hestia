@@ -21,7 +21,7 @@ import (
 // 報名」會直接勸退一部分人(grill Q12)。代價是活動層得自己發憑證,
 // 於是同一個服務上有兩種身分並存:
 //
-//	選手      遊戲ID + 通行碼 → 活動層 session cookie(本檔案)
+//	選手      遊戲ID          → 活動層 session cookie(本檔案)
 //	下注/投票  平台帳號 Bearer   → 既有的認證攔截器
 //
 // 兩者可以是同一人:選手事後 BindPlatformAccount 即可,而那支 RPC **同時**
@@ -59,12 +59,13 @@ const activitySessionFallbackTTL = 12 * time.Hour
 //
 // 只有兩個欄位,而且**都是對外識別字**:選手的內部 BIGINT id 不進 token
 // (鐵則 5 —— token 由客戶端持有,內部 id 進去就等於進了對外契約)。
-// 內部 id 由 handler 每次用 public_id 反查,那也順便讓「選手被刪掉/棄賽後
-// 舊 token 還能用」不可能發生。
+// 內部 id 由 handler 每次用 public_id 反查,選手被刪掉或換屆後舊 token 會在
+// 那一步自然失效。棄賽不在此列(只改 status,列還在)—— 要踢掉一張已經發出去的
+// token,裁判得用「重新產生通行碼」,細節在 internal/core/activity/session。
 type ActivityIdentity struct {
 	// TournamentSlug 是這個 session 屬於哪一屆。
 	//
-	// 必要而不是冗餘:通行碼是逐屆發的,一個 session 只該對一屆有效。
+	// 必要而不是冗餘:報名是逐屆的,一個 session 只該對一屆有效。
 	// 少了它,舊屆的 token 就能拿來操作新一屆的讓武。
 	TournamentSlug string
 	// PlayerPublicID 是選手的 public_id(ULID)。
@@ -105,7 +106,7 @@ type ActivitySignup interface {
 //
 // 與 sessionCookieConfig 同一套規則,只是少了 refresh 那一半:
 // 活動層 session 沒有輪替 —— 它的壽命以「一屆賽事的一次使用」為尺度,
-// 而通行碼隨時可以重新登入。少一個 refresh token 就少一個長效憑證要保護。
+// 而選手隨時可以用遊戲ID 再登入一次。少一個 refresh token 就少一個長效憑證要保護。
 type activitySessionCookie struct {
 	basePath string // 已由 NormalizeBasePath 正規化;"" = 掛在根
 }
@@ -230,6 +231,8 @@ func (h activitySignupHandler) Register(
 	if slug == "" {
 		return nil, invalidArgument("tournament_slug 必填")
 	}
+	// 只有 tournament_slug 在這裡擋:game_id 的必填與格式交給領域層,
+	// 那裡是它唯一的權威(errmap 已經把 ErrGameIDRequired 映射成 InvalidArgument)。
 	res, err := h.svc.Register(ctx, signup.RegisterParams{
 		TournamentSlug:   slug,
 		GameID:           req.Msg.GetGameId(),
@@ -250,17 +253,20 @@ func (h activitySignupHandler) Register(
 	if err != nil {
 		return nil, err
 	}
-	// 明碼通行碼**只在這裡出現一次**。它不進日誌、不進稽核紀錄、
-	// 不進任何其他回應 —— 這個性質是刻意維持的,加任何 log 前請先想清楚。
+	// **回應裡沒有通行碼**(2026-09-13):登入只要遊戲ID,吐一組沒有用途的密碼
+	// 只會讓人以為那是要保存的東西。領域層的 RegisterResult 根本沒有那個欄位,
+	// 所以這裡也不可能「順手」加回來 —— 要加回來得先改領域契約。
 	return connect.NewResponse(&activityv1.RegisterResponse{
 		Player:          player,
-		Passcode:        res.Passcode,
 		ReturningFencer: res.ReturningFencer,
 		PreviousRank:    rankToProto(res.PreviousRank),
 	}), nil
 }
 
-// Login 用遊戲ID + 通行碼換發活動層 session。
+// Login 用遊戲ID 換發活動層 session。
+//
+// 沒有通行碼這一步(2026-09-13),而且只有 active 的選手登得進來 ——
+// 兩件事的權威都在 signup.Service.Login,這裡不複製任何一條判斷。
 //
 // 回應 body 裡**沒有** token:它只在 HttpOnly cookie 裡(與平台的瀏覽器登入
 // 同一個判斷 —— 交給 JS 存等於把憑證交給每一個第三方腳本)。
@@ -277,12 +283,11 @@ func (h activitySignupHandler) Login(
 	player, err := h.svc.Login(ctx, signup.LoginParams{
 		TournamentSlug: slug,
 		GameID:         req.Msg.GetGameId(),
-		Passcode:       req.Msg.GetPasscode(),
 	})
 	if err != nil {
-		// 「查無此遊戲ID」與「通行碼錯誤」在領域層就已經折成同一個
-		// ErrInvalidCredentials,這裡不做任何額外分流 ——
-		// 分得出來的話,登入頁就變成一份「誰報了名」的查詢介面。
+		// 查無此遊戲ID、非 active、格式不合在領域層就已經折成同一個
+		// ErrInvalidCredentials,這裡不做任何額外分流 —— 分得出來的話,
+		// 登入頁就變成一支「誰報了名、誰被裁判擋掉了」的查詢介面。
 		return nil, toConnectError(err)
 	}
 	view, err := h.tournaments.Get(ctx, slug)
@@ -307,7 +312,8 @@ func (h activitySignupHandler) Login(
 // Logout 結束活動層 session。
 //
 // 只清 cookie:活動層 session 是無狀態簽章,沒有伺服器端的撤銷清單。
-// 少一張清單就少一個會忘記清的地方(與通行碼「換發即失效」同一個判斷)。
+// 少一張清單就少一個會忘記清的地方 —— 要從伺服器端踢掉某個人現有的 session,
+// 走裁判的「重新產生通行碼」(那會推進 passcode_issued_at,見 activity session)。
 //
 // 不帶 cookie 也回成功:登出的語意是「結束後不該有憑證」,而那在
 // 一開始就沒有憑證時已經成立。回錯只會讓前端要為一個無害的狀態寫分支。
@@ -367,7 +373,7 @@ func (h activitySignupHandler) GetMyPlayer(
 // 也刻意不接受只有其中一半的請求。
 //
 // 兩道檢查的順序是有意義的:先要平台身分(那是認證攔截器已經做完的事),
-// 再要活動層身分 —— 反過來的話,沒登入平台的人會先看到「請用通行碼登入」,
+// 再要活動層身分 —— 反過來的話,沒登入平台的人會先看到「請用遊戲ID 登入」,
 // 而那不是他該做的事。
 func (h activitySignupHandler) BindPlatformAccount(
 	ctx context.Context, req *connect.Request[activityv1.BindPlatformAccountRequest],
