@@ -321,6 +321,101 @@ func TestStateRequiresMatchingCookie(t *testing.T) {
 	}
 }
 
+// 匯出的 Sign / Verify 是給平台以外的用途用的(目前是活動層的選手 session)。
+// 它必須與 access / state 一樣有用途分離,而且**不能成為簽發平台身分的後門**。
+func TestCustomPurposeTokens(t *testing.T) {
+	s := newSigner(t)
+	now := time.Now()
+
+	type custom struct {
+		Who string `json:"who"`
+		Exp int64  `json:"exp"`
+	}
+	want := custom{Who: "01JBXPLAYER0000000000000001", Exp: now.Add(time.Hour).Unix()}
+
+	tok, err := s.Sign("player_session", want)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	var got custom
+	if err := s.Verify("player_session", tok, &got); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if got != want {
+		t.Fatalf("claims 不符: %+v,要 %+v", got, want)
+	}
+
+	// 用途分離:自訂用途與平台的兩種用途,以及自訂用途彼此之間,全部不可互換
+	if err := s.Verify("other_purpose", tok, &got); !errors.Is(err, identity.ErrInvalidToken) {
+		t.Fatalf("換用途驗要被拒,得到 %v", err)
+	}
+	if _, err := s.VerifyAccess(tok, now); !errors.Is(err, identity.ErrInvalidToken) {
+		t.Fatalf("自訂用途當 access 用要被拒,得到 %v", err)
+	}
+	if _, err := s.VerifyState(tok, tok, now); !errors.Is(err, identity.ErrInvalidState) {
+		t.Fatalf("自訂用途當 state 用要被拒,得到 %v", err)
+	}
+	access, _, err := s.SignAccess("USER123", "SESS456", now)
+	if err != nil {
+		t.Fatalf("SignAccess: %v", err)
+	}
+	if err := s.Verify("player_session", access, &got); !errors.Is(err, identity.ErrInvalidToken) {
+		t.Fatalf("access 當自訂用途用要被拒,得到 %v", err)
+	}
+	state, err := s.SignState("/lobby", now)
+	if err != nil {
+		t.Fatalf("SignState: %v", err)
+	}
+	if err := s.Verify("player_session", state, &got); !errors.Is(err, identity.ErrInvalidToken) {
+		t.Fatalf("state 當自訂用途用要被拒,得到 %v", err)
+	}
+
+	// 長度上限同樣適用(未認證請求會走這條路)
+	huge := "v1." + strings.Repeat("A", 1<<20) + ".AAAA"
+	if err := s.Verify("player_session", huge, &got); !errors.Is(err, identity.ErrInvalidToken) {
+		t.Fatalf("超長 token 要被拒,得到 %v", err)
+	}
+	// 空 token
+	if err := s.Verify("player_session", "", &got); !errors.Is(err, identity.ErrInvalidToken) {
+		t.Fatalf("空 token 要被拒,得到 %v", err)
+	}
+}
+
+// 匯出簽章原語**不等於**匯出「簽發任意平台身分」的能力:
+// 少了這道檢查,任何拿得到 Signer 的程式碼都能 Sign("access", 自己捏的 claims)。
+func TestSignRejectsReservedAndMalformedPurpose(t *testing.T) {
+	s := newSigner(t)
+
+	bad := []string{
+		"access", // 平台保留
+		"state",  // 平台保留
+		"",
+		"Player_Session",        // 大寫
+		"player.session",        // 分隔符
+		"player-session",        // 連字號
+		"player session",        // 空白
+		"player\x00session",     // 控制字元
+		strings.Repeat("a", 33), // 過長
+	}
+	for _, typ := range bad {
+		t.Run(typ, func(t *testing.T) {
+			if _, err := s.Sign(typ, map[string]string{"a": "b"}); !errors.Is(err, identity.ErrInvalidTokenType) {
+				t.Fatalf("Sign(%q) 要回 ErrInvalidTokenType,得到 %v", typ, err)
+			}
+			var dst map[string]string
+			if err := s.Verify(typ, "v1.aa.bb", &dst); !errors.Is(err, identity.ErrInvalidTokenType) {
+				t.Fatalf("Verify(%q) 要回 ErrInvalidTokenType,得到 %v", typ, err)
+			}
+		})
+	}
+
+	// 用途給錯是程式錯誤,不是憑證問題 —— 不可被當成「請重新登入」。
+	_, err := s.Sign("access", map[string]string{"a": "b"})
+	if errors.Is(err, identity.ErrInvalidToken) || errors.Is(err, identity.ErrTokenExpired) {
+		t.Fatalf("ErrInvalidTokenType 不該屬於憑證錯誤族: %v", err)
+	}
+}
+
 // 沒有長度上限的話,每個未認證請求都能叫我們對數 MB 的字串做 base64 + HMAC。
 func TestVerifyRejectsOversizedToken(t *testing.T) {
 	s := newSigner(t)

@@ -22,6 +22,7 @@ import (
 	"google.golang.org/protobuf/reflect/protoregistry"
 
 	"github.com/danicotech/hestia/gen/hestia/platform/v1/platformv1connect"
+	"github.com/danicotech/hestia/internal/core/activity/watch"
 	"github.com/danicotech/hestia/internal/core/platform/activitylog"
 	"github.com/danicotech/hestia/internal/core/platform/adminecon"
 	"github.com/danicotech/hestia/internal/core/platform/daily"
@@ -81,6 +82,20 @@ type Deps struct {
 	// Activity 是 Discord 活動記錄寫入(schemas/10、11);nil = ActivityService
 	// 全部回 Unimplemented。
 	Activity activitylog.Service
+	// ActivityLayer 是**活動層**(proto 的 hestia.activity.v1,目前是《百業試鋒》)
+	// 的領域服務。名字與上面的 Activity 只差一個字卻是兩件完全不同的事:
+	// Activity 是「誰在 Discord 說了話」,ActivityLayer 是整個賽事系統。
+	// 這個撞名是既有的,寫在這裡是為了讓下一個人不必自己撞一次。
+	//
+	// nil = 活動層完全不掛載,平台層照常運作 —— 本機還沒跑活動 schema 的
+	// migration 時也能把服務起起來。
+	ActivityLayer *ActivityDeps
+	// WatchHub 是即時戰況推播的行程內扇出樞紐。nil = WatchService 不掛載
+	// (觀眾看得到賽事,只是不會自動更新)。
+	//
+	// 它與 ActivityLayer 分開是因為生命週期不同:Hub 要由組裝端 Close,
+	// 而且餵它的 LISTEN 迴圈是一條獨立的 goroutine。
+	WatchHub *watch.Hub
 	// Announcements 是 outbox → Discord 閘道的取貨口(見 ports.go);
 	// nil = NotificationService 全部回 Unimplemented。
 	//
@@ -262,6 +277,24 @@ func New(deps Deps) (*Server, error) {
 	mux.Handle(platformv1connect.NewActivityServiceHandler(activityHandler{svc: deps.Activity}, opts...))
 	mux.Handle(platformv1connect.NewNotificationServiceHandler(
 		notificationHandler{src: deps.Announcements}, opts...))
+
+	// 活動層。掛在這裡而不是讓 cmd/server 自己呼叫 MountActivity:mux 是
+	// New 私有的,而且更重要的是 opts —— 少傳那組攔截器一樣掛得起來,結果
+	// 會是一整層 RPC 沒有認證、沒有稽核、panic 不會被接住,而且沒有任何
+	// 東西會出聲。讓唯一持有 opts 的地方負責掛載,那條路徑就不存在。
+	if deps.ActivityLayer != nil {
+		ad := *deps.ActivityLayer
+		// BasePath 與 Authorizer 的權威是 Deps,不是 ActivityDeps。組裝端寫
+		// 第二次就有機會寫得不一樣,而 BasePath 不一致的後果特別難查:
+		// 活動層 session cookie 的 Path 會與平台層不同,登入看起來成功,
+		// 但之後每一支 RPC 都拿不到 cookie。
+		ad.BasePath = basePath
+		ad.Authorizer = deps.Authorizer
+		MountActivity(mux, ad, opts...)
+	}
+	if deps.WatchHub != nil {
+		MountActivityWatch(mux, deps.WatchHub, opts...)
+	}
 
 	// 瀏覽器用的登入路由(browserauth.go)。它們**不是** RPC:Discord 完成
 	// 授權後是把使用者的瀏覽器重導到 redirect_uri,那是一個普通的 GET,

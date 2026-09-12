@@ -23,6 +23,13 @@
 // 重新比對條件、影響 0 列,於是拿到 ErrPhaseConflict —— 那正是要的結果,
 // 多取一次鎖只會讓同一件事有兩個做法。
 //
+// # 階段變更會在同一個 tx 裡發推播
+//
+// UpdatePhase 與 RollbackToRanked 都在自己那個 tx 裡呼叫 notifyPhase。
+// 掛在 tx 內是這個設計的全部意義:NOTIFY 只在 commit 時送出,所以
+// 「兩個裁判同時推階段、輸的那個被 rollback」不可能讓觀眾看到一個
+// 沒有發生過的階段。
+//
 // # ULID 由這一層產生
 //
 // matches 的 public_id 走 internal/shared/ulid,SQL 不生 id(鐵則 5)。
@@ -40,6 +47,7 @@ import (
 
 	"github.com/danicotech/hestia/internal/core/activity/bp"
 	"github.com/danicotech/hestia/internal/core/activity/tournament"
+	"github.com/danicotech/hestia/internal/core/activity/watch"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/db"
 )
 
@@ -105,7 +113,7 @@ func (s *Service) TournamentBySlug(ctx context.Context, slug string) (tournament
 		}
 		return tournament.Tournament{}, fmt.Errorf("讀賽事 %s: %w", slug, err)
 	}
-	return tournamentFromRow(row)
+	return TournamentFromRow(row)
 }
 
 // CountUnrankedActivePlayers 數還有幾位 active 選手沒評段。
@@ -147,7 +155,7 @@ func (s *Service) PlayerByPublicID(ctx context.Context, tournamentID int64, publ
 
 // ── 階段 ──────────────────────────────────────────────────────
 
-// UpdatePhase 推進階段。影響 0 列回 ErrPhaseConflict。
+// UpdatePhase 推進階段。動不到列回 ErrPhaseConflict。
 //
 // 0 列也涵蓋「賽事不存在」,但這裡一律回 ErrPhaseConflict:呼叫端在這之前
 // 必然已經讀過這屆賽事(轉換合法性要由讀到的 from 決定),所以走到這裡
@@ -157,19 +165,11 @@ func (s *Service) UpdatePhase(ctx context.Context, p tournament.UpdatePhaseParam
 		return fmt.Errorf("推進階段: %w", tournament.ErrActorRequired)
 	}
 	return s.inTx(ctx, func(qtx *db.Queries) error {
-		n, err := qtx.UpdateTournamentPhase(ctx, db.UpdateTournamentPhaseParams{
-			TournamentID: p.TournamentID,
-			FromPhase:    string(p.From),
-			ToPhase:      string(p.To),
-		})
+		slug, err := s.advancePhase(ctx, qtx, p.TournamentID, p.From, p.To)
 		if err != nil {
-			return fmt.Errorf("推進賽事 %d 階段: %w", p.TournamentID, err)
+			return err
 		}
-		if n == 0 {
-			return fmt.Errorf("賽事 %d %s→%s: %w",
-				p.TournamentID, p.From, p.To, tournament.ErrPhaseConflict)
-		}
-		return writeAudit(ctx, qtx, auditEntry{
+		if err := writeAudit(ctx, qtx, auditEntry{
 			ActorUserID: p.ActorUserID,
 			Action:      actionPhaseChanged,
 			TargetType:  targetTournament,
@@ -177,8 +177,61 @@ func (s *Service) UpdatePhase(ctx context.Context, p tournament.UpdatePhaseParam
 			Before:      map[string]any{"phase": string(p.From)},
 			After:       map[string]any{"phase": string(p.To)},
 			Reason:      p.Reason,
-		})
+		}); err != nil {
+			return err
+		}
+		return notifyPhase(ctx, qtx, slug)
 	})
+}
+
+// advancePhase 下那一句樂觀鎖 UPDATE,回傳賽事 slug(推播的路由鍵)。
+//
+// 抽出來是因為 RollbackToRanked 走的是同一句:退回 ranked 也是一次階段變更,
+// 它同樣要寫稽核、同樣要推播。兩處各寫一遍的話,漏掉的那一邊不會有任何
+// 錯誤訊息 —— 只是那個階段變化在觀眾的畫面上不會出現。
+func (s *Service) advancePhase(ctx context.Context, qtx *db.Queries,
+	tournamentID int64, from, to tournament.Phase,
+) (string, error) {
+	slug, err := qtx.UpdateTournamentPhase(ctx, db.UpdateTournamentPhaseParams{
+		TournamentID: tournamentID,
+		FromPhase:    string(from),
+		ToPhase:      string(to),
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", fmt.Errorf("賽事 %d %s→%s: %w",
+				tournamentID, from, to, tournament.ErrPhaseConflict)
+		}
+		return "", fmt.Errorf("推進賽事 %d 階段: %w", tournamentID, err)
+	}
+	return slug, nil
+}
+
+// notifyPhase 在**呼叫端的 tx 內**送出一則階段變化的推播信封。
+//
+// 必須在這個 tx 裡,不能挪到 commit 之後:NOTIFY 只在 commit 時送出,
+// rollback 的交易一個字都不送(internal/core/activity/watch 的檔頭)——
+// 觀眾因此不可能看到一個後來被撤銷的階段。挪出去就失去這個唯一的理由。
+//
+// 信封的 Ref 留空:階段變化的對象是賽事本身,而賽事已經由 Tournament(slug)
+// 指定了。watch.Envelope.Valid 對 KindPhase 特別允許空 Ref,就是為了這一則。
+//
+// 失敗一律讓整筆階段推進失敗(而不是吞掉):pg_notify 出錯代表這個 transaction
+// 已經被 Postgres 標成 aborted,後面每一句都只會回「current transaction is
+// aborted」—— 吞掉只會把成因換成一個看不懂的錯誤。
+// 形狀照 matchpg 的 notifyWatch,不另造一套信封。
+func notifyPhase(ctx context.Context, qtx *db.Queries, slug string) error {
+	payload, err := watch.Envelope{Tournament: slug, Kind: watch.KindPhase}.Marshal()
+	if err != nil {
+		return fmt.Errorf("組推播信封 slug=%s: %w", slug, err)
+	}
+	if err := qtx.NotifyActivityWatch(ctx, db.NotifyActivityWatchParams{
+		Channel: watch.Channel,
+		Payload: payload,
+	}); err != nil {
+		return fmt.Errorf("送階段推播 slug=%s: %w", slug, err)
+	}
+	return nil
 }
 
 // ── 評段 ──────────────────────────────────────────────────────
@@ -318,8 +371,14 @@ func PlayerFromRow(r db.GetPlayerByPublicIDRow) tournament.Player {
 	}
 }
 
-// tournamentFromRow 把賽事列轉成 port 型別。
-func tournamentFromRow(r db.ActivityTournament) (tournament.Tournament, error) {
+// TournamentFromRow 把賽事列轉成 port 型別。
+//
+// 匯出的理由與 PlayerFromRow 相同:讀取側(activityreadpg)也要把
+// activity.tournaments 的一列變成 tournament.Tournament,而「怎麼變」
+// ——尤其是 phase 解不開時要整筆失敗而不是落成零值——只該有一份(鐵則 9)。
+// GetTournamentByID / GetTournamentByPlayerPublicID 的欄位與 GetTournamentBySlug
+// 逐字相同,sqlc 因此把三支都生成同一個 db.ActivityTournament。
+func TournamentFromRow(r db.ActivityTournament) (tournament.Tournament, error) {
 	phase, err := tournament.ParsePhase(r.Phase)
 	if err != nil {
 		// DB 的 CHECK 擋得住這件事,走到這裡代表 migration 與 Phase 枚舉分岔了。

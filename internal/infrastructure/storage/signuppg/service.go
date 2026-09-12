@@ -32,6 +32,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -96,6 +97,31 @@ func (s *Service) TournamentBySlug(ctx context.Context, slug string) (tournament
 // PlayerByPublicID 在指定賽事內以 public_id 查選手。查無回 tournament.ErrPlayerNotFound。
 func (s *Service) PlayerByPublicID(ctx context.Context, tournamentID int64, publicID string) (tournament.Player, error) {
 	return s.reads.PlayerByPublicID(ctx, tournamentID, publicID)
+}
+
+// PasscodeIssuedAt 取這位選手目前的 passcode_issued_at,供選手 session 驗證用
+// (session.Repo)。查無回 tournament.ErrPlayerNotFound。
+//
+// 「查無」把三種情況折成同一個錯誤:賽事不存在、選手不存在、public_id 不屬於
+// 這一屆。這條路徑跑在**未認證**的請求上,分辨得出哪一種就等於一支探測器。
+//
+// 回傳的是 DB 的值,一微秒都不加工 —— 它會與 token 裡的值逐微秒比對,
+// 這裡若用本地時鐘補任何東西,結果是全屆選手隨機被登出。
+func (s *Service) PasscodeIssuedAt(
+	ctx context.Context, tournamentSlug, playerPublicID string,
+) (time.Time, error) {
+	at, err := s.q.PlayerPasscodeIssuedAt(ctx, db.PlayerPasscodeIssuedAtParams{
+		Slug:           tournamentSlug,
+		PlayerPublicID: playerPublicID,
+	})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return time.Time{}, fmt.Errorf("賽事 %s 的選手 %s: %w",
+				tournamentSlug, playerPublicID, tournament.ErrPlayerNotFound)
+		}
+		return time.Time{}, fmt.Errorf("查通行碼簽發時間: %w", err)
+	}
+	return at, nil
 }
 
 // ── 報名 ──────────────────────────────────────────────────────

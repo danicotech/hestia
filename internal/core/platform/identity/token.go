@@ -32,6 +32,9 @@ const (
 	typState  = "state"
 )
 
+// maxTypLen 是 typ 的長度上限。typ 只是一個用途標籤,長度沒有理由失控。
+const maxTypLen = 32
+
 // minSecretLen 是 HMAC-SHA256 金鑰的下限。短金鑰能通過所有測試卻毫無強度,
 // 必須在建構時就失敗出聲,不能等到被暴力破解才知道。
 const minSecretLen = 32
@@ -166,6 +169,85 @@ func (s *Signer) VerifyState(token, fromCookie string, now time.Time) (*StateCla
 	}
 	c.Redirect = clean
 	return &c, nil
+}
+
+// ErrInvalidTokenType 是呼叫端給了不合法或平台保留的 token 用途。
+//
+// 它**刻意不包** ErrInvalidToken:那一族是「使用者拿來的憑證有問題」,
+// 會被映射成 Unauthenticated(「請重新登入」)。用途給錯是**呼叫端的程式錯誤**,
+// 重新登入一萬次也不會好 —— 混進同一族只會讓一個 bug 偽裝成正常的登入過期。
+//
+// 沒有與其他 sentinel 放在 identity.go,是為了讓它緊挨著唯一產生它的
+// checkCustomTyp:這個錯誤的全部語意都在那個函式裡。
+var ErrInvalidTokenType = errors.New("token 用途不合法")
+
+// Sign 以呼叫端指定的用途簽發 token;Verify 是它的反向。
+//
+// # 為什麼把簽章原語匯出(2026-09-12)
+//
+// 活動層的選手 session(遊戲ID + 通行碼換發的那一組)同樣需要「我們自己簽的
+// token」。在那邊再寫一次 HMAC 就是同一個概念的第二個權威位置(鐵則 9),
+// 所以它必須用這裡的原語。讓它用得到的方式有兩個:
+//
+//	(a) 匯出通用的 Sign / Verify,用途與 claims 由呼叫端自己定義
+//	(b) 在這裡加 SignActivity / VerifyActivity 與一份活動層專用的 claims
+//
+// **選 (a)**,理由是邊界的方向:platform 不認識 activity(專案鐵則 1)。
+// (b) 兩者都不會真的 import,但它會把「賽事」「選手」這些活動層概念的名字
+// 長進平台層的檔案裡 —— 而活動層是逐活動的、遲早搬去 themis,
+// 到時候平台層會留下一組沒有主人的函式。(a) 讓 identity 只回答「怎麼簽」,
+// 「簽什麼、給誰用」留在需要它的那一層,搬家時這個檔案一行都不用改。
+//
+// 代價是 typ 從封閉的常數變成呼叫端給的字串,於是這裡必須自己守住兩件事
+// (見 checkCustomTyp):平台自己的用途是保留字,而且值域受限。
+//
+// # 這一層不檢查 exp
+//
+// 通用原語看不懂 claims 的形狀,自然也不知道哪個欄位是到期時間。
+// **過期檢查是呼叫端包裝的責任**(VerifyAccess 與活動層的 session 服務
+// 都各自做),這一句話是這個 API 唯一的陷阱,所以寫在最顯眼的地方。
+func (s *Signer) Sign(typ string, claims any) (string, error) {
+	if err := checkCustomTyp(typ); err != nil {
+		return "", err
+	}
+	return s.sign(typ, claims)
+}
+
+// Verify 驗證簽章並把 claims 解進 dst。失敗一律回 ErrInvalidToken 族
+// (不分辨是哪一步錯的);**不檢查到期**,見 Sign 的說明。
+func (s *Signer) Verify(typ, token string, dst any) error {
+	if err := checkCustomTyp(typ); err != nil {
+		return err
+	}
+	return s.verify(typ, token, dst)
+}
+
+// checkCustomTyp 守住「用途由呼叫端指定」這條路的兩個前提。
+//
+//  1. **平台自己的用途是保留字**。少了這一道,「匯出簽章原語」就等於
+//     「匯出簽發任意平台身分的能力」—— 任何拿得到 Signer 的程式碼都能
+//     Sign("access", 自己捏的 claims),而那正是 access token 的全部內容。
+//  2. **值域受限**。typ 會被混進被簽的訊息,它就是 domain separation 的
+//     邊界本身;允許任意字串等於讓那道邊界由呼叫端隨手決定。限定
+//     [a-z0-9_] 也順帶讓「typ 含分隔符造成訊息歧義」這類問題不可能發生。
+func checkCustomTyp(typ string) error {
+	if typ == "" {
+		return fmt.Errorf("%w: 不可為空", ErrInvalidTokenType)
+	}
+	if len(typ) > maxTypLen {
+		return fmt.Errorf("%w: 超過 %d 字元", ErrInvalidTokenType, maxTypLen)
+	}
+	for i := 0; i < len(typ); i++ {
+		c := typ[i]
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' {
+			continue
+		}
+		return fmt.Errorf("%w: 只接受小寫英數與底線", ErrInvalidTokenType)
+	}
+	if typ == typAccess || typ == typState {
+		return fmt.Errorf("%w: %q 是平台保留用途", ErrInvalidTokenType, typ)
+	}
+	return nil
 }
 
 // sign 產生 v1.<claims>.<sig>。

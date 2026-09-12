@@ -58,16 +58,23 @@ SELECT id, phase FROM activity.tournaments
 WHERE id = sqlc.arg(tournament_id)::bigint
 FOR UPDATE;
 
--- name: UpdateTournamentPhase :execrows
--- 樂觀鎖:WHERE phase = @from_phase。影響 0 列 = 有人搶先改了,adapter 回
--- ErrPhaseConflict。用 :execrows 而不是 :exec,就是為了讓「0 列」這件事
--- 有辦法被看見 —— 兩個裁判同時按「進入下一階段」時,輸的那個必須知道
+-- name: UpdateTournamentPhase :one
+-- 樂觀鎖:WHERE phase = @from_phase。動不到列 = 有人搶先改了,adapter 回
+-- ErrPhaseConflict —— 兩個裁判同時按「進入下一階段」時,輸的那個必須知道
 -- 自己什麼都沒做到,而不是收到一個成功然後以為賽事被自己推進了兩階。
 -- RollbackToRanked 也用這一支(from='drawing', to='ranked')。
+--
+-- **RETURNING slug 是即時推播要的。** 階段變更要在同一個 tx 裡送出
+-- watch 的信封(NOTIFY 只在 commit 時送出,rollback 的交易一個字都不送),
+-- 而信封的路由鍵是 slug。用 :one + RETURNING 而不是 :execrows 再補一支
+-- SELECT slug:那會多一個「slug 從哪裡來」的權威位置,而且兩句之間的那一列
+-- 說到底就是這句剛更新的那一列 —— 從它自己身上拿才不可能拿錯。
+-- 「動了 0 列」這件事改由 pgx.ErrNoRows 表達,一樣看得見。
 UPDATE activity.tournaments
 SET phase = sqlc.arg(to_phase)::text, updated_at = now()
 WHERE id = sqlc.arg(tournament_id)::bigint
-  AND phase = sqlc.arg(from_phase)::text;
+  AND phase = sqlc.arg(from_phase)::text
+RETURNING slug;
 
 -- ═══ 選手讀取(tournament_players)════════════════════════════
 
@@ -253,7 +260,13 @@ RETURNING id, public_id, game_id, user_id, discord_name,
 
 -- name: UpdatePlayerPasscode :execrows
 -- 「舊碼立即失效」不需要撤銷清單 —— passcode_hash 被覆寫的那一刻,
--- 舊碼就再也比對不過。issued_at 同步更新,只是給裁判看的痕跡。
+-- 舊碼就再也比對不過。
+--
+-- ⚠ passcode_issued_at **不是**給人看的痕跡,它是已簽發 session 的失效依據:
+-- 選手 session 的 token 裡帶著簽發當下的這個值,驗證時逐微秒比對,不相等
+-- 就當場失效(見 internal/core/activity/session)。所以任何「順手」改動它
+-- ——資料修復、回填、把它當 updated_at 用——都會讓該屆選手全部被登出。
+-- 它只能由這句 SQL 在換發通行碼時前進。
 -- :execrows 讓 adapter 分得出「查無此選手」(0 列),那要回 ErrPlayerNotFound。
 -- 呼叫端必須另外呼叫 InsertAdminAudit(同一個 tx),而且
 -- **明碼與雜湊都絕不可進稽核紀錄**。
@@ -263,6 +276,19 @@ SET passcode_hash = sqlc.arg(passcode_hash)::text,
     updated_at = now()
 WHERE id = sqlc.arg(player_id)::bigint
   AND tournament_id = sqlc.arg(tournament_id)::bigint;
+
+-- name: PlayerPasscodeIssuedAt :one
+-- 選手 session 驗證用:取這一列目前的 passcode_issued_at。
+--
+-- 走 slug + 選手 public_id 而不是內部 id,因為呼叫端是 token 的驗證路徑,
+-- 而 token 裡只會有對外識別字(鐵則 5)。查無回 0 列 —— 包含「slug 不存在」
+-- 與「這個 public_id 不屬於這一屆」,adapter 一律折成同一個錯誤,
+-- 不讓未認證的呼叫端分辨得出哪一種。
+SELECT tp.passcode_issued_at
+FROM activity.tournament_players tp
+JOIN activity.tournaments t ON t.id = tp.tournament_id
+WHERE t.slug = sqlc.arg(slug)::text
+  AND tp.public_id = sqlc.arg(player_public_id)::text;
 
 -- name: BindPlayerUser :one
 -- 綁定的第一支(依鎖序 tournament_players 先於 fencers)。

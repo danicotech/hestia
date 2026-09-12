@@ -188,6 +188,13 @@ type Querier interface {
 	// 每日次數上限(schemas/25:20 次/人/日)。用 UTC 當日,與 XP 的 daily_cap 一致 ——
 	// 兩個「今天」用不同定義會讓人在某個時區看到兩者不同步。
 	CountDrawsToday(ctx context.Context, userID int64) (int64, error)
+	// ═══ 選手 ═══════════════════════════════════════════════════
+	// 本屆報名人數(Tournament.player_count)。
+	//
+	// **不**過濾 status:這個數字是「有幾個人報了名」,不是「還有幾個人在賽中」。
+	// 把棄賽者排除掉的話,賽事頁的人數會在活動進行中自己往下掉,而報名人數
+	// 是一個已經發生過、不會再變的事實。
+	CountTournamentPlayers(ctx context.Context, tournamentID int64) (int32, error)
 	// 抽籤的守門條件,回 0 才能抽。只算 active:棄賽者本來就不進抽籤,
 	// 把他們算進來會讓裁判被一個永遠評不完的數字擋住。
 	CountUnrankedActivePlayers(ctx context.Context, tournamentID int64) (int64, error)
@@ -211,6 +218,24 @@ type Querier interface {
 	CreatePetState(ctx context.Context, arg CreatePetStateParams) error
 	CreateSpace(ctx context.Context, arg CreateSpaceParams) (CreateSpaceRow, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (PlatformUser, error)
+	// 這位選手「現在輪到要打」的那一場:未完賽的場次裡 (round, slot) 最小的一場。
+	// 查無 0 列 → adapter 回 nil(不是錯誤)。三種情況都會落到 0 列:
+	//
+	//   已淘汰   敗的那一場是 done,之後的場次坐的是對手 → 沒有未完賽的場次
+	//   已棄賽   靠 EXISTS 那道條件擋掉(見下)
+	//   未抽籤   整屆一場都還沒有
+	//
+	// **status = 'active' 的檢查不是多餘的。** 棄賽的級聯只會把「對手已就位」的
+	// 場次判成不戰而勝;對手未定的那些留在 pending 等晉級鏈接手
+	// (LockUnfinishedMatchesOfPlayer 的註解)。沒有這道條件的話,一位已經棄賽的
+	// 選手登入後會看到「你的下一場」,而他根本不會上場。
+	//
+	// 含對手未定(p2 為 NULL)的場次:那正是「等上一輪」的樣子,選手頁要顯示的
+	// 是「下一場對手未定」而不是「沒有比賽」。
+	//
+	// 排序與 LIMIT 1 缺一不可:一位選手同時有兩場未完賽是可能的(剛晉級、
+	// 下一輪的節點已經建好),沒有排序的話「目前這一場」會在兩者之間跳動。
+	CurrentMatchOfPlayer(ctx context.Context, playerID int64) (CurrentMatchOfPlayerRow, error)
 	// 條件帶 remaining > 0:就算呼叫端算錯,DB 也不會讓它變成負數。
 	DecrementLootBoxItem(ctx context.Context, id int64) (int64, error)
 	// ═══ 抽籤(ReplaceDraw / RollbackToRanked)════════════════════
@@ -426,6 +451,47 @@ type Querier interface {
 	// audit 寫入用 audit.sql 的 InsertAdminAudit,不重複定義。
 	// 退款前讀原分錄(分區表,依 id 掃全分區;管理操作低頻,可接受)
 	GetTokenEntryByID(ctx context.Context, id int64) (PlatformTokenEntry, error)
+	// 《百業試鋒》活動層的**讀取側**(對應 transport.ActivityReader)。
+	// 全檔只有 SELECT,一句寫入都沒有。
+	//
+	// ── 為什麼另立一個檔案 ────────────────────────────────────────
+	//
+	// activity_tournament.sql 與 activity_match.sql 各自服務一個領域埠
+	// (tournament.Repo / match.Repository),它們的每一支查詢都背著鎖序與階段
+	// 守門的約定。觀眾頁要的是完全相反的東西:不取任何鎖、不改任何狀態、
+	// 看得到已淘汰與已棄賽的人。混進去的話,那兩個檔頭的「本檔所有查詢都在
+	// 鎖序約定之內」就會出現例外,而例外正是日後有人照著抄出死鎖的來源。
+	//
+	// ── 沿用既有查詢,不重寫 ──────────────────────────────────────
+	//
+	//   單場       GetMatchForJudge(activity_match.sql)—— 無鎖重讀,欄位就是
+	//              對戰表要的全部。watchpg 的推播路徑也用它(規則 9:同一個畫面上的
+	//              同一個數字不該有兩條產生路徑)。這裡因此**沒有** MatchByPublicID。
+	//   單一選手   GetPlayerByPublicID(activity_tournament.sql)—— 同樣的簽名、
+	//              同樣的一句 SQL,adapter 直接委派給 tournamentpg。
+	//
+	// ── 欄位順序是契約 ────────────────────────────────────────────
+	//
+	// ListTournamentPlayers 的欄位必須與 GetPlayerByPublicID 逐字相同,
+	// ListTournamentMatches / CurrentMatchOfPlayer 必須與 GetMatchForJudge 逐字相同。
+	// adapter 靠 Go 的結構轉換共用同一份映射 —— 不一致會在編譯期爆掉,
+	// 那正是要的:錯位在 build 時就被看見,不是執行期靜靜接錯欄位。
+	// ═══ 賽事 ═══════════════════════════════════════════════════
+	// 依內部 id 讀一屆賽事。欄位與 GetTournamentBySlug 逐字相同(共用同一份列轉換)。
+	//
+	// 為什麼不用 JudgeTournamentByID:那一支帶 FOR SHARE,而且回的是裁判流程要的
+	// 形狀(含 TotalRounds、不含 config 以外的欄位對不上 tournament.Tournament)。
+	// 觀眾讀一場比賽的所屬賽事時不該對賽事列取任何鎖 —— 一個沒有人在寫的路徑
+	// 去排隊等鎖,只會在裁判正在抽籤時讓整個對戰表頁卡住。
+	GetTournamentByID(ctx context.Context, tournamentID int64) (ActivityTournament, error)
+	// 依選手 public_id 反查他所屬的那一屆。
+	//
+	// 存在的理由是契約而不是方便:AssignRank / SwapSeeds / RegeneratePasscode 的
+	// 請求只帶 player_public_id(選手 public_id 是 ULID,全域唯一,不需要 slug 去
+	// 消歧義),而領域服務的參數要 slug。這條反查就是那個落差。
+	// 查無 0 列 → adapter 回 tournament.ErrPlayerNotFound:輸入是一個選手 id,
+	// 「這個選手不存在」才是誠實的答案,回「賽事不存在」會讓裁判去找錯地方。
+	GetTournamentByPlayerPublicID(ctx context.Context, playerPublicID string) (ActivityTournament, error)
 	// 《百業試鋒》賽事核心 query(schemas/20 + schemas/26)。
 	// 對應 port:internal/core/activity/tournament.Repo 與 internal/core/activity/signup.Repo。
 	// 涵蓋 activity.tournaments / fencers / tournament_players / matches 四張表。
@@ -724,6 +790,16 @@ type Querier interface {
 	// 可以合法地換一個執行計畫、換一個回傳順序,那一刻「拿舊種子重跑驗證」就失效了。
 	ListDrawablePlayers(ctx context.Context, tournamentID int64) ([]ListDrawablePlayersRow, error)
 	ListEntriesByUser(ctx context.Context, arg ListEntriesByUserParams) ([]PlatformTokenEntry, error)
+	// ═══ 跨屆檔案 ═══════════════════════════════════════════════
+	// 批次取跨屆選手檔案(裁判評段時要看歷屆戰績)。
+	// 欄位與 GetFencerByGameID 逐字相同,共用 signuppg.FencerFromRow。
+	//
+	// 一次查一批而不是讓呼叫端在迴圈裡查:ListUnranked 一屆可能有數十人,
+	// 逐筆查就是數十次 round-trip,而且那個迴圈看起來完全無害。
+	//
+	// 查不到的 id 不會有列,adapter 因此**不**回錯誤 —— 呼叫端拿到的是一個
+	// 少了那個鍵的 map,而它本來就要處理「這個人沒有跨屆資料」的情況。
+	ListFencersByIDs(ctx context.Context, fencerIds []int64) ([]ActivityFencer, error)
 	// ── 讓武項目 ────────────────────────────────────────────────────
 	// 排序即前端的呈現順序:先分類,類內依 sort_order,最後以 id 收尾 ——
 	// sort_order 允許重複,沒有第三個鍵的話同分項目的順序會隨執行計畫變動,
@@ -794,6 +870,25 @@ type Querier interface {
 	ListSpaceChannels(ctx context.Context, spaceID int64) ([]ListSpaceChannelsRow, error)
 	ListSpacePurposes(ctx context.Context, spaceID int64) ([]ListSpacePurposesRow, error)
 	ListSpaces(ctx context.Context) ([]ListSpacesRow, error)
+	// ═══ 對戰表 ═════════════════════════════════════════════════
+	// 本屆全部場次,依 (round, slot) 遞增。欄位與 GetMatchForJudge 逐字相同。
+	//
+	// 尚未抽籤時回 0 列 —— 那不是錯誤,賽事存在、只是還沒抽(transport 靠
+	// 「空清單」決定顯示「尚未抽籤」而不是 404)。
+	//
+	// 不加任何 FOR SHARE / FOR UPDATE:這是匿名可讀的路徑,決賽當下可能有上百人
+	// 同時在看。對 matches 取鎖會讓觀眾與裁判互相排隊,而觀眾一個字都不會寫。
+	ListTournamentMatches(ctx context.Context, tournamentID int64) ([]ListTournamentMatchesRow, error)
+	// 本屆全部參賽者,**含已淘汰與已棄賽**。欄位與 GetPlayerByPublicID 逐字相同。
+	//
+	// 排序:籤位優先,未抽籤者(seed_no IS NULL)排在最後,同組內依報名序。
+	//   * NULLS LAST 是 Postgres 對 ASC 的預設,這裡仍然寫出來 —— 讀的人不必
+	//     去查文件才知道報名期間(全部都是 NULL)的清單會不會反過來。
+	//   * tp.id 就是報名序:它是 BIGSERIAL,先報名的人 id 一定比較小。
+	//     用 created_at 的話,同一毫秒內的兩筆報名順序就不定了。
+	// 排序不是排版偏好:報名頁與對戰表都靠這個順序呈現,不穩定的順序會讓
+	// 同一頁重新整理兩次看到不同的排列。
+	ListTournamentPlayers(ctx context.Context, tournamentID int64) ([]ListTournamentPlayersRow, error)
 	// 徽章就是 category='badge' 的物品 —— 不是另一套系統(schemas/25)。
 	ListUserBadges(ctx context.Context, arg ListUserBadgesParams) ([]ListUserBadgesRow, error)
 	// 多幣別:一列一幣別。**沒有列 = 沒有那個幣別的餘額 = 0**(與 ledger.GetBalance
@@ -1298,6 +1393,13 @@ type Querier interface {
 	// 隨機取 N 位。random() 在這裡夠用:抽獎的公平性由「誰都不能改參加名單」
 	// 保證(UNIQUE + append),不是由亂數品質保證;而且結果會連同 seed 進 chance_draws。
 	PickGiveawayWinners(ctx context.Context, arg PickGiveawayWinnersParams) ([]PickGiveawayWinnersRow, error)
+	// 選手 session 驗證用:取這一列目前的 passcode_issued_at。
+	//
+	// 走 slug + 選手 public_id 而不是內部 id,因為呼叫端是 token 的驗證路徑,
+	// 而 token 裡只會有對外識別字(鐵則 5)。查無回 0 列 —— 包含「slug 不存在」
+	// 與「這個 public_id 不屬於這一屆」,adapter 一律折成同一個錯誤,
+	// 不讓未認證的呼叫端分辨得出哪一種。
+	PlayerPasscodeIssuedAt(ctx context.Context, arg PlayerPasscodeIssuedAtParams) (time.Time, error)
 	// 投影重算:xp ← SUM(events)、last_xp_at ← MAX(created_at),整個投影可從事實重建。
 	// 呼叫前必須已 LockUserXp,否則與並行 Award 有覆寫競態(先算 SUM、後拿鎖會蓋掉新事件)
 	RebuildUserXp(ctx context.Context, arg RebuildUserXpParams) (int64, error)
@@ -1538,19 +1640,31 @@ type Querier interface {
 	UpdateLoginIdentity(ctx context.Context, arg UpdateLoginIdentityParams) error
 	// ═══ 身分維護(通行碼、綁定)═════════════════════════════════
 	// 「舊碼立即失效」不需要撤銷清單 —— passcode_hash 被覆寫的那一刻,
-	// 舊碼就再也比對不過。issued_at 同步更新,只是給裁判看的痕跡。
+	// 舊碼就再也比對不過。
+	//
+	// ⚠ passcode_issued_at **不是**給人看的痕跡,它是已簽發 session 的失效依據:
+	// 選手 session 的 token 裡帶著簽發當下的這個值,驗證時逐微秒比對,不相等
+	// 就當場失效(見 internal/core/activity/session)。所以任何「順手」改動它
+	// ——資料修復、回填、把它當 updated_at 用——都會讓該屆選手全部被登出。
+	// 它只能由這句 SQL 在換發通行碼時前進。
 	// :execrows 讓 adapter 分得出「查無此選手」(0 列),那要回 ErrPlayerNotFound。
 	// 呼叫端必須另外呼叫 InsertAdminAudit(同一個 tx),而且
 	// **明碼與雜湊都絕不可進稽核紀錄**。
 	UpdatePlayerPasscode(ctx context.Context, arg UpdatePlayerPasscodeParams) (int64, error)
 	// 呼叫前必須已 LockRedemptionForHandle 且確認 status='pending'。
 	UpdateRedemptionStatus(ctx context.Context, arg UpdateRedemptionStatusParams) (PlatformRedemption, error)
-	// 樂觀鎖:WHERE phase = @from_phase。影響 0 列 = 有人搶先改了,adapter 回
-	// ErrPhaseConflict。用 :execrows 而不是 :exec,就是為了讓「0 列」這件事
-	// 有辦法被看見 —— 兩個裁判同時按「進入下一階段」時,輸的那個必須知道
+	// 樂觀鎖:WHERE phase = @from_phase。動不到列 = 有人搶先改了,adapter 回
+	// ErrPhaseConflict —— 兩個裁判同時按「進入下一階段」時,輸的那個必須知道
 	// 自己什麼都沒做到,而不是收到一個成功然後以為賽事被自己推進了兩階。
 	// RollbackToRanked 也用這一支(from='drawing', to='ranked')。
-	UpdateTournamentPhase(ctx context.Context, arg UpdateTournamentPhaseParams) (int64, error)
+	//
+	// **RETURNING slug 是即時推播要的。** 階段變更要在同一個 tx 裡送出
+	// watch 的信封(NOTIFY 只在 commit 時送出,rollback 的交易一個字都不送),
+	// 而信封的路由鍵是 slug。用 :one + RETURNING 而不是 :execrows 再補一支
+	// SELECT slug:那會多一個「slug 從哪裡來」的權威位置,而且兩句之間的那一列
+	// 說到底就是這句剛更新的那一列 —— 從它自己身上拿才不可能拿錯。
+	// 「動了 0 列」這件事改由 pgx.ErrNoRows 表達,一樣看得見。
+	UpdateTournamentPhase(ctx context.Context, arg UpdateTournamentPhaseParams) (string, error)
 	UpdateUserTimezone(ctx context.Context, arg UpdateUserTimezoneParams) (UpdateUserTimezoneRow, error)
 	UpsertDailyState(ctx context.Context, arg UpsertDailyStateParams) error
 	// 這裡用 upsert 而不是「先查再建」,是因為重跑的語意不同:再跑一次

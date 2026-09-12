@@ -18,24 +18,39 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/danicotech/hestia/internal/core/activity/handicap"
+	"github.com/danicotech/hestia/internal/core/activity/match"
+	"github.com/danicotech/hestia/internal/core/activity/prize"
+	"github.com/danicotech/hestia/internal/core/activity/session"
+	"github.com/danicotech/hestia/internal/core/activity/signup"
+	"github.com/danicotech/hestia/internal/core/activity/tournament"
+	"github.com/danicotech/hestia/internal/core/activity/watch"
 	"github.com/danicotech/hestia/internal/core/platform/identity"
 	"github.com/danicotech/hestia/internal/core/platform/notification"
 	"github.com/danicotech/hestia/internal/infrastructure/maintenance"
 	"github.com/danicotech/hestia/internal/infrastructure/outbox"
 	"github.com/danicotech/hestia/internal/infrastructure/reaper"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/activitylogpg"
+	"github.com/danicotech/hestia/internal/infrastructure/storage/activityreadpg"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/admineconpg"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/authzpg"
+	"github.com/danicotech/hestia/internal/infrastructure/storage/bettingpg"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/dailypg"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/eventlogpg"
+	"github.com/danicotech/hestia/internal/infrastructure/storage/handicappg"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/identitypg"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/ledgerpg"
+	"github.com/danicotech/hestia/internal/infrastructure/storage/matchpg"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/notificationpg"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/playpg"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/readpg"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/shoppg"
+	"github.com/danicotech/hestia/internal/infrastructure/storage/signuppg"
+	"github.com/danicotech/hestia/internal/infrastructure/storage/tournamentpg"
+	"github.com/danicotech/hestia/internal/infrastructure/storage/watchpg"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/xppg"
 	"github.com/danicotech/hestia/internal/transport"
 )
@@ -123,9 +138,76 @@ func run() error {
 		TrustedProxies: trustedProxies,
 	}
 
+	// ── 活動層(《百業試鋒》)
+	//
+	// 領域服務住在 internal/core/activity,M1 期間與平台層同一個 repo、同一顆
+	// Postgres 的兩個 schema。第二個活動時整包抽到 themis(見 CLAUDE.md)。
+	//
+	// 組裝順序有意義:handicap 與 betting 要先存在,match 才組得起來 ——
+	// 判定勝負是一個橫跨三者的 transaction(封盤、結算注單、晉級),
+	// 而那個 tx 的擁有者是 match。
+	hasher, err := signup.NewHasher(0)
+	if err != nil {
+		return fmt.Errorf("建立通行碼雜湊器: %w", err)
+	}
+	signer, err := buildSigner()
+	if err != nil {
+		return err
+	}
+	activityRead := activityreadpg.New(pool)
+	signupRepo := signuppg.New(pool)
+	tournamentRepo := tournamentpg.New(pool)
+	tournaments := tournament.NewService(tournamentRepo)
+	bets := bettingpg.New(pool, led)
+	matches := match.NewService[pgx.Tx](
+		matchpg.New(pool),
+		matchpg.NewHandicaps(func(tx pgx.Tx) handicap.Repository { return handicappg.BindTx(tx) }),
+		bets,
+	)
+	activityDeps := transport.ActivityDeps{
+		Signup:     signup.NewService(signupRepo, hasher),
+		Tournament: tournaments,
+		Handicap:   handicap.New(handicappg.New(pool)),
+		Betting:    bets,
+		Matches:    matches,
+		Reader:     activityRead,
+		Prizes: prizeAdapter{svc: prize.New(
+			prizeRepo{Service: activityRead, tournaments: tournamentRepo}, led, "")},
+		Directory: read,
+	}
+	// 選手 session 只需要平台密鑰,不需要 Discord。沒設密鑰時報名照常,
+	// 但選手登入不了(handler 會回 Unimplemented)—— 讓它安靜地半通不如
+	// 在啟動時就說清楚。
+	if signer != nil {
+		activityDeps.Sessions = activitySessionAdapter{
+			svc: session.New(signer, signupRepo),
+		}
+	} else {
+		slog.Warn("PLATFORM_JWT_SECRET 未設定,選手登入停用(報名與公開檢視照常)")
+	}
+	deps.ActivityLayer = &activityDeps
+
+	// ── 即時戰況推播
+	//
+	// Hub 是行程內的扇出樞紐,LISTEN 迴圈是唯一餵它的東西。兩者分開建立是
+	// 因為生命週期不同:Hub 要跟著行程結束時關掉(關掉會讓所有訂閱者收到
+	// 結束訊號,handler 才走得完),而 LISTEN 迴圈自己會重連,只有 ctx
+	// 取消才停。
+	//
+	// 推播只影響「畫面會不會自動更新」——它掛掉不該讓賽事本身停擺,所以
+	// 迴圈的錯誤是記 log 而不是讓行程退出。
+	hub := watch.NewHub(0)
+	defer hub.Close()
+	deps.WatchHub = hub
+	go func() {
+		if err := watchpg.New(pool, hub, watchpg.Options{Logger: slog.Default()}).Run(ctx); err != nil {
+			slog.Error("即時推播的 LISTEN 迴圈結束", "err", err)
+		}
+	}()
+
 	// ── 身分:Discord 憑證齊全才啟用。缺了就讓 AuthService 保持 Unimplemented,
 	// 其餘 API 照常運作——本機還沒申請 Discord 應用程式時也能把服務跑起來。
-	if idsvc, signer, err := buildIdentity(pool, led); err != nil {
+	if idsvc, err := buildIdentity(pool, led, signer); err != nil {
 		return err
 	} else if idsvc != nil {
 		deps.Auth = &authAdapter{svc: idsvc, signer: signer, profiles: read, dir: read}
@@ -243,15 +325,30 @@ func run() error {
 // (那會擋住「先把服務跑起來看資料表」這種完全合理的事)。
 //
 // 但 Discord 三個之間仍是全有全無:半套的登入設定只會在使用者按下登入時才炸。
-func buildIdentity(pool *pgxpool.Pool, led *ledgerpg.Service) (identity.Service, *identity.Signer, error) {
+// buildSigner 建平台的 token 簽章器。回 (nil, nil) 表示沒設密鑰。
+//
+// 獨立於 Discord 憑證:選手 session(活動層)只需要這把密鑰,不需要 Discord
+// 應用程式。綁在一起的話,還沒申請 Discord 的部署連選手都登入不了 ——
+// 而選手本來就不需要平台帳號,那正是活動層身分存在的理由。
+func buildSigner() (*identity.Signer, error) {
+	secret := os.Getenv("PLATFORM_JWT_SECRET")
+	if secret == "" {
+		return nil, nil
+	}
+	signer, err := identity.NewSigner([]byte(secret))
+	if err != nil {
+		return nil, fmt.Errorf("PLATFORM_JWT_SECRET: %w", err)
+	}
+	return signer, nil
+}
+
+func buildIdentity(pool *pgxpool.Pool, led *ledgerpg.Service, signer *identity.Signer) (identity.Service, error) {
 	cfg := identitypg.Config{
 		ClientID:     os.Getenv("PLATFORM_DISCORD_CLIENT_ID"),
 		ClientSecret: os.Getenv("PLATFORM_DISCORD_CLIENT_SECRET"),
 		RedirectURI:  os.Getenv("PLATFORM_DISCORD_REDIRECT_URI"),
 		TokenEncKey:  []byte(os.Getenv("PLATFORM_TOKEN_ENC_KEY")),
 	}
-	secret := os.Getenv("PLATFORM_JWT_SECRET")
-
 	discordSet := 0
 	for _, v := range []string{cfg.ClientID, cfg.ClientSecret, cfg.RedirectURI} {
 		if v != "" {
@@ -260,27 +357,22 @@ func buildIdentity(pool *pgxpool.Pool, led *ledgerpg.Service) (identity.Service,
 	}
 	switch discordSet {
 	case 0:
-		return nil, nil, nil // 還沒申請 Discord 應用程式:登入停用,其餘照跑
+		return nil, nil // 還沒申請 Discord 應用程式:登入停用,其餘照跑
 	case 3:
 	default:
-		return nil, nil, errors.New(
+		return nil, errors.New(
 			"PLATFORM_DISCORD_CLIENT_ID / _SECRET / _REDIRECT_URI 必須全部設定或全部不設定")
 	}
 	// 到這裡代表要啟用登入,平台密鑰就成了必要條件
-	if secret == "" || len(cfg.TokenEncKey) == 0 {
-		return nil, nil, errors.New(
+	if signer == nil || len(cfg.TokenEncKey) == 0 {
+		return nil, errors.New(
 			"啟用 Discord 登入還需要 PLATFORM_JWT_SECRET 與 PLATFORM_TOKEN_ENC_KEY")
-	}
-
-	signer, err := identity.NewSigner([]byte(secret))
-	if err != nil {
-		return nil, nil, fmt.Errorf("PLATFORM_JWT_SECRET: %w", err)
 	}
 	svc, err := identitypg.New(pool, led, signer, cfg)
 	if err != nil {
-		return nil, nil, fmt.Errorf("建立身分服務: %w", err)
+		return nil, fmt.Errorf("建立身分服務: %w", err)
 	}
-	return svc, signer, nil
+	return svc, nil
 }
 
 func ignoreCanceled(err error) error {

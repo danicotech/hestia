@@ -33,17 +33,10 @@ func (s *Service) RollbackToRanked(ctx context.Context, p tournament.RollbackPar
 			return err
 		}
 
-		n, err := qtx.UpdateTournamentPhase(ctx, db.UpdateTournamentPhaseParams{
-			TournamentID: p.TournamentID,
-			FromPhase:    string(tournament.PhaseDrawing),
-			ToPhase:      string(tournament.PhaseRanked),
-		})
+		slug, err := s.advancePhase(ctx, qtx, p.TournamentID,
+			tournament.PhaseDrawing, tournament.PhaseRanked)
 		if err != nil {
-			return fmt.Errorf("退回賽事 %d 階段: %w", p.TournamentID, err)
-		}
-		if n == 0 {
-			return fmt.Errorf("賽事 %d 不在 %s 階段: %w",
-				p.TournamentID, tournament.PhaseDrawing, tournament.ErrPhaseConflict)
+			return err
 		}
 
 		// 對戰表與籤位一起作廢。只做一半的話,觀眾會看到一張已經不作數的表,
@@ -52,7 +45,7 @@ func (s *Service) RollbackToRanked(ctx context.Context, p tournament.RollbackPar
 			return err
 		}
 
-		return writeAudit(ctx, qtx, auditEntry{
+		if err := writeAudit(ctx, qtx, auditEntry{
 			ActorUserID: p.ActorUserID,
 			Action:      actionRollback,
 			TargetType:  targetTournament,
@@ -60,7 +53,13 @@ func (s *Service) RollbackToRanked(ctx context.Context, p tournament.RollbackPar
 			Before:      map[string]any{"phase": string(tournament.PhaseDrawing)},
 			After:       map[string]any{"phase": string(tournament.PhaseRanked)},
 			Reason:      p.Reason,
-		})
+		}); err != nil {
+			return err
+		}
+
+		// 退回 ranked 也是一次階段變更,所以它也要推播:對戰表在這一刻整張
+		// 被刪掉了,正在看的觀眾如果沒收到通知,畫面就會停在一張已經不存在的表上。
+		return notifyPhase(ctx, qtx, slug)
 	})
 }
 

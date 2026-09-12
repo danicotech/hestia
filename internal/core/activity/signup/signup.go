@@ -167,7 +167,10 @@ type Credential struct {
 // UpdatePasscodeParams 是重新產生通行碼。
 //
 // 實作必須同時更新 passcode_hash 與 passcode_issued_at ——
-// 舊碼「立即失效」靠的就是雜湊被覆寫,issued_at 只是給裁判看的痕跡。
+// 舊碼「立即失效」靠的是雜湊被覆寫;issued_at 則讓**已經簽發出去的
+// session** 一併失效(選手 session 把它寫進 token,驗證時逐微秒比對,
+// 見 internal/core/activity/session)。補發通行碼的情境就是「原本那組
+// 可能落到別人手上」,只換雜湊而留著舊 session 等於沒換。
 // 這個動作要寫進 platform.admin_audit_logs(同一個 transaction),
 // 但**絕不可**把明碼或雜湊寫進稽核紀錄。
 type UpdatePasscodeParams struct {
