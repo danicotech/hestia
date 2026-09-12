@@ -75,9 +75,15 @@ func (s *Service) Award(ctx context.Context, p xp.AwardParams) (*xp.AwardResult,
 //   - **失敗用 savepoint 隔離**:source 不存在、cap 攔下等路徑只回滾 savepoint,
 //     不毒化呼叫端的 tx —— 呼叫端仍可自行決定要不要繼續(例如照樣記事實)。
 //   - **併發語意不變**:一樣鎖 user_xp 列、一樣用 DB 單一時鐘(LockUserXp 回傳的
-//     db_now)判冷卻。注意 savepoint rollback **不釋放已取得的 row lock**:
-//     本函式回來之後,呼叫端的 tx 仍持有該 user_xp 列的鎖直到 tx 結束,
-//     所以請盡快收尾,別拿著它做別的長工。
+//     db_now)判冷卻。
+//
+// 這裡原本寫著「savepoint rollback **不釋放**已取得的 row lock」,那是錯的
+// (2026-09-12 對真 Postgres 實測推翻,見 ledgerpg.ApplyInTx 的說明與
+// bettingpg 的 TestApplyInTxContract)。PostgreSQL 的列鎖寫在 tuple 的 xmax 上,
+// 子交易 abort 之後那把鎖對別的 session 就不再可見。
+//
+// 「失敗後盡快收尾」這個建議仍然成立,但理由不是這個 —— 而是呼叫端此時
+// 仍持有它自己在 savepoint **外面**取得的鎖。
 //
 // 刻意放在具體 *Service 而非 xp.Service interface:interface 要保持可攜
 // (未來的 HTTP 版沒有 tx 可傳),同 repo 需要 tx 組合的呼叫端依賴具體型別
