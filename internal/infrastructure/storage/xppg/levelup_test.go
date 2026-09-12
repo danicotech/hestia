@@ -289,3 +289,59 @@ func TestRewardGranter_UnknownKindFails(t *testing.T) {
 		t.Fatalf("失敗後不該留下發放登記,得到 %d 筆", grants)
 	}
 }
+
+// 寵物與使用者「各自獨立但同時漲」(schemas/25 Q11)。
+// 共用一條的話,換一隻寵物還是同等級,養不養都一樣,沒有人會在意。
+func TestAward_DeployedPetGainsSameXP(t *testing.T) {
+	setup(t)
+	ctx := context.Background()
+	u := newUser(t)
+	c := newCommunity(t, "")
+
+	// 直接發一隻出戰中的寵物
+	var defID, instID int64
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO platform.item_definitions (public_id, name, category)
+		 VALUES (gen_random_uuid()::text, '橘貓', 'pet') RETURNING id`).Scan(&defID); err != nil {
+		t.Fatalf("建寵物定義: %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO platform.item_instances (public_id, definition_id, owner_id, acquired_at)
+		 VALUES (gen_random_uuid()::text, $1, $2, now()) RETURNING id`,
+		defID, u).Scan(&instID); err != nil {
+		t.Fatalf("發寵物: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO platform.pet_states (item_instance_id, owner_id, deployed)
+		 VALUES ($1, $2, true)`, instID, u); err != nil {
+		t.Fatalf("建寵物狀態: %v", err)
+	}
+
+	if _, err := svc.Award(ctx, xp.AwardParams{
+		UserID: u, CommunityID: c, Source: "admin", Amount: 150,
+	}); err != nil {
+		t.Fatalf("Award: %v", err)
+	}
+
+	var petXP int64
+	if err := pool.QueryRow(ctx,
+		`SELECT xp FROM platform.pet_states WHERE item_instance_id = $1`, instID).Scan(&petXP); err != nil {
+		t.Fatalf("讀寵物 XP: %v", err)
+	}
+	if petXP != 150 {
+		t.Fatalf("出戰寵物應拿到同樣的 150 XP,得到 %d", petXP)
+	}
+}
+
+// 沒有出戰寵物是常態(多數人一開始都沒有),不該讓入帳失敗。
+func TestAward_NoDeployedPetIsFine(t *testing.T) {
+	setup(t)
+	ctx := context.Background()
+	u := newUser(t)
+	c := newCommunity(t, "")
+	if _, err := svc.Award(ctx, xp.AwardParams{
+		UserID: u, CommunityID: c, Source: "admin", Amount: 50,
+	}); err != nil {
+		t.Fatalf("沒有寵物不該失敗: %v", err)
+	}
+}

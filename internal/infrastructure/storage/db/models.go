@@ -11,6 +11,157 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+// 注單。扣款經 Ledger(reason=bet_stake),與 INSERT 本列必須同一個 tx —— 這依賴 Ledger.ApplyInTx(外部傳入 tx)。activity 仍只透過 interface 動錢,邊界沒破。
+type ActivityBet struct {
+	ID                  int64
+	PublicID            string
+	TournamentID        int64
+	UserID              int64
+	Stake               int64
+	PotentialPayout     int64
+	Status              string
+	LedgerStakeEntryID  *int64
+	LedgerRefundEntryID *int64
+	PayoutRecalculated  bool
+	SettledAt           *time.Time
+	CreatedAt           time.Time
+}
+
+// 串關的每一腿。同輪比賽彼此不共用選手,所以各腿天然無相關 —— 單淘汰的結構性保證。棄賽時該腿標 void 並從乘積中移除,剩餘腿仍用各自鎖定的 odds_milli 重算。
+type ActivityBetLeg struct {
+	ID        int64
+	BetID     int64
+	MatchID   int64
+	Side      int16
+	OddsMilli int64
+	Result    string
+}
+
+// 跨屆選手檔案,以遊戲ID 為自然鍵。與 tournament_players 的分工:這裡是跨屆聚合,那裡是報名當下的快照 —— 因為「段位一經確認即為本屆計算依據」,本屆段位不能被下屆覆寫。
+type ActivityFencer struct {
+	ID                int64
+	PublicID          string
+	GameID            string
+	UserID            *int64
+	DiscordName       *string
+	LastRankLevel     *int16
+	LastRankedAt      *time.Time
+	TournamentsPlayed int32
+	Wins              int32
+	Losses            int32
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+}
+
+// 讓武項目:低段位者花 BP 施加在高段位者身上的正式比賽限制。與 platform 的收藏品是不同概念 —— 不可交易、逐屆定義、只在賽內有意義。
+type ActivityHandicapItem struct {
+	ID           int64
+	TournamentID int64
+	// 系統刻意不做互斥檢查(09-12 定案)。victory 類同時選多項會互相矛盾,但那由裁判臨場判 —— 前端只給非阻擋式提示,不擋購買。
+	Category    string
+	Name        string
+	Description *string
+	RefereeNote *string
+	Cost        int64
+	Repeatable  bool
+	SortOrder   int32
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+// 每次購買一列。退費只是 BP 內部的事(改 spent + 標 voided),不經 Ledger。外鍵指向 match_budgets 的複合鍵 —— 沒有預算的人連一列都插不進來。
+type ActivityHandicapSelection struct {
+	ID         int64
+	PublicID   string
+	MatchID    int64
+	PlayerID   int64
+	ItemID     int64
+	Cost       int64
+	TargetNote *string
+	Voided     bool
+	CreatedAt  time.Time
+}
+
+// 單淘汰賽程樹。round 1 = 首輪,slot 為該輪內 0-based 位置。同輪比賽彼此不共用選手 —— 這是串關天然無相關的結構性保證,不需要特判。
+type ActivityMatch struct {
+	ID               int64
+	PublicID         string
+	TournamentID     int64
+	Round            int32
+	Slot             int32
+	P1PlayerID       *int64
+	P2PlayerID       *int64
+	WinnerPlayerID   *int64
+	Status           string
+	HandicapOpen     bool
+	HandicapLockedAt *time.Time
+	StreamUrl        *string
+	ResultKind       string
+	StartedAt        *time.Time
+	FinishedAt       *time.Time
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+}
+
+// BP 預算。每輪配對後依當下段位差重算發放,該場有效,賽後作廢 —— 不跨輪累積、不找零。不進平台帳本、不走 Ledger、不需冪等:它不是貨幣。
+type ActivityMatchBudget struct {
+	MatchID   int64
+	PlayerID  int64
+	Budget    int64
+	Spent     int64
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+type ActivityTournament struct {
+	ID          int64
+	PublicID    string
+	Slug        string
+	Name        string
+	CommunityID int64
+	// 階段限制一律在伺服器端驗證(requirePhase),前端變灰只是視覺。
+	Phase       string
+	Config      []byte
+	SignupBonus int64
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+type ActivityTournamentPlayer struct {
+	ID           int64
+	PublicID     string
+	TournamentID int64
+	FencerID     int64
+	UserID       *int64
+	DisplayName  string
+	// 本屆評定段位,1=開山 2=斷水 3=飛花 4=無我。一經確認即為本屆計算 BP 的依據。進入 drawing 階段後不可再改 —— BP 依段位差算出,抽籤後改段位會讓已發的 match_budgets 對不上。
+	RankLevel        *int16
+	RankedAt         *time.Time
+	RankedBy         *int64
+	PasscodeHash     string
+	PasscodeIssuedAt time.Time
+	DiscordName      string
+	SelfRatedLevel   *int16
+	LadderRank       *string
+	LadderScore      *int32
+	ArtsNote         *string
+	AvailabilityNote *string
+	SeedNo           *int32
+	Status           string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+}
+
+// 觀眾投票,驅動浮動賠率。隱含機率 = (該方票數 + SMOOTHING) / (總票數 + 2×SMOOTHING);賠率 = (1 − VIG) / 隱含機率,夾在 [MIN_ODDS, MAX_ODDS]。參數在 tournaments.config。
+type ActivityVote struct {
+	ID        int64
+	MatchID   int64
+	UserID    int64
+	Side      int16
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
 type PlatformActivityDaily struct {
 	UserID        int64
 	CommunityID   int64

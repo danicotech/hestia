@@ -22,6 +22,7 @@ type Querier interface {
 	// XP 入帳後回填當日彙總。單獨一句是因為 XP 入帳走 xp.Service(自己開 tx),
 	// 不在事實那個 tx 裡(理由見 activitylogpg 的註解)。
 	AddActivityDailyXP(ctx context.Context, arg AddActivityDailyXPParams) error
+	AddPetXP(ctx context.Context, arg AddPetXPParams) (int64, error)
 	// 與 InsertXpEvent 同 tx;now() 為 tx 時間,與事件的 created_at 同值。
 	// level 不動:M1 曲線未上線,恆 0(schemas/06)
 	AddUserXp(ctx context.Context, arg AddUserXpParams) (int64, error)
@@ -87,11 +88,15 @@ type Querier interface {
 	// rotated_from 的子列指標由 FK 的 ON DELETE SET NULL 自動斷開,不會撞 FK。
 	CleanupSessions(ctx context.Context, retentionDays int32) (int64, error)
 	ClearChannelPurpose(ctx context.Context, arg ClearChannelPurposeParams) (int64, error)
+	CloseGiveaway(ctx context.Context, id int64) error
 	ClosePresenceSpan(ctx context.Context, arg ClosePresenceSpanParams) error
 	CloseReaction(ctx context.Context, arg CloseReactionParams) error
 	// 帶 joined_at 讓分區裁剪生效(voice_sessions 按 joined_at 分區)。
 	// COALESCE:補收尾的事件若沒帶靜音狀態,保留進場時記下的值。
 	CloseVoiceSession(ctx context.Context, arg CloseVoiceSessionParams) error
+	// 每日次數上限(schemas/25:20 次/人/日)。用 UTC 當日,與 XP 的 daily_cap 一致 ——
+	// 兩個「今天」用不同定義會讓人在某個時區看到兩者不同步。
+	CountDrawsToday(ctx context.Context, userID int64) (int64, error)
 	// per_user_limit 的計數口徑(schemas/08):未撤銷的 entitlements + 非 cancelled/rejected
 	// 的 redemptions。退款(撤銷)與被拒/取消的工單釋放額度。
 	CountUserItemAcquisitions(ctx context.Context, arg CountUserItemAcquisitionsParams) (int64, error)
@@ -104,12 +109,20 @@ type Querier interface {
 	// 目前唯一的呼叫端是 CLI。之後補管理 RPC 時直接複用這些查詢,
 	// 不要另外寫一份近義的 SQL(專案第 9 條)。
 	CreateCommunity(ctx context.Context, arg CreateCommunityParams) (CreateCommunityRow, error)
+	// ── 抽獎活動 ──────────────────────────────────────────────────
+	CreateGiveaway(ctx context.Context, arg CreateGiveawayParams) (CreateGiveawayRow, error)
 	CreateIdentity(ctx context.Context, arg CreateIdentityParams) (PlatformIdentity, error)
+	// 發到寵物時建狀態列。owner_id 是 item_instances.owner_id 的受控副本
+	// (複合外鍵保證一致),存它是為了「同時只能出戰一隻」那條部分唯一索引。
+	CreatePetState(ctx context.Context, arg CreatePetStateParams) error
 	CreateSpace(ctx context.Context, arg CreateSpaceParams) (CreateSpaceRow, error)
 	CreateUser(ctx context.Context, arg CreateUserParams) (PlatformUser, error)
+	// 條件帶 remaining > 0:就算呼叫端算錯,DB 也不會讓它變成負數。
+	DecrementLootBoxItem(ctx context.Context, id int64) (int64, error)
 	// ══ 訊息舊版本 ══
 	// 刪除沒有可靠的事件時間(Discord 不給),所以冪等改用「一則訊息只會被刪一次」。
 	DeletionRevisionExists(ctx context.Context, messageID string) (bool, error)
+	DeployPet(ctx context.Context, arg DeployPetParams) (int64, error)
 	// 編輯用 (message_id, captured_at):Discord 的 edited_timestamp 重送時穩定,
 	// 而同一則訊息可以被編輯很多次,不能只用 message_id。
 	EditRevisionExists(ctx context.Context, arg EditRevisionExistsParams) (bool, error)
@@ -127,6 +140,8 @@ type Querier interface {
 	EnsureSpaceChannel(ctx context.Context, arg EnsureSpaceChannelParams) error
 	// 與 EnsureBalanceRow 同模式:先保證投影列存在,才能 FOR UPDATE 串行化同 user 的併發入帳
 	EnsureUserXpRow(ctx context.Context, arg EnsureUserXpRowParams) error
+	// 一人一次靠 UNIQUE 擋,不靠應用層先查再寫(那有競態,而且是兩份真相)。
+	EnterGiveaway(ctx context.Context, arg EnterGiveawayParams) (int64, error)
 	// 毒訊息終止:重試次數用完、可見性也逾時了(= 沒有人正在處理它),
 	// 標成 failed 讓它離開待送佇列。
 	//
@@ -152,6 +167,8 @@ type Querier interface {
 	GetDailyState(ctx context.Context, userID int64) (PlatformUserDailyState, error)
 	// 出戰中的寵物。一個人最多一隻(部分唯一索引保證),查無列 = 沒有出戰寵物。
 	GetDeployedPet(ctx context.Context, ownerID int64) (GetDeployedPetRow, error)
+	GetDeployedPetID(ctx context.Context, ownerID int64) (GetDeployedPetIDRow, error)
+	GetGiveawayByPublicID(ctx context.Context, publicID string) (GetGiveawayByPublicIDRow, error)
 	// manual 購買的押款分錄 ref 指向 redemption;免費 manual 商品沒有分錄 → no rows。
 	GetHoldEntryForRedemption(ctx context.Context, refID *int64) (GetHoldEntryForRedemptionRow, error)
 	GetIdempotencyKey(ctx context.Context, key string) (PlatformIdempotencyKey, error)
@@ -177,8 +194,11 @@ type Querier interface {
 	// UNIQUE(provider, provider_user_id),必須讓應用層看見並明確拒絕,
 	// 而不是查不到就再建一個 user(那會撞唯一鍵)。
 	GetLoginIdentity(ctx context.Context, arg GetLoginIdentityParams) (GetLoginIdentityRow, error)
+	// ── 開箱 ──────────────────────────────────────────────────────
+	GetLootBoxByPublicID(ctx context.Context, publicID string) (GetLootBoxByPublicIDRow, error)
 	// 查無列 = 從未設定 = false(不退出)。
 	GetOptOutLogging(ctx context.Context, userID int64) (bool, error)
+	GetPetByPublicID(ctx context.Context, publicID string) (GetPetByPublicIDRow, error)
 	// ══ Presence ══
 	GetPresenceSpan(ctx context.Context, arg GetPresenceSpanParams) (GetPresenceSpanRow, error)
 	// Purchase 把扣款分錄的 ref 指向 entitlement(ref_type='entitlement', ref_id=權益 id),
@@ -258,6 +278,8 @@ type Querier interface {
 	GetXpEventType(ctx context.Context, key string) (GetXpEventTypeRow, error)
 	// 發一件物品。bound 跟著定義走:成就類的東西不該能轉手賣掉。
 	GrantItemByDefinitionPublicID(ctx context.Context, arg GrantItemByDefinitionPublicIDParams) (GrantItemByDefinitionPublicIDRow, error)
+	// 開箱與抽獎共用的發物品路徑。
+	GrantItemToUser(ctx context.Context, arg GrantItemToUserParams) (GrantItemToUserRow, error)
 	// source='level_reward':與 manual / provider_sync 分開,身分組同步撤銷時
 	// 不會誤刪里程碑發出去的角色。
 	GrantRoleByPublicID(ctx context.Context, arg GrantRoleByPublicIDParams) (int64, error)
@@ -266,6 +288,15 @@ type Querier interface {
 	IncrementReplyCount(ctx context.Context, messageID string) error
 	// reason NOT NULL 是刻意的:強迫動作當下寫理由(schemas/03)
 	InsertAdminAudit(ctx context.Context, arg InsertAdminAuditParams) (int64, error)
+	// 小遊戲、開箱、抽獎、寵物的查詢(schemas/25)。
+	//
+	// 檔名是 play 不是 chance:抽獎(giveaway)本身沒有隨機以外的共通點,
+	// 但這四個功能在使用者眼裡是同一件事 ——「可以玩的東西」。
+	//
+	// 注意:activity_ 前綴保留給活動層(themis),這裡不使用。
+	// ── 抽籤留痕(三處共用)───────────────────────────────────────
+	// 每一次隨機都要留痕:產出速率、黑箱質疑、賠率變更的稽核都靠它。
+	InsertChanceDraw(ctx context.Context, arg InsertChanceDrawParams) (InsertChanceDrawRow, error)
 	// 調整 = 插新列(必帶 created_by;seed 列 created_by 為 NULL)
 	InsertConfig(ctx context.Context, arg InsertConfigParams) (PlatformEconomyConfig, error)
 	// 聚合規則:同 space + channel + thread,相鄰(合格)訊息間隔超過 chunk_gap_minutes 即斷開。
@@ -405,6 +436,10 @@ type Querier interface {
 	// include_delisted 只放寬 delisted_at 那一段:從未上架(listed_at IS NULL)與
 	// 上架時間未到的商品是草稿,任何情況都不對外露出。
 	ListListedItems(ctx context.Context, arg ListListedItemsParams) ([]ListListedItemsRow, error)
+	ListLootBoxes(ctx context.Context, communityID int64) ([]ListLootBoxesRow, error)
+	ListOpenGiveaways(ctx context.Context, communityID int64) ([]ListOpenGiveawaysRow, error)
+	// ── 寵物 ──────────────────────────────────────────────────────
+	ListPets(ctx context.Context, ownerID int64) ([]ListPetsRow, error)
 	ListSpaceChannels(ctx context.Context, spaceID int64) ([]ListSpaceChannelsRow, error)
 	ListSpacePurposes(ctx context.Context, spaceID int64) ([]ListSpacePurposesRow, error)
 	ListSpaces(ctx context.Context) ([]ListSpacesRow, error)
@@ -480,6 +515,8 @@ type Querier interface {
 	// WHERE 條件正中既有部分索引 (expires_at) WHERE revoked_at IS NULL AND expires_at IS NOT NULL。
 	// external_role_id:auto_role 商品的 Discord 身分組,消費端收回身分組要用。
 	LockExpiredEntitlements(ctx context.Context, limit int32) ([]LockExpiredEntitlementsRow, error)
+	// 開獎要序列化:兩個人同時按開獎會抽出兩組贏家,而獎品只有一份。
+	LockGiveawayForDraw(ctx context.Context, id int64) (LockGiveawayForDrawRow, error)
 	LockItemInstanceByID(ctx context.Context, id int64) (LockItemInstanceByIDRow, error)
 	// FOR UPDATE OF i:只鎖實例列(同一件物品的掛單串行化),不鎖共享讀的定義列。
 	LockItemInstanceByPublicID(ctx context.Context, publicID string) (LockItemInstanceByPublicIDRow, error)
@@ -489,6 +526,9 @@ type Querier interface {
 	// db_now 一併回傳:過期比對用 DB 時鐘,避免 app/DB 時鐘偏移誤判。
 	LockListingByID(ctx context.Context, id int64) (LockListingByIDRow, error)
 	LockListingByPublicID(ctx context.Context, publicID string) (LockListingByPublicIDRow, error)
+	// **FOR UPDATE**:有限獎池的 remaining 要在同一個 transaction 裡讀了再扣,
+	// 否則兩個人同時抽最後一件,兩個人都會拿到。
+	LockLootBoxItems(ctx context.Context, boxID int64) ([]LockLootBoxItemsRow, error)
 	// FOR UPDATE OF r:同一工單的 approve / reject / cancel 串行化,
 	// 後到者看到非 pending 即拒絕(狀態機單向)。
 	LockRedemptionForHandle(ctx context.Context, id int64) (LockRedemptionForHandleRow, error)
@@ -520,6 +560,7 @@ type Querier interface {
 	// 單一時鐘來源,app/DB 時鐘偏移不影響判斷
 	LockUserXp(ctx context.Context, arg LockUserXpParams) (LockUserXpRow, error)
 	MaintenanceUnlock(ctx context.Context, jobName string) error
+	MarkGiveawayWinners(ctx context.Context, arg MarkGiveawayWinnersParams) (int64, error)
 	// 刪除事件同時在 message_logs 打上 deleted_at(欄位本來就是為此存在)。
 	// 沒有那一列(頻道沒開白名單)時什麼都不做。
 	MarkMessageDeleted(ctx context.Context, arg MarkMessageDeletedParams) error
@@ -549,6 +590,9 @@ type Querier interface {
 	// 一次掃描三個數字——分三句查會在三個時點看到三份不一致的快照。
 	// 沒有 pending 時年齡回 0(NULL 會逼呼叫端處理一個沒有意義的空值)。
 	OutboxBacklog(ctx context.Context) (OutboxBacklogRow, error)
+	// 隨機取 N 位。random() 在這裡夠用:抽獎的公平性由「誰都不能改參加名單」
+	// 保證(UNIQUE + append),不是由亂數品質保證;而且結果會連同 seed 進 chance_draws。
+	PickGiveawayWinners(ctx context.Context, arg PickGiveawayWinnersParams) ([]PickGiveawayWinnersRow, error)
 	// 投影重算:xp ← SUM(events)、last_xp_at ← MAX(created_at),整個投影可從事實重建。
 	// 呼叫前必須已 LockUserXp,否則與並行 Award 有覆寫競態(先算 SUM、後拿鎖會蓋掉新事件)
 	RebuildUserXp(ctx context.Context, arg RebuildUserXpParams) (int64, error)
@@ -561,6 +605,7 @@ type Querier interface {
 	// 而那個總和幾乎永遠不等於任何單一列的 balance —— 對帳會變成全表誤報,
 	// 比不對帳更糟(沒有人會再相信它)。
 	ReconcileBalances(ctx context.Context) ([]ReconcileBalancesRow, error)
+	RenamePet(ctx context.Context, arg RenamePetParams) (int64, error)
 	// 取消後又按回來:復用同一列。activity_daily.reactions **不再加一次** ——
 	// 否則按了取消再按就是無限刷參與度。
 	ReopenReaction(ctx context.Context, arg ReopenReactionParams) error
@@ -634,6 +679,8 @@ type Querier interface {
 	SetUserTimezone(ctx context.Context, arg SetUserTimezoneParams) (SetUserTimezoneRow, error)
 	// 對帳 job 用:驗證 SUM(entries) = balance
 	SumEntriesForUser(ctx context.Context, arg SumEntriesForUserParams) (int64, error)
+	// 產出速率:這段時間系統淨吐出多少點。負數 = 淨回收(水槽正常運作)。
+	SumFaucetSince(ctx context.Context, arg SumFaucetSinceParams) (int64, error)
 	// daily_cap 判斷:UTC 當日該 user 該 community 該 source 的總和(schemas/01 A)。
 	// 呼叫前必須已 LockUserXp,同 user 的併發入帳已串行化,SUM 不會低估
 	SumXpTodayBySource(ctx context.Context, arg SumXpTodayBySourceParams) (int64, error)
@@ -646,6 +693,9 @@ type Querier interface {
 	// session-level advisory lock:同名 job 多實例只有一個能跑,拿不到就跳過本輪。
 	// 必須在同一條連線上執行 TryMaintenanceLock / MaintenanceUnlock(排程器用 pool.Acquire 釘住連線)。
 	TryMaintenanceLock(ctx context.Context, jobName string) (bool, error)
+	// 換出戰前先全部收起來。部分唯一索引保證「同時只有一隻」,
+	// 但那是最後防線 —— 直接撞索引會得到約束錯誤而不是可讀訊息。
+	UndeployAllPets(ctx context.Context, ownerID int64) error
 	// 取消掛單時解鎖;只解本掛單放的鎖,不會誤解別人的。
 	UnlockItemInstance(ctx context.Context, arg UnlockItemInstanceParams) (int64, error)
 	UpdateIdentityTokens(ctx context.Context, arg UpdateIdentityTokensParams) error

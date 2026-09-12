@@ -38,12 +38,23 @@ const (
 	ReasonBetRefund        Reason = "bet_refund"
 	ReasonTournamentPrize  Reason = "tournament_prize"
 	ReasonEventReward      Reason = "event_reward"
+	// 小遊戲與開箱(schemas/25)。投注與回收分成兩筆,不記淨額:
+	// 對帳時「這個月遊戲收了多少、吐了多少」要分得出來,
+	// 只記淨額的話那兩個數字永遠算不出來。
+	ReasonGameStake     Reason = "game_stake"
+	ReasonGamePayout    Reason = "game_payout"
+	ReasonBoxOpen       Reason = "box_open"
+	ReasonBoxReward     Reason = "box_reward"
+	ReasonGiveawayEntry Reason = "giveaway_entry"
+	ReasonGiveawayPrize Reason = "giveaway_prize"
 )
 
 var validReasons = map[Reason]struct{}{
 	ReasonSignupBonus: {}, ReasonDailyClaim: {}, ReasonDailyMakeup: {},
 	ReasonAdminGrant: {}, ReasonAdminDeduct: {}, ReasonShopPurchase: {},
 	ReasonRefund: {}, ReasonRedemptionHold: {}, ReasonRedemptionRefund: {},
+	ReasonGameStake: {}, ReasonGamePayout: {}, ReasonBoxOpen: {}, ReasonBoxReward: {},
+	ReasonGiveawayEntry: {}, ReasonGiveawayPrize: {},
 	ReasonMarketPurchase: {}, ReasonMarketSaleIncome: {}, ReasonMarketFee: {},
 	ReasonTradeSettle: {}, ReasonBetStake: {}, ReasonBetPayout: {},
 	ReasonBetRefund: {}, ReasonTournamentPrize: {}, ReasonEventReward: {},

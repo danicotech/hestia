@@ -213,7 +213,19 @@ func (s *Service) run(
 		return nil, false, fmt.Errorf("更新 user_xp: %w", err)
 	}
 
-	// ── 7. 升級偵測(schemas/24)──
+	// ── 7. 出戰寵物同步入帳(schemas/25 Q11)──
+	//
+	// 「各自獨立但同時漲」:同一個活動事件給使用者與當前出戰寵物各自的 XP。
+	// 共用一條的話,換一隻寵物還是同等級,養不養都一樣,沒有人會在意。
+	//
+	// 只有正數才給寵物:admin 手動扣減是針對人的修正,不該連坐寵物。
+	if award > 0 {
+		if err := s.awardDeployedPet(ctx, qtx, p, award); err != nil {
+			return nil, false, err
+		}
+	}
+
+	// ── 8. 升級偵測(schemas/24)──
 	//
 	// 等級是 XP 的純函數,所以「升級了沒」就是入帳前後各算一次。
 	// 用區間而不是單一新等級:語音一次入帳可能跨兩級以上,
@@ -313,6 +325,51 @@ func validate(p xp.AwardParams) error {
 		// 負數只允許 admin 手動修正(schemas/06 增補 E);一般 emitter 沒有扣 XP 的
 		// 正當理由 —— XP 只增不減是設計核心,負數流入等於繞過它(QA 中2)
 		return fmt.Errorf("source %q 不允許負數 amount: %w", p.Source, xp.ErrInvalidParams)
+	}
+	return nil
+}
+
+// awardDeployedPet 給出戰中的寵物同一份 XP,並在跨級時發事件。
+//
+// 沒有出戰寵物是常態(多數人一開始都沒有),所以查不到不是錯誤。
+// 寵物用**預設曲線**:牠的 XP 來源跨社群,綁其中一個社群的規則沒有道理。
+func (s *Service) awardDeployedPet(
+	ctx context.Context, qtx *db.Queries, p xp.AwardParams, award int64,
+) error {
+	pet, err := qtx.GetDeployedPetID(ctx, p.UserID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("查出戰寵物: %w", err)
+	}
+	newXP, err := qtx.AddPetXP(ctx, db.AddPetXPParams{ItemInstanceID: pet.ItemInstanceID, Xp: award})
+	if err != nil {
+		return fmt.Errorf("寵物入帳: %w", err)
+	}
+
+	var cfg xp.Config
+	from := cfg.ProgressFor(pet.Xp).Level
+	to := cfg.ProgressFor(newXP).Level
+	if to <= from {
+		return nil
+	}
+	payload, err := json.Marshal(map[string]any{
+		"user_id":      p.UserID,
+		"community_id": p.CommunityID,
+		"subject":      "pet",
+		"from_level":   from,
+		"to_level":     to,
+	})
+	if err != nil {
+		return fmt.Errorf("序列化寵物升級事件: %w", err)
+	}
+	for _, topic := range []string{notification.TopicLevelUp, notification.TopicLevelReward} {
+		if _, err := qtx.InsertOutboxEvent(ctx, db.InsertOutboxEventParams{
+			Topic: topic, Payload: payload,
+		}); err != nil {
+			return fmt.Errorf("寫寵物 %s 事件: %w", topic, err)
+		}
 	}
 	return nil
 }
