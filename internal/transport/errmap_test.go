@@ -13,9 +13,11 @@ import (
 
 	platformv1 "github.com/danicotech/hestia/gen/hestia/platform/v1"
 	"github.com/danicotech/hestia/gen/hestia/platform/v1/platformv1connect"
+	"github.com/danicotech/hestia/internal/core/activity/activityerr"
 	"github.com/danicotech/hestia/internal/core/activity/betting"
 	"github.com/danicotech/hestia/internal/core/activity/handicap"
 	"github.com/danicotech/hestia/internal/core/activity/match"
+	"github.com/danicotech/hestia/internal/core/activity/prize"
 	"github.com/danicotech/hestia/internal/core/activity/signup"
 	"github.com/danicotech/hestia/internal/core/activity/tournament"
 	"github.com/danicotech/hestia/internal/core/platform/activitylog"
@@ -159,7 +161,7 @@ func TestToConnectError(t *testing.T) {
 
 		// 活動層:比賽生命週期
 		{match.ErrInvalidRequest, connect.CodeInvalidArgument},
-		{match.ErrMatchNotFound, connect.CodeNotFound},
+		{activityerr.ErrMatchNotFound, connect.CodeNotFound},
 		{match.ErrConfirmationRequired, connect.CodeInvalidArgument},
 		{match.ErrWinnerNotInMatch, connect.CodeInvalidArgument},
 		{match.ErrNotReady, connect.CodeFailedPrecondition},
@@ -169,9 +171,16 @@ func TestToConnectError(t *testing.T) {
 		{match.ErrAlreadyOpen, connect.CodeFailedPrecondition},
 		{match.ErrAlreadyWithdrawn, connect.CodeAlreadyExists},
 		{match.ErrPlayerWithdrawn, connect.CodeFailedPrecondition},
-		{match.ErrPlayersNotSet, connect.CodeFailedPrecondition},
+		{activityerr.ErrPlayersNotSet, connect.CodeFailedPrecondition},
 		{match.ErrBracketMissing, connect.CodeInternal},
 		{match.ErrAdvanceTargetMissing, connect.CodeInternal},
+
+		// 活動層:賽事獎金
+		{prize.ErrInvalidRequest, connect.CodeInvalidArgument},
+		{prize.ErrThirdPlaceUndecidable, connect.CodeFailedPrecondition},
+		{prize.ErrFinalNotDecided, connect.CodeFailedPrecondition},
+		{prize.ErrBracketBroken, connect.CodeInternal},
+		{prize.ErrLedgerStateConflict, connect.CodeInternal},
 
 		{errMixedCredentials, connect.CodePermissionDenied},
 		{errServiceOnUserRPC, connect.CodePermissionDenied},

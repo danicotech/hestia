@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/danicotech/hestia/internal/core/activity/activityerr"
 )
 
 // fakeRepo 是記憶體版 Repository。
@@ -95,7 +97,7 @@ func (f *fakeRepo) LockMatch(ctx context.Context, matchPublicID string) (*Match,
 func (f *fakeRepo) GetMatch(_ context.Context, matchPublicID string) (*Match, error) {
 	m, ok := f.matches[matchPublicID]
 	if !ok {
-		return nil, ErrMatchNotFound
+		return nil, activityerr.ErrMatchNotFound
 	}
 	cp := *m
 	return &cp, nil
@@ -246,7 +248,7 @@ func (f *fakeRepo) InsertSelection(ctx context.Context, ns NewSelection) (*Selec
 	}
 	m := f.matchByID(ns.MatchID)
 	if m == nil {
-		return nil, ErrMatchNotFound
+		return nil, activityerr.ErrMatchNotFound
 	}
 	// 對應 handicap_selections_budget_fkey:沒有預算的人連一列都插不進來。
 	if _, err := f.GetBudget(ctx, ns.MatchID, ns.PlayerID); err != nil {
@@ -285,7 +287,7 @@ func (f *fakeRepo) MarkSelectionVoided(_ context.Context, selectionID int64) err
 func (f *fakeRepo) LockHandicaps(_ context.Context, matchID int64, at time.Time) error {
 	m := f.matchByID(matchID)
 	if m == nil {
-		return ErrMatchNotFound
+		return activityerr.ErrMatchNotFound
 	}
 	m.HandicapOpen = false
 	m.LockedAt = &at

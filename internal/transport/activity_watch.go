@@ -11,7 +11,6 @@ import (
 
 	activityv1 "github.com/danicotech/hestia/gen/hestia/activity/v1"
 	"github.com/danicotech/hestia/gen/hestia/activity/v1/activityv1connect"
-	"github.com/danicotech/hestia/internal/core/activity/betting"
 	"github.com/danicotech/hestia/internal/core/activity/watch"
 )
 
@@ -212,8 +211,13 @@ func watchUpdateToProto(u watch.Update) *activityv1.WatchTournamentResponse {
 		if u.Odds == nil {
 			return nil
 		}
+		odds := matchOddsToProto(*u.Odds)
+		// 推播是廣播,my_vote 不可能因人而異。解析端本來就不填它,這裡再
+		// 明確歸零一次 —— 這是「不要把某個人的投票送給所有人」的最後一道
+		// 保險,成本只有一行。
+		odds.MyVote = 0
 		out.Update = &activityv1.WatchTournamentResponse_Odds{
-			Odds: &activityv1.OddsUpdate{Odds: watchOddsToProto(u.Odds)},
+			Odds: &activityv1.OddsUpdate{Odds: odds},
 		}
 	case watch.KindPhase:
 		out.Update = &activityv1.WatchTournamentResponse_Phase{
@@ -238,21 +242,4 @@ func watchUpdateToProto(u watch.Update) *activityv1.WatchTournamentResponse {
 		return nil
 	}
 	return out
-}
-
-// watchOddsToProto 把賠率檢視轉成 proto。
-//
-// 名字帶 watch 前綴是暫時的:BettingService 的 GetOdds 需要一模一樣的轉換,
-// 那支 handler 落地時這兩個應該合成一個(整合時處理,見回報)。
-// 差別只有一個 —— 這裡的 my_vote 恆為 0,因為推播是廣播,不可能因人而異。
-func watchOddsToProto(o *betting.MatchOdds) *activityv1.MatchOdds {
-	return &activityv1.MatchOdds{
-		MatchPublicId: o.MatchPublicID,
-		P1Votes:       int32(o.P1Votes),
-		P2Votes:       int32(o.P2Votes),
-		P1OddsMilli:   o.P1OddsMilli,
-		P2OddsMilli:   o.P2OddsMilli,
-		OpenForBets:   o.OpenForBets,
-		MyVote:        0,
-	}
 }

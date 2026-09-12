@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/danicotech/hestia/internal/core/activity/activityerr"
 	"github.com/danicotech/hestia/internal/core/activity/handicap"
 	"github.com/danicotech/hestia/internal/core/activity/match"
 	"github.com/danicotech/hestia/internal/core/activity/tournament"
@@ -173,7 +174,7 @@ func TestNotFound(t *testing.T) {
 		_, err := f.repo.LockMatch(ctx, tx, "不存在的場次")
 		return err
 	})
-	if !errors.Is(err, match.ErrMatchNotFound) {
+	if !errors.Is(err, activityerr.ErrMatchNotFound) {
 		t.Fatalf("LockMatch 查無應回 ErrMatchNotFound,得到 %v", err)
 	}
 
@@ -197,7 +198,7 @@ func TestNotFound(t *testing.T) {
 		_, err := f.repo.LockMatchAt(ctx, tx, f.id, 9, 9)
 		return err
 	})
-	if !errors.Is(err, match.ErrMatchNotFound) {
+	if !errors.Is(err, activityerr.ErrMatchNotFound) {
 		t.Fatalf("LockMatchAt 查無應回 ErrMatchNotFound,得到 %v", err)
 	}
 }
@@ -223,15 +224,15 @@ func TestZeroRowAttribution(t *testing.T) {
 		want error
 		run  func(ctx context.Context, tx pgx.Tx) error
 	}{
-		{"開盤", match.ErrMatchNotFound, func(ctx context.Context, tx pgx.Tx) error {
+		{"開盤", activityerr.ErrMatchNotFound, func(ctx context.Context, tx pgx.Tx) error {
 			_, err := f.repo.MarkReady(ctx, tx, match.ReadyWrite{MatchID: missing, ActorUserID: f.judge})
 			return err
 		}},
-		{"開打", match.ErrMatchNotFound, func(ctx context.Context, tx pgx.Tx) error {
+		{"開打", activityerr.ErrMatchNotFound, func(ctx context.Context, tx pgx.Tx) error {
 			_, err := f.repo.MarkLive(ctx, tx, match.LiveWrite{MatchID: missing, ActorUserID: f.judge})
 			return err
 		}},
-		{"判定勝負", match.ErrMatchNotFound, func(ctx context.Context, tx pgx.Tx) error {
+		{"判定勝負", activityerr.ErrMatchNotFound, func(ctx context.Context, tx pgx.Tx) error {
 			_, err := f.repo.MarkFinished(ctx, tx, match.FinishWrite{
 				MatchID: missing, WinnerPlayerID: a.id,
 				ResultKind: match.ResultNormal, ActorUserID: f.judge,

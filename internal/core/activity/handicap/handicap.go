@@ -279,12 +279,8 @@ type MatchHandicaps struct {
 var (
 	// ErrInvalidRequest 表示請求參數不合法(缺 id、target_note 過長等)。
 	ErrInvalidRequest = errors.New("請求參數不合法")
-	// ErrMatchNotFound 表示場次不存在。
-	ErrMatchNotFound = errors.New("場次不存在")
 	// ErrItemNotFound 表示讓武項目不存在,或不屬於這場比賽所在的賽事。
 	ErrItemNotFound = errors.New("讓武項目不存在")
-	// ErrPlayersNotSet 表示雙方尚未確定(等上一輪),還不能發預算。
-	ErrPlayersNotSet = errors.New("場次雙方尚未確定")
 	// ErrHandicapNotOpen 表示裁判尚未開盤。
 	ErrHandicapNotOpen = errors.New("讓武尚未開盤")
 	// ErrHandicapClosed 表示該場狀態不允許選購(如 pending、live、done)。
@@ -335,9 +331,9 @@ type Repository interface {
 	//
 	// matches 列是讓武的**序列化點**:選購、退選、封盤彼此互斥,
 	// 因此不會出現「檢查時還沒封盤、寫入時已經封盤」的縫隙,
-	// 也不會有兩次連點同時通過餘額檢查。找不到時回 ErrMatchNotFound。
+	// 也不會有兩次連點同時通過餘額檢查。找不到時回 activityerr.ErrMatchNotFound。
 	LockMatch(ctx context.Context, matchPublicID string) (*Match, error)
-	// GetMatch 是唯讀路徑用的無鎖版本。找不到時回 ErrMatchNotFound。
+	// GetMatch 是唯讀路徑用的無鎖版本。找不到時回 activityerr.ErrMatchNotFound。
 	GetMatch(ctx context.Context, matchPublicID string) (*Match, error)
 
 	// ListItems 列出某屆的全部讓武項目,依 category、sort_order 排序。

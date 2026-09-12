@@ -187,10 +187,6 @@ var (
 	ErrInvalidRequest = errors.New("請求參數不合法")
 	// ErrConfirmationRequired 表示不可逆動作沒帶 confirm。
 	ErrConfirmationRequired = errors.New("這是不可逆的動作,需要二次確認")
-	// ErrMatchNotFound 表示場次不存在。
-	ErrMatchNotFound = errors.New("場次不存在")
-	// ErrPlayersNotSet 表示雙方尚未確定(等上一輪),還不能開盤。
-	ErrPlayersNotSet = errors.New("場次雙方尚未確定")
 	// ErrPlayerWithdrawn 表示場上有一方已棄賽,這場不該再走正常流程。
 	ErrPlayerWithdrawn = errors.New("場上有一方已棄賽")
 	// ErrAlreadyOpen 表示重複開盤。開盤會發提醒公告,默默成功等於再公告一次。
@@ -343,9 +339,9 @@ type Repository[TX any] interface {
 	//
 	// matches 列是整條生命週期的**序列化點**:裁判連點兩次「判定勝負」、
 	// 或一邊開打一邊封盤,都在這裡排成序。與 handicap 用的是同一列鎖,
-	// 所以「一邊買讓武一邊封盤」也一併被擋住。查無回 ErrMatchNotFound。
+	// 所以「一邊買讓武一邊封盤」也一併被擋住。查無回 activityerr.ErrMatchNotFound。
 	LockMatch(ctx context.Context, tx TX, matchPublicID string) (*Match, error)
-	// LockMatchAt 依位置讀晉級目標並鎖住該列。查無回 ErrMatchNotFound。
+	// LockMatchAt 依位置讀晉級目標並鎖住該列。查無回 activityerr.ErrMatchNotFound。
 	//
 	// 取鎖順序恆為 round 遞增(晉級只會往後走),不會與自己形成環。
 	LockMatchAt(ctx context.Context, tx TX, tournamentID int64, round, slot int) (*Match, error)

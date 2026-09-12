@@ -328,10 +328,6 @@ type IdempotencyRecord struct {
 var (
 	// ErrInvalidRequest 表示請求參數不合法(缺冪等鍵、stake ≤ 0、side 不是 1/2 等)。
 	ErrInvalidRequest = errors.New("請求參數不合法")
-	// ErrTournamentNotFound 表示賽事不存在。
-	ErrTournamentNotFound = errors.New("賽事不存在")
-	// ErrMatchNotFound 表示場次不存在。
-	ErrMatchNotFound = errors.New("場次不存在")
 	// ErrMatchNotInTournament 表示場次不屬於這一屆賽事。
 	ErrMatchNotInTournament = errors.New("場次不屬於這屆賽事")
 	// ErrVotingClosed 表示這場已經不能投票(未開盤或已開賽)。
@@ -380,7 +376,7 @@ type Repository[TX any] interface {
 	// 兩場各自的 advisory lock 擋不住彼此,只有注單列鎖擋得住。
 	LockBets(ctx context.Context, tx TX, betIDs []int64) error
 
-	// TournamentBySlug 找不到回 (nil, nil) —— 由 Service 轉成 ErrTournamentNotFound,
+	// TournamentBySlug 找不到回 (nil, nil) —— 由 Service 轉成 tournament.ErrTournamentNotFound,
 	// 實作端不必知道 core 的錯誤語意。
 	TournamentBySlug(ctx context.Context, tx TX, slug string) (*Tournament, error)
 	// OddsConfig 讀 tournaments.config 的賠率參數。缺值可回零值,由 Normalize 補預設。

@@ -39,6 +39,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/danicotech/hestia/internal/core/activity/activityerr"
 	"github.com/danicotech/hestia/internal/core/activity/match"
 	"github.com/danicotech/hestia/internal/core/activity/tournament"
 	"github.com/danicotech/hestia/internal/core/activity/watch"
@@ -98,7 +99,7 @@ func (s *Service) LockMatch(ctx context.Context, tx pgx.Tx, matchPublicID string
 	row, err := q.LockMatchForJudge(ctx, matchPublicID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, fmt.Errorf("match=%s: %w", matchPublicID, match.ErrMatchNotFound)
+			return nil, fmt.Errorf("match=%s: %w", matchPublicID, activityerr.ErrMatchNotFound)
 		}
 		return nil, fmt.Errorf("鎖場次 %s: %w", matchPublicID, err)
 	}
@@ -119,7 +120,7 @@ func (s *Service) LockMatchAt(ctx context.Context, tx pgx.Tx, tournamentID int64
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, fmt.Errorf("tournament=%d round=%d slot=%d: %w",
-				tournamentID, round, slot, match.ErrMatchNotFound)
+				tournamentID, round, slot, activityerr.ErrMatchNotFound)
 		}
 		return nil, fmt.Errorf("鎖場次 tournament=%d round=%d slot=%d: %w",
 			tournamentID, round, slot, err)
@@ -133,7 +134,7 @@ func (s *Service) GetMatch(ctx context.Context, tx pgx.Tx, matchPublicID string)
 	row, err := s.q.WithTx(tx).GetMatchForJudge(ctx, matchPublicID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, fmt.Errorf("match=%s: %w", matchPublicID, match.ErrMatchNotFound)
+			return nil, fmt.Errorf("match=%s: %w", matchPublicID, activityerr.ErrMatchNotFound)
 		}
 		return nil, fmt.Errorf("讀場次 %s: %w", matchPublicID, err)
 	}
@@ -261,7 +262,7 @@ func (s *Service) SetStreamURL(ctx context.Context, tx pgx.Tx, w match.StreamWri
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// 這一支沒有狀態閘門(賽後補 VOD 是常態),0 列只能是場次不存在。
-			return nil, fmt.Errorf("match id=%d: %w", w.MatchID, match.ErrMatchNotFound)
+			return nil, fmt.Errorf("match id=%d: %w", w.MatchID, activityerr.ErrMatchNotFound)
 		}
 		return nil, fmt.Errorf("設定直播連結 match=%d: %w", w.MatchID, err)
 	}
@@ -504,7 +505,7 @@ func (s *Service) attribute(ctx context.Context, q *db.Queries, matchID int64, s
 				// 晉級目標整場不見了 = 對戰表被刪了一半,service 要的是這個錯誤。
 				return fmt.Errorf("match id=%d: %w", matchID, match.ErrAdvanceTargetMissing)
 			}
-			return fmt.Errorf("match id=%d: %w", matchID, match.ErrMatchNotFound)
+			return fmt.Errorf("match id=%d: %w", matchID, activityerr.ErrMatchNotFound)
 		}
 		return fmt.Errorf("重讀場次 id=%d: %w", matchID, err)
 	}

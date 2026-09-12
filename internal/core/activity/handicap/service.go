@@ -8,6 +8,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/danicotech/hestia/internal/core/activity/activityerr"
 	"github.com/danicotech/hestia/internal/core/activity/bp"
 )
 
@@ -89,7 +90,7 @@ func (s *Service) GrantBudget(ctx context.Context, matchPublicID string) (*Budge
 			return err
 		}
 		if m.P1PlayerID == 0 || m.P2PlayerID == 0 {
-			return ErrPlayersNotSet
+			return activityerr.ErrPlayersNotSet
 		}
 		// 已封盤之後才來發預算,代表叫用順序錯了。這時候發下去的 BP 永遠花不掉,
 		// 而前端會顯示一筆「有 16 BP 但不能用」的預算,比直接失敗更難查。

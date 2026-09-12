@@ -251,6 +251,11 @@ catch (e) {
 | `match_players_not_set` | failed_precondition | 場次雙方尚未確定(等上一輪),還不能開盤 |
 | `activity_bracket_missing` | internal | 這屆賽事尚未抽籤卻走到需要對戰表的路徑 |
 | `activity_advance_target_missing` | internal | 晉級目標場次不存在(對戰表壞了) |
+| `prize_invalid_request` | invalid_argument | 發獎參數不合法 |
+| `prize_third_place_undecidable` | failed_precondition | 設定了季軍獎金,但單淘汰沒有季軍賽推不出季軍 → **一毛不發**,要發得先加季軍賽 |
+| `prize_final_not_decided` | failed_precondition | 決賽尚未分出勝負,名次不成立 |
+| `prize_bracket_broken` | internal | 對戰表資料異常,無法決定名次 |
+| `prize_ledger_state_conflict` | internal | 帳本回應與預期不符 |
 | `not_found` | not_found | 泛用的查無此物(入口層 port) |
 | `unauthenticated` | unauthenticated | 沒有有效身分 |
 | `permission_denied` | permission_denied | 身分有效但無權執行 |

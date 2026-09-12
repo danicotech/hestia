@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/danicotech/hestia/internal/core/activity/activityerr"
 	"github.com/danicotech/hestia/internal/core/activity/bp"
 	"github.com/danicotech/hestia/internal/core/activity/handicap"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/handicappg"
@@ -259,7 +260,7 @@ func TestMatchRoundTrip(t *testing.T) {
 		t.Error("選手 public_id 不應為空")
 	}
 
-	if _, err := repo.GetMatch(ctx, "不存在"); !errors.Is(err, handicap.ErrMatchNotFound) {
+	if _, err := repo.GetMatch(ctx, "不存在"); !errors.Is(err, activityerr.ErrMatchNotFound) {
 		t.Errorf("查不存在的場次 err = %v,想要 ErrMatchNotFound", err)
 	}
 }

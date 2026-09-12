@@ -6,6 +6,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/danicotech/hestia/internal/core/activity/activityerr"
 	"github.com/danicotech/hestia/internal/core/activity/bp"
 	"github.com/danicotech/hestia/internal/core/activity/handicap"
 	"github.com/danicotech/hestia/internal/core/activity/tournament"
@@ -190,12 +191,12 @@ func TestOpenHandicapGates(t *testing.T) {
 		{
 			name:    "場次不存在",
 			params:  OpenHandicapParams{MatchPublicID: "M-NOPE", ActorUserID: judgeID},
-			wantErr: ErrMatchNotFound,
+			wantErr: activityerr.ErrMatchNotFound,
 		},
 		{
 			name:    "雙方未確定",
 			params:  OpenHandicapParams{MatchPublicID: "M-FINAL", ActorUserID: judgeID},
-			wantErr: ErrPlayersNotSet,
+			wantErr: activityerr.ErrPlayersNotSet,
 		},
 		{
 			name:    "重複開盤",

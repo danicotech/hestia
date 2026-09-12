@@ -13,6 +13,7 @@ import (
 
 	activityv1 "github.com/danicotech/hestia/gen/hestia/activity/v1"
 	"github.com/danicotech/hestia/gen/hestia/activity/v1/activityv1connect"
+	"github.com/danicotech/hestia/internal/core/activity/activityerr"
 	"github.com/danicotech/hestia/internal/core/activity/betting"
 	"github.com/danicotech/hestia/internal/core/activity/bp"
 	"github.com/danicotech/hestia/internal/core/activity/handicap"
@@ -213,7 +214,7 @@ func (f *fakeActivityReader) MatchByPublicID(_ context.Context, publicID string)
 	}
 	m, ok := f.matchByPublic[publicID]
 	if !ok {
-		return match.Match{}, match.ErrMatchNotFound
+		return match.Match{}, activityerr.ErrMatchNotFound
 	}
 	return m, nil
 }

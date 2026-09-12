@@ -81,7 +81,7 @@ type ActivityReader interface {
 	PlayerByPublicID(ctx context.Context, tournamentID int64, playerPublicID string) (tournament.Player, error)
 	// ListMatches 列出本屆全部場次,依 (round, slot) 遞增。尚未抽籤時回空切片。
 	ListMatches(ctx context.Context, tournamentID int64) ([]match.Match, error)
-	// MatchByPublicID 讀單場。查無回 match.ErrMatchNotFound。
+	// MatchByPublicID 讀單場。查無回 activityerr.ErrMatchNotFound。
 	MatchByPublicID(ctx context.Context, matchPublicID string) (match.Match, error)
 	// CurrentMatchOfPlayer 回這位選手目前輪到要打的場次;nil = 沒有待打的場次
 	// (已出局、已棄賽、或還沒抽籤)。

@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/danicotech/hestia/internal/core/activity/activityerr"
+	"github.com/danicotech/hestia/internal/core/activity/tournament"
 	"github.com/danicotech/hestia/internal/core/platform/ledger"
 	"github.com/danicotech/hestia/internal/shared/ulid"
 )
@@ -301,7 +303,7 @@ func (s *Service[TX]) placeBetInTx(ctx context.Context, tx TX, p PlaceBetParams)
 		return nil, fmt.Errorf("讀賽事 %s: %w", p.TournamentSlug, err)
 	}
 	if t == nil {
-		return nil, fmt.Errorf("slug=%s: %w", p.TournamentSlug, ErrTournamentNotFound)
+		return nil, fmt.Errorf("slug=%s: %w", p.TournamentSlug, tournament.ErrTournamentNotFound)
 	}
 	cfg, err := s.oddsConfig(ctx, tx, t.ID)
 	if err != nil {
@@ -329,7 +331,7 @@ func (s *Service[TX]) placeBetInTx(ctx context.Context, tx TX, p PlaceBetParams)
 	for _, l := range p.Legs {
 		m, ok := byPub[l.MatchPublicID]
 		if !ok {
-			return nil, fmt.Errorf("match=%s: %w", l.MatchPublicID, ErrMatchNotFound)
+			return nil, fmt.Errorf("match=%s: %w", l.MatchPublicID, activityerr.ErrMatchNotFound)
 		}
 		if m.TournamentID != t.ID {
 			return nil, fmt.Errorf("match=%s: %w", l.MatchPublicID, ErrMatchNotInTournament)
@@ -462,7 +464,7 @@ func (s *Service[TX]) ListMyBets(ctx context.Context, p ListMyBetsParams) ([]Bet
 			return fmt.Errorf("讀賽事 %s: %w", p.TournamentSlug, err)
 		}
 		if t == nil {
-			return fmt.Errorf("slug=%s: %w", p.TournamentSlug, ErrTournamentNotFound)
+			return fmt.Errorf("slug=%s: %w", p.TournamentSlug, tournament.ErrTournamentNotFound)
 		}
 		out, err = s.repo.BetsByUser(ctx, tx, t.ID, p.UserID, p.OpenOnly)
 		if err != nil {
@@ -779,7 +781,7 @@ func (s *Service[TX]) oneMatch(ctx context.Context, tx TX, publicID string) (*Ma
 			return &ms[i], nil
 		}
 	}
-	return nil, fmt.Errorf("match=%s: %w", publicID, ErrMatchNotFound)
+	return nil, fmt.Errorf("match=%s: %w", publicID, activityerr.ErrMatchNotFound)
 }
 
 func (s *Service[TX]) oddsConfig(ctx context.Context, tx TX, tournamentID int64) (OddsConfig, error) {

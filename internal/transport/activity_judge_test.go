@@ -10,6 +10,7 @@ import (
 
 	activityv1 "github.com/danicotech/hestia/gen/hestia/activity/v1"
 	"github.com/danicotech/hestia/gen/hestia/activity/v1/activityv1connect"
+	"github.com/danicotech/hestia/internal/core/activity/activityerr"
 	"github.com/danicotech/hestia/internal/core/activity/betting"
 	"github.com/danicotech/hestia/internal/core/activity/bp"
 	"github.com/danicotech/hestia/internal/core/activity/handicap"
@@ -787,7 +788,7 @@ func TestActivitySentinelsMapToStableReasons(t *testing.T) {
 		{betting.ErrStakeTooLarge, connect.CodeFailedPrecondition, "bet_stake_too_large"},
 		// 場次生命週期
 		{match.ErrConfirmationRequired, connect.CodeInvalidArgument, "confirmation_required"},
-		{match.ErrMatchNotFound, connect.CodeNotFound, "activity_match_not_found"},
+		{activityerr.ErrMatchNotFound, connect.CodeNotFound, "activity_match_not_found"},
 		{match.ErrWinnerNotInMatch, connect.CodeInvalidArgument, "winner_not_in_match"},
 	}
 	if ErrorReason(toConnectError(cases[0].err)) == "" {

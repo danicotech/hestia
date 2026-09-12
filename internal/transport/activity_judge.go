@@ -22,10 +22,15 @@ import (
 //	裁判權限    Authorizer.Authorize(每一支都查,不是挑幾支)
 //	稽核紀錄    由領域層與 adapter 在同一個 transaction 內寫
 //
-// 權限檢查在 handler 而不是靠攔截器的 privilegedServices 清單:那份清單
-// 用服務前綴比對,而它與 authz 的 procedurePermissions 是同一件事的兩半 ——
-// JudgeService 的權限對應還沒進 authz 的映射表(見回報),在那之前
-// 這裡明確呼叫 Authorize 是唯一能讓「漏配置 = 打不開」成立的寫法。
+// 權限檢查在 handler,而攔截器的 privilegedServices 也會查一次 —— 這是
+// 刻意保留的重複,不是忘了收斂。攔截器只在 transport.New() 建的那組
+// handler option 裡,而 MountActivity 收的是 `opts ...connect.HandlerOption`:
+// 少傳那組選項一樣掛得起來,而且不會有任何東西出聲。那條路徑上,handler
+// 這道是唯一的把關,所以它留著。
+//
+// 兩邊不會漂移:兩者查的都是 authz.PermissionFor(procedure),同一張映射表。
+// 映射表與 privilegedServices 對不對得起來,由 verifyProcedureCoverage 在
+// New() 啟動時反推斷言(宣告了權限卻不需要授權 → 開不起來)。
 //
 // # confirm 原樣往下傳,不在這裡判斷
 //

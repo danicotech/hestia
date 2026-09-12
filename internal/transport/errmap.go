@@ -6,9 +6,11 @@ import (
 
 	"connectrpc.com/connect"
 
+	"github.com/danicotech/hestia/internal/core/activity/activityerr"
 	"github.com/danicotech/hestia/internal/core/activity/betting"
 	"github.com/danicotech/hestia/internal/core/activity/handicap"
 	"github.com/danicotech/hestia/internal/core/activity/match"
+	"github.com/danicotech/hestia/internal/core/activity/prize"
 	"github.com/danicotech/hestia/internal/core/activity/signup"
 	"github.com/danicotech/hestia/internal/core/activity/tournament"
 	"github.com/danicotech/hestia/internal/core/platform/activitylog"
@@ -143,7 +145,7 @@ var errorCodes = []struct {
 
 	// ── 活動層:比賽生命週期(match)──────────────────────────
 	{match.ErrInvalidRequest, connect.CodeInvalidArgument, "match_invalid_request"},
-	{match.ErrMatchNotFound, connect.CodeNotFound, "activity_match_not_found"},
+	{activityerr.ErrMatchNotFound, connect.CodeNotFound, "activity_match_not_found"},
 	{match.ErrConfirmationRequired, connect.CodeInvalidArgument, "confirmation_required"},
 	{match.ErrWinnerNotInMatch, connect.CodeInvalidArgument, "winner_not_in_match"},
 	{match.ErrNotReady, connect.CodeFailedPrecondition, "match_not_ready"},
@@ -153,7 +155,7 @@ var errorCodes = []struct {
 	{match.ErrAlreadyOpen, connect.CodeFailedPrecondition, "match_already_open"},
 	{match.ErrAlreadyWithdrawn, connect.CodeAlreadyExists, "activity_player_already_withdrawn"},
 	{match.ErrPlayerWithdrawn, connect.CodeFailedPrecondition, "activity_player_withdrawn"},
-	{match.ErrPlayersNotSet, connect.CodeFailedPrecondition, "match_players_not_set"},
+	{activityerr.ErrPlayersNotSet, connect.CodeFailedPrecondition, "match_players_not_set"},
 	// 對戰表或晉級目標不見了:資料完整性失效,不是使用者錯誤。
 	{match.ErrBracketMissing, connect.CodeInternal, "activity_bracket_missing"},
 	{match.ErrAdvanceTargetMissing, connect.CodeInternal, "activity_advance_target_missing"},
@@ -168,6 +170,16 @@ var errorCodes = []struct {
 	{play.ErrClosed, connect.CodeFailedPrecondition, "play_closed"},
 	{play.ErrNotOwner, connect.CodePermissionDenied, "play_not_owner"},
 	{play.ErrInvalidParams, connect.CodeInvalidArgument, "play_invalid_params"},
+
+	// ── 活動層:賽事獎金(prize)────────────────────────────────
+	{prize.ErrInvalidRequest, connect.CodeInvalidArgument, "prize_invalid_request"},
+	// 季軍推不出來是賽制的事實,不是暫時性失敗:單淘汰沒有季軍賽,重試永遠一樣。
+	{prize.ErrThirdPlaceUndecidable, connect.CodeFailedPrecondition, "prize_third_place_undecidable"},
+	{prize.ErrFinalNotDecided, connect.CodeFailedPrecondition, "prize_final_not_decided"},
+	// 以下兩個是資料異常,不是裁判能修正的東西 —— 給 internal,讓它進日誌而不是
+	// 變成一句叫裁判自己想辦法的提示。
+	{prize.ErrBracketBroken, connect.CodeInternal, "prize_bracket_broken"},
+	{prize.ErrLedgerStateConflict, connect.CodeInternal, "prize_ledger_state_conflict"},
 
 	// ── 帳本(ledger)──────────────────────────────────────────────
 	{ledger.ErrInsufficientBalance, connect.CodeFailedPrecondition, "insufficient_balance"},

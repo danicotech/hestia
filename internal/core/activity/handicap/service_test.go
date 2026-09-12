@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/danicotech/hestia/internal/core/activity/activityerr"
 	"github.com/danicotech/hestia/internal/core/activity/bp"
 )
 
@@ -180,8 +181,8 @@ func TestGrantBudget_Rejections(t *testing.T) {
 		repo := base()
 		repo.matches[testMatchPub].P2PlayerID = 0
 		_, err := New(repo).GrantBudget(context.Background(), testMatchPub)
-		if !errors.Is(err, ErrPlayersNotSet) {
-			t.Fatalf("期望 ErrPlayersNotSet,實際 %v", err)
+		if !errors.Is(err, activityerr.ErrPlayersNotSet) {
+			t.Fatalf("期望 activityerr.ErrPlayersNotSet,實際 %v", err)
 		}
 	})
 
@@ -205,8 +206,8 @@ func TestGrantBudget_Rejections(t *testing.T) {
 
 	t.Run("場次不存在", func(t *testing.T) {
 		_, err := New(newFakeRepo()).GrantBudget(context.Background(), "沒這場")
-		if !errors.Is(err, ErrMatchNotFound) {
-			t.Fatalf("期望 ErrMatchNotFound,實際 %v", err)
+		if !errors.Is(err, activityerr.ErrMatchNotFound) {
+			t.Fatalf("期望 activityerr.ErrMatchNotFound,實際 %v", err)
 		}
 	})
 }

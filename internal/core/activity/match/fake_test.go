@@ -7,6 +7,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/danicotech/hestia/internal/core/activity/activityerr"
 	"github.com/danicotech/hestia/internal/core/activity/betting"
 	"github.com/danicotech/hestia/internal/core/activity/bp"
 	"github.com/danicotech/hestia/internal/core/activity/handicap"
@@ -241,7 +242,7 @@ func (db *fakeDB) LockMatch(_ context.Context, _ fakeTx, publicID string) (*Matc
 	db.log("LockMatch(%s)", publicID)
 	m := db.findMatch(publicID)
 	if m == nil {
-		return nil, ErrMatchNotFound
+		return nil, activityerr.ErrMatchNotFound
 	}
 	return db.view(m), nil
 }
@@ -253,13 +254,13 @@ func (db *fakeDB) LockMatchAt(_ context.Context, _ fakeTx, tournamentID int64, r
 			return db.view(m), nil
 		}
 	}
-	return nil, ErrMatchNotFound
+	return nil, activityerr.ErrMatchNotFound
 }
 
 func (db *fakeDB) GetMatch(_ context.Context, _ fakeTx, publicID string) (*Match, error) {
 	m := db.findMatch(publicID)
 	if m == nil {
-		return nil, ErrMatchNotFound
+		return nil, activityerr.ErrMatchNotFound
 	}
 	return db.view(m), nil
 }
@@ -307,7 +308,7 @@ func (db *fakeDB) LockUnfinishedMatchesOfPlayer(_ context.Context, _ fakeTx, pla
 func (db *fakeDB) MarkReady(_ context.Context, _ fakeTx, w ReadyWrite) (*Match, error) {
 	m := db.matches[w.MatchID]
 	if m == nil {
-		return nil, ErrMatchNotFound
+		return nil, activityerr.ErrMatchNotFound
 	}
 	m.status, m.handicapOpen = StatusReady, true
 	db.audit(w.ActorUserID, ActionOpenHandicap, AuditTargetMatch, m.id, w.Reason)
@@ -317,7 +318,7 @@ func (db *fakeDB) MarkReady(_ context.Context, _ fakeTx, w ReadyWrite) (*Match, 
 func (db *fakeDB) MarkLive(_ context.Context, _ fakeTx, w LiveWrite) (*Match, error) {
 	m := db.matches[w.MatchID]
 	if m == nil {
-		return nil, ErrMatchNotFound
+		return nil, activityerr.ErrMatchNotFound
 	}
 	m.status, m.startedAt = StatusLive, db.now()
 	db.audit(w.ActorUserID, ActionStartMatch, AuditTargetMatch, m.id, w.Reason)
@@ -327,7 +328,7 @@ func (db *fakeDB) MarkLive(_ context.Context, _ fakeTx, w LiveWrite) (*Match, er
 func (db *fakeDB) MarkFinished(_ context.Context, _ fakeTx, w FinishWrite) (*Match, error) {
 	m := db.matches[w.MatchID]
 	if m == nil {
-		return nil, ErrMatchNotFound
+		return nil, activityerr.ErrMatchNotFound
 	}
 	// 模擬 matches_winner_is_participant_check:勝者必須是場上兩人之一。
 	if w.WinnerPlayerID != m.p1ID && w.WinnerPlayerID != m.p2ID {
@@ -343,7 +344,7 @@ func (db *fakeDB) MarkFinished(_ context.Context, _ fakeTx, w FinishWrite) (*Mat
 func (db *fakeDB) SetStreamURL(_ context.Context, _ fakeTx, w StreamWrite) (*Match, error) {
 	m := db.matches[w.MatchID]
 	if m == nil {
-		return nil, ErrMatchNotFound
+		return nil, activityerr.ErrMatchNotFound
 	}
 	m.streamURL = w.StreamURL
 	db.audit(w.ActorUserID, ActionSetStreamURL, AuditTargetMatch, m.id, w.Reason)
@@ -353,7 +354,7 @@ func (db *fakeDB) SetStreamURL(_ context.Context, _ fakeTx, w StreamWrite) (*Mat
 func (db *fakeDB) SeatPlayer(_ context.Context, _ fakeTx, w SeatWrite) (*Match, error) {
 	m := db.matches[w.MatchID]
 	if m == nil {
-		return nil, ErrMatchNotFound
+		return nil, activityerr.ErrMatchNotFound
 	}
 	if w.IsP1 {
 		m.p1ID = w.PlayerID
@@ -413,7 +414,7 @@ func (db *fakeDB) audit(actorUserID int64, action, targetType string, targetID i
 func (db *fakeDB) GrantBudgetInTx(_ context.Context, _ fakeTx, matchPublicID string) (*handicap.Budget, error) {
 	m := db.findMatch(matchPublicID)
 	if m == nil {
-		return nil, handicap.ErrMatchNotFound
+		return nil, activityerr.ErrMatchNotFound
 	}
 	db.log("GrantBudget(%s)", matchPublicID)
 	b := db.budgets[m.id]
@@ -427,7 +428,7 @@ func (db *fakeDB) GrantBudgetInTx(_ context.Context, _ fakeTx, matchPublicID str
 func (db *fakeDB) LockInTx(_ context.Context, _ fakeTx, matchPublicID string) (*handicap.MatchHandicaps, error) {
 	m := db.findMatch(matchPublicID)
 	if m == nil {
-		return nil, handicap.ErrMatchNotFound
+		return nil, activityerr.ErrMatchNotFound
 	}
 	if m.status != StatusReady {
 		return nil, handicap.ErrHandicapClosed
@@ -465,7 +466,7 @@ func (db *fakeDB) LockInTx(_ context.Context, _ fakeTx, matchPublicID string) (*
 func (db *fakeDB) requireDone(matchPublicID string, kind ResultKind) (*fakeMatch, error) {
 	m := db.findMatch(matchPublicID)
 	if m == nil {
-		return nil, betting.ErrMatchNotFound
+		return nil, activityerr.ErrMatchNotFound
 	}
 	if m.status != StatusDone || m.winnerID == 0 {
 		return nil, betting.ErrMatchNotDecided

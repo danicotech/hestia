@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/danicotech/hestia/internal/core/activity/activityerr"
 	"github.com/danicotech/hestia/internal/core/activity/handicap"
 	"github.com/danicotech/hestia/internal/core/activity/tournament"
 )
@@ -159,7 +160,7 @@ func (s *Service[TX]) OpenHandicap(ctx context.Context, p OpenHandicapParams) (*
 			// 對裁判來說要做的事都一樣 —— 這個按鈕已經按過了。
 			return fmt.Errorf("match=%s status=%s: %w", m.PublicID, m.Status, ErrAlreadyOpen)
 		case !m.BothSeated():
-			return fmt.Errorf("match=%s: %w", m.PublicID, ErrPlayersNotSet)
+			return fmt.Errorf("match=%s: %w", m.PublicID, activityerr.ErrPlayersNotSet)
 		case m.P1.Status == tournament.PlayerWithdrawn || m.P2.Status == tournament.PlayerWithdrawn:
 			// 對已棄賽的一方開盤,發下去的 BP 永遠花不掉,而且會發一則
 			// 沒有意義的提醒。這種場次該走 WithdrawPlayer 判不戰而勝。
@@ -713,7 +714,7 @@ func (s *Service[TX]) advance(ctx context.Context, tx TX, ec eventCtx, m *Match,
 	}
 	next, err := s.repo.LockMatchAt(ctx, tx, m.TournamentID, nr, ns)
 	if err != nil {
-		if errors.Is(err, ErrMatchNotFound) {
+		if errors.Is(err, activityerr.ErrMatchNotFound) {
 			return nil, fmt.Errorf("round=%d slot=%d: %w", nr, ns, ErrAdvanceTargetMissing)
 		}
 		return nil, fmt.Errorf("讀晉級目標 round=%d slot=%d: %w", nr, ns, err)

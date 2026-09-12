@@ -8,6 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/danicotech/hestia/internal/core/activity/activityerr"
 	"github.com/danicotech/hestia/internal/core/activity/bp"
 	"github.com/danicotech/hestia/internal/core/activity/handicap"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/db"
@@ -18,7 +19,7 @@ func (r *Repo) LockMatch(ctx context.Context, matchPublicID string) (*handicap.M
 	row, err := r.q.LockMatchForHandicap(ctx, matchPublicID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, fmt.Errorf("match=%s: %w", matchPublicID, handicap.ErrMatchNotFound)
+			return nil, fmt.Errorf("match=%s: %w", matchPublicID, activityerr.ErrMatchNotFound)
 		}
 		return nil, fmt.Errorf("鎖場次 %s: %w", matchPublicID, err)
 	}
@@ -30,7 +31,7 @@ func (r *Repo) GetMatch(ctx context.Context, matchPublicID string) (*handicap.Ma
 	row, err := r.q.GetMatchForHandicap(ctx, matchPublicID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, fmt.Errorf("match=%s: %w", matchPublicID, handicap.ErrMatchNotFound)
+			return nil, fmt.Errorf("match=%s: %w", matchPublicID, activityerr.ErrMatchNotFound)
 		}
 		return nil, fmt.Errorf("讀場次 %s: %w", matchPublicID, err)
 	}

@@ -29,6 +29,8 @@ import (
 	"github.com/danicotech/hestia/internal/core/platform/ledger"
 	"github.com/danicotech/hestia/internal/core/platform/play"
 	"github.com/danicotech/hestia/internal/core/platform/shop"
+
+	"github.com/danicotech/hestia/internal/core/platform/authz"
 )
 
 // protoPackage 是平台層 RPC 的 proto package。
@@ -353,6 +355,24 @@ func verifyProcedureCoverage() error {
 	for _, svc := range serviceIdentityServices {
 		if !knownService(known, svc) {
 			problems = append(problems, svc+" 在服務身分清單裡但 proto 沒有這個服務")
+		}
+	}
+	// 授權映射表與 privilegedServices 是同一件事的兩半:前者說「這支 RPC 要哪個
+	// 權限」,後者決定「攔截器會不會去查」。兩邊對不起來時的失敗是沉默的 ——
+	// 映射表登記了權限,但服務沒進 privilegedServices,結果是任何登入使用者都
+	// 打得到一支明明宣告了需要權限的 RPC。
+	//
+	// 原本只有「服務名開頭是 Admin」這條命名慣例在守,JudgeService 不符合那個
+	// 命名,於是它進 privilegedServices 純粹靠手工。改成由映射表反推,涵蓋
+	// 每一支宣告過權限的 RPC,不管它叫什麼名字。
+	for procedure := range authz.ProcedurePermissions() {
+		if _, ok := known[procedure]; !ok {
+			problems = append(problems, procedure+" 在授權映射表裡但 proto 沒有這個 procedure")
+			continue
+		}
+		if !requiresAuthorization(procedure) {
+			problems = append(problems,
+				procedure+" 在授權映射表裡宣告了權限,卻不需要授權(privilegedServices 漏登記)")
 		}
 	}
 	// subjectlessServices 同理,而且多一條:它必須是 serviceIdentityServices
