@@ -41,6 +41,7 @@ import (
 
 	"github.com/danicotech/hestia/internal/core/activity/match"
 	"github.com/danicotech/hestia/internal/core/activity/tournament"
+	"github.com/danicotech/hestia/internal/core/activity/watch"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/db"
 )
 
@@ -169,7 +170,7 @@ func (s *Service) LockPlayer(ctx context.Context, tx pgx.Tx, playerPublicID stri
 	row, err := q.LockPlayerForJudge(ctx, playerPublicID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, fmt.Errorf("player=%s: %w", playerPublicID, match.ErrPlayerNotFound)
+			return nil, fmt.Errorf("player=%s: %w", playerPublicID, tournament.ErrPlayerNotFound)
 		}
 		return nil, fmt.Errorf("鎖選手 %s: %w", playerPublicID, err)
 	}
@@ -300,7 +301,7 @@ func (s *Service) SetPlayerStatus(ctx context.Context, tx pgx.Tx, w match.Player
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// 這一支刻意沒有 status 的守門,所以 0 列只能是查無此選手。
-			return nil, fmt.Errorf("player id=%d: %w", w.PlayerID, match.ErrPlayerNotFound)
+			return nil, fmt.Errorf("player id=%d: %w", w.PlayerID, tournament.ErrPlayerNotFound)
 		}
 		return nil, fmt.Errorf("改選手狀態 player=%d: %w", w.PlayerID, err)
 	}
@@ -371,7 +372,12 @@ func (s *Service) RecordJudgeAction(ctx context.Context, tx pgx.Tx, a match.Judg
 	return nil
 }
 
-// AppendEvents 與領域變更同 tx 寫 outbox。
+// AppendEvents 與領域變更同 tx 寫 outbox,並順手送出即時戰況的推播信封。
+//
+// 推播掛在這裡而不是另開一條路徑,是因為這五個 topic 就是「一場比賽的生命週期
+// 會對外講的全部的話」,而即時戰況要推的正是同一組時刻。更重要的是它必須
+// **在這個 tx 裡**:NOTIFY 只在 commit 時送出,rollback 的交易不會送 ——
+// 觀眾因此不可能看到一個後來被撤銷的賽果(internal/core/activity/watch 的檔頭)。
 func (s *Service) AppendEvents(ctx context.Context, tx pgx.Tx, events []match.Event) error {
 	if len(events) == 0 {
 		return nil
@@ -384,6 +390,34 @@ func (s *Service) AppendEvents(ctx context.Context, tx pgx.Tx, events []match.Ev
 		}); err != nil {
 			return fmt.Errorf("寫 outbox topic=%s: %w", e.Topic, err)
 		}
+		if err := s.notifyWatch(ctx, q, e); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// notifyWatch 送出一則即時戰況的推播信封。
+//
+// 失敗一律讓整個裁判動作失敗(而不是吞掉繼續):pg_notify 出錯代表這個
+// transaction 已經被 Postgres 標成 aborted,後面每一句都只會回
+// 「current transaction is aborted」—— 吞掉只會把成因換成一個看不懂的錯誤。
+//
+// 與戰況無關的 topic(EnvelopeForEvent 回 false)直接跳過,那不是錯誤。
+func (s *Service) notifyWatch(ctx context.Context, q *db.Queries, e match.Event) error {
+	env, ok := watch.EnvelopeForEvent(e.Topic, e.Payload)
+	if !ok {
+		return nil
+	}
+	payload, err := env.Marshal()
+	if err != nil {
+		return fmt.Errorf("組推播信封 topic=%s: %w", e.Topic, err)
+	}
+	if err := q.NotifyActivityWatch(ctx, db.NotifyActivityWatchParams{
+		Channel: watch.Channel,
+		Payload: payload,
+	}); err != nil {
+		return fmt.Errorf("送推播通知 topic=%s: %w", e.Topic, err)
 	}
 	return nil
 }

@@ -185,15 +185,10 @@ type Event struct {
 var (
 	// ErrInvalidRequest 表示請求參數不合法(缺 public_id 等)。
 	ErrInvalidRequest = errors.New("請求參數不合法")
-	// ErrActorRequired 表示沒帶裁判身分。六個動作全部要進 admin_audit_logs,
-	// 沒有 actor 就記不出「是誰做的」,而賽事的公正性完全建立在那件事上。
-	ErrActorRequired = errors.New("這個操作必須指明執行的裁判")
 	// ErrConfirmationRequired 表示不可逆動作沒帶 confirm。
 	ErrConfirmationRequired = errors.New("這是不可逆的動作,需要二次確認")
 	// ErrMatchNotFound 表示場次不存在。
 	ErrMatchNotFound = errors.New("場次不存在")
-	// ErrPlayerNotFound 表示選手不存在。
-	ErrPlayerNotFound = errors.New("選手不存在")
 	// ErrPlayersNotSet 表示雙方尚未確定(等上一輪),還不能開盤。
 	ErrPlayersNotSet = errors.New("場次雙方尚未確定")
 	// ErrPlayerWithdrawn 表示場上有一方已棄賽,這場不該再走正常流程。
@@ -361,7 +356,7 @@ type Repository[TX any] interface {
 	// TournamentByID 讀賽事,含 TotalRounds。查無回 tournament.ErrTournamentNotFound。
 	TournamentByID(ctx context.Context, tx TX, tournamentID int64) (*Tournament, error)
 
-	// LockPlayer 依 public_id 讀參賽者並鎖住該列。查無回 ErrPlayerNotFound。
+	// LockPlayer 依 public_id 讀參賽者並鎖住該列。查無回 tournament.ErrPlayerNotFound。
 	LockPlayer(ctx context.Context, tx TX, playerPublicID string) (*Player, error)
 
 	// LockUnfinishedMatchesOfPlayer 列出這位選手所有**尚未完賽**的場次並鎖住那些列,

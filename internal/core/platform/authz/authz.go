@@ -42,6 +42,13 @@ const (
 	PermRolesManage Permission = "roles.manage"
 	// PermLogsRead 是讀取管理端紀錄(含帳本分錄列表)。
 	PermLogsRead Permission = "logs.read"
+
+	// PermTournamentJudge 是賽事裁判:評段、抽籤、開封盤、判勝負、棄賽、補發通行碼。
+	//
+	// 刻意與 moderator 的能力分開:辦賽事的人與管理伺服器的人是兩群人。
+	// 發獎**不在這個權限裡** —— 那是動平台代幣,走既有的 economy.grant,
+	// 同一個概念不該有第二個權限名字。
+	PermTournamentJudge Permission = "tournament.judge"
 	// PermLogsReadDeleted 是讀取已刪除訊息(動作本身也要進 admin_audit_logs;
 	// 尚無對應 RPC)。
 	PermLogsReadDeleted Permission = "logs.read_deleted"
@@ -59,6 +66,24 @@ const (
 	ProcAdminEconomyRefund           = "/hestia.platform.v1.AdminEconomyService/Refund"
 	ProcAdminEconomyHandleRedemption = "/hestia.platform.v1.AdminEconomyService/HandleRedemption"
 	ProcAdminEconomyListEntries      = "/hestia.platform.v1.AdminEconomyService/ListEntries"
+
+	// 賽事裁判(activity)。逐條列是因為 privilegedServices 的前綴只決定
+	// 「要不要授權」,「需要哪個權限」仍然在這張表裡 —— 而啟動時的
+	// verifyProcedureCoverage 會走一遍 proto descriptor,漏掉一支直接開不起來。
+	ProcJudgeAdvancePhase       = "/hestia.activity.v1.JudgeService/AdvancePhase"
+	ProcJudgeAssignRank         = "/hestia.activity.v1.JudgeService/AssignRank"
+	ProcJudgeListUnranked       = "/hestia.activity.v1.JudgeService/ListUnranked"
+	ProcJudgeDrawBracket        = "/hestia.activity.v1.JudgeService/DrawBracket"
+	ProcJudgeSwapSeeds          = "/hestia.activity.v1.JudgeService/SwapSeeds"
+	ProcJudgeConfirmBracket     = "/hestia.activity.v1.JudgeService/ConfirmBracket"
+	ProcJudgeOpenHandicap       = "/hestia.activity.v1.JudgeService/OpenHandicap"
+	ProcJudgeLockHandicap       = "/hestia.activity.v1.JudgeService/LockHandicap"
+	ProcJudgeSetStreamUrl       = "/hestia.activity.v1.JudgeService/SetStreamUrl"
+	ProcJudgeStartMatch         = "/hestia.activity.v1.JudgeService/StartMatch"
+	ProcJudgeReportResult       = "/hestia.activity.v1.JudgeService/ReportResult"
+	ProcJudgeWithdrawPlayer     = "/hestia.activity.v1.JudgeService/WithdrawPlayer"
+	ProcJudgeRegeneratePasscode = "/hestia.activity.v1.JudgeService/RegeneratePasscode"
+	ProcJudgeAwardPrizes        = "/hestia.activity.v1.JudgeService/AwardPrizes"
 )
 
 // procedurePermissions 是 procedure → 所需權限的**唯一**映射表。
@@ -72,6 +97,24 @@ var procedurePermissions = map[string]Permission{
 	ProcAdminEconomyRefund:           PermEconomyRefund,
 	ProcAdminEconomyHandleRedemption: PermRedemptionHandle,
 	ProcAdminEconomyListEntries:      PermLogsRead,
+
+	// 發獎走 economy.grant:它動的是平台代幣,而「能發錢」這個概念已經有權限了。
+	// 裁判要發獎就得另外拿到那個權限 —— 判勝負與發錢是兩件事,
+	// 同一個人能做不代表該用同一把鑰匙。
+	ProcJudgeAdvancePhase:       PermTournamentJudge,
+	ProcJudgeAssignRank:         PermTournamentJudge,
+	ProcJudgeListUnranked:       PermTournamentJudge,
+	ProcJudgeDrawBracket:        PermTournamentJudge,
+	ProcJudgeSwapSeeds:          PermTournamentJudge,
+	ProcJudgeConfirmBracket:     PermTournamentJudge,
+	ProcJudgeOpenHandicap:       PermTournamentJudge,
+	ProcJudgeLockHandicap:       PermTournamentJudge,
+	ProcJudgeSetStreamUrl:       PermTournamentJudge,
+	ProcJudgeStartMatch:         PermTournamentJudge,
+	ProcJudgeReportResult:       PermTournamentJudge,
+	ProcJudgeWithdrawPlayer:     PermTournamentJudge,
+	ProcJudgeRegeneratePasscode: PermTournamentJudge,
+	ProcJudgeAwardPrizes:        PermEconomyGrant,
 }
 
 // PermissionFor 回傳 procedure 所需的權限。第二個回傳值為 false 表示

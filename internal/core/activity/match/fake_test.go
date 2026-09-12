@@ -280,7 +280,7 @@ func (db *fakeDB) LockPlayer(_ context.Context, _ fakeTx, publicID string) (*Pla
 			return db.playerView(p), nil
 		}
 	}
-	return nil, ErrPlayerNotFound
+	return nil, tournament.ErrPlayerNotFound
 }
 
 func (db *fakeDB) LockUnfinishedMatchesOfPlayer(_ context.Context, _ fakeTx, playerID int64) ([]Match, error) {
@@ -367,7 +367,7 @@ func (db *fakeDB) SeatPlayer(_ context.Context, _ fakeTx, w SeatWrite) (*Match, 
 func (db *fakeDB) SetPlayerStatus(_ context.Context, _ fakeTx, w PlayerStatusWrite) (*Player, error) {
 	p := db.players[w.PlayerID]
 	if p == nil {
-		return nil, ErrPlayerNotFound
+		return nil, tournament.ErrPlayerNotFound
 	}
 	p.status = w.Status
 	db.log("SetPlayerStatus(%s,%s)", p.publicID, w.Status)

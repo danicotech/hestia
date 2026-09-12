@@ -181,7 +181,7 @@ func TestNotFound(t *testing.T) {
 		_, err := f.repo.LockPlayer(ctx, tx, "不存在的選手")
 		return err
 	})
-	if !errors.Is(err, match.ErrPlayerNotFound) {
+	if !errors.Is(err, tournament.ErrPlayerNotFound) {
 		t.Fatalf("LockPlayer 查無應回 ErrPlayerNotFound,得到 %v", err)
 	}
 

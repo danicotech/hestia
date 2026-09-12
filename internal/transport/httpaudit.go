@@ -116,7 +116,20 @@ const unknownAction = "(non-rpc path)"
 //     會撞到截斷的只有「前綴對但後面接一長串」的變形攻擊。
 func auditAction(path, basePath string) string {
 	rest, ok := stripBasePath(path, basePath)
-	if !ok || !strings.HasPrefix(rest, "/"+string(protoPackage)+".") {
+	if !ok {
+		return unknownAction
+	}
+	// 兩個 package 都要認。只認平台層的話,裁判的每一個動作
+	// (判勝負、棄賽、封盤)在 HTTP 稽核裡都會變成 unknown ——
+	// 而那些正是最需要查得出「誰在什麼時候做了什麼」的動作。
+	var ours bool
+	for _, pkg := range scannedPackages() {
+		if strings.HasPrefix(rest, "/"+string(pkg)+".") {
+			ours = true
+			break
+		}
+	}
+	if !ours {
 		return unknownAction
 	}
 	action, _ := truncateUTF8(rest, summaryMaxStringBytes)

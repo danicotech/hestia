@@ -13,6 +13,11 @@ import (
 
 	platformv1 "github.com/danicotech/hestia/gen/hestia/platform/v1"
 	"github.com/danicotech/hestia/gen/hestia/platform/v1/platformv1connect"
+	"github.com/danicotech/hestia/internal/core/activity/betting"
+	"github.com/danicotech/hestia/internal/core/activity/handicap"
+	"github.com/danicotech/hestia/internal/core/activity/match"
+	"github.com/danicotech/hestia/internal/core/activity/signup"
+	"github.com/danicotech/hestia/internal/core/activity/tournament"
 	"github.com/danicotech/hestia/internal/core/platform/activitylog"
 	"github.com/danicotech/hestia/internal/core/platform/adminecon"
 	"github.com/danicotech/hestia/internal/core/platform/daily"
@@ -96,6 +101,78 @@ func TestToConnectError(t *testing.T) {
 
 		// 入口層自己的憑證錯誤:它們不是 core sentinel,但同樣在表上
 		// (為了有穩定的 reason),所以同樣要驗 code。
+		// 活動層:報名與身分
+		{signup.ErrInvalidCredentials, connect.CodeUnauthenticated},
+		{signup.ErrAlreadyRegistered, connect.CodeAlreadyExists},
+		{signup.ErrGameIDRequired, connect.CodeInvalidArgument},
+		{signup.ErrInvalidGameID, connect.CodeInvalidArgument},
+		{signup.ErrDiscordNameRequired, connect.CodeInvalidArgument},
+		{signup.ErrFieldTooLong, connect.CodeInvalidArgument},
+		{signup.ErrAlreadyBound, connect.CodeFailedPrecondition},
+		{signup.ErrUserAlreadyBound, connect.CodeFailedPrecondition},
+		{signup.ErrUserRequired, connect.CodeUnauthenticated},
+
+		// 活動層:賽事與階段
+		{tournament.ErrTournamentNotFound, connect.CodeNotFound},
+		{tournament.ErrPlayerNotFound, connect.CodeNotFound},
+		{tournament.ErrPhaseConflict, connect.CodeAborted},
+		{tournament.ErrWrongPhase, connect.CodeFailedPrecondition},
+		{tournament.ErrIllegalTransition, connect.CodeFailedPrecondition},
+		{tournament.ErrRanksLocked, connect.CodeFailedPrecondition},
+		{tournament.ErrPlayersUnranked, connect.CodeFailedPrecondition},
+		{tournament.ErrInvalidRank, connect.CodeInvalidArgument},
+		{tournament.ErrActorRequired, connect.CodeInvalidArgument},
+		{tournament.ErrInvalidSeed, connect.CodeInvalidArgument},
+		{tournament.ErrNoDrawablePlayers, connect.CodeFailedPrecondition},
+		{tournament.ErrPlayerNotSeeded, connect.CodeFailedPrecondition},
+		{tournament.ErrSamePlayer, connect.CodeInvalidArgument},
+
+		// 活動層:讓武 BP
+		{handicap.ErrInvalidRequest, connect.CodeInvalidArgument},
+		{handicap.ErrInsufficientBP, connect.CodeFailedPrecondition},
+		{handicap.ErrNoBudget, connect.CodeFailedPrecondition},
+		{handicap.ErrHandicapLocked, connect.CodeFailedPrecondition},
+		{handicap.ErrAlreadyLocked, connect.CodeFailedPrecondition},
+		{handicap.ErrHandicapClosed, connect.CodeFailedPrecondition},
+		{handicap.ErrHandicapNotOpen, connect.CodeFailedPrecondition},
+		{handicap.ErrTargetNoteRequired, connect.CodeInvalidArgument},
+		{handicap.ErrNotSelectionOwner, connect.CodePermissionDenied},
+		{handicap.ErrItemNotFound, connect.CodeNotFound},
+		{handicap.ErrSelectionNotFound, connect.CodeNotFound},
+		{handicap.ErrSelectionAlreadyVoided, connect.CodeAlreadyExists},
+		{handicap.ErrBudgetInconsistent, connect.CodeInternal},
+
+		// 活動層:投票與下注
+		{betting.ErrInvalidRequest, connect.CodeInvalidArgument},
+		{betting.ErrSelfBet, connect.CodePermissionDenied},
+		{betting.ErrBettingClosed, connect.CodeFailedPrecondition},
+		{betting.ErrVotingClosed, connect.CodeFailedPrecondition},
+		{betting.ErrOddsMoved, connect.CodeAborted},
+		{betting.ErrStakeTooLarge, connect.CodeFailedPrecondition},
+		{betting.ErrDuplicateLeg, connect.CodeInvalidArgument},
+		{betting.ErrTooManyLegs, connect.CodeInvalidArgument},
+		{betting.ErrMatchNotInTournament, connect.CodeInvalidArgument},
+		{betting.ErrMatchNotDecided, connect.CodeFailedPrecondition},
+		{betting.ErrWalkoverMatch, connect.CodeFailedPrecondition},
+		{betting.ErrNotWalkover, connect.CodeFailedPrecondition},
+		{betting.ErrLedgerStateConflict, connect.CodeInternal},
+
+		// 活動層:比賽生命週期
+		{match.ErrInvalidRequest, connect.CodeInvalidArgument},
+		{match.ErrMatchNotFound, connect.CodeNotFound},
+		{match.ErrConfirmationRequired, connect.CodeInvalidArgument},
+		{match.ErrWinnerNotInMatch, connect.CodeInvalidArgument},
+		{match.ErrNotReady, connect.CodeFailedPrecondition},
+		{match.ErrNotLocked, connect.CodeFailedPrecondition},
+		{match.ErrNotLive, connect.CodeFailedPrecondition},
+		{match.ErrMatchFinished, connect.CodeFailedPrecondition},
+		{match.ErrAlreadyOpen, connect.CodeFailedPrecondition},
+		{match.ErrAlreadyWithdrawn, connect.CodeAlreadyExists},
+		{match.ErrPlayerWithdrawn, connect.CodeFailedPrecondition},
+		{match.ErrPlayersNotSet, connect.CodeFailedPrecondition},
+		{match.ErrBracketMissing, connect.CodeInternal},
+		{match.ErrAdvanceTargetMissing, connect.CodeInternal},
+
 		{errMixedCredentials, connect.CodePermissionDenied},
 		{errServiceOnUserRPC, connect.CodePermissionDenied},
 		{errDelegationNotGranted, connect.CodePermissionDenied},

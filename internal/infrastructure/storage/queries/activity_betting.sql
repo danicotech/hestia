@@ -376,3 +376,30 @@ SELECT * FROM activity.bets
 WHERE tournament_id = sqlc.arg(tournament_id) AND user_id = sqlc.arg(user_id)
   AND status = 'open'
 ORDER BY created_at DESC, id DESC;
+
+-- ══ 即時戰況推播 ════════════════════════════════════════════════
+
+-- name: NotifyWatchOdds :exec
+-- 投票改變了賠率,通知即時戰況的訂閱者(internal/core/activity/watch)。
+--
+-- 為什麼投票要有自己的一支,而不是沿用 activity_match.sql 的 NotifyActivityWatch:
+-- 那一支收的是組好的信封字串,而投票路徑手上**只有 matches.id** ——
+-- UpsertVote 的參數就只有 (match_id, user_id, side)。要在 Go 裡組信封就得先查
+-- 一次 slug 與 public_id,那是**每一票**都要付的一次額外往返,只為了換一個
+-- 字串拼接的位置。所以這裡直接在同一句 SQL 裡把信封組好。
+--
+-- 代價是信封的三個鍵名在這裡有一份鏡像(權威是 watch.Envelope 的 json tag)。
+-- 鍵名對不上的話推播會靜靜失效,所以 watchpg 的整合測試直接解析這一句送出的
+-- 信封並與 Go 的型別比對 —— 有一邊被改到,測試就會紅。
+-- 種類(k)與頻道名仍然由呼叫端從 Go 常數帶進來,不在 SQL 裡寫死。
+--
+-- 查無此場次時 FROM 沒有列,自然不送通知 —— 那正是想要的行為。
+-- 同一個交易裡對同一場投兩次票只會送一則:Postgres 會把 (channel, payload)
+-- 完全相同的通知去重,而投票的信封不含票數,內容天生相同。
+SELECT pg_notify(
+  sqlc.arg(channel)::text,
+  json_build_object('t', t.slug, 'k', sqlc.arg(kind)::text, 'r', m.public_id)::text
+)
+FROM activity.matches m
+JOIN activity.tournaments t ON t.id = m.tournament_id
+WHERE m.id = sqlc.arg(match_id);

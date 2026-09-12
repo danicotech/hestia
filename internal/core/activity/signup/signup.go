@@ -74,8 +74,6 @@ var (
 	ErrDiscordNameRequired = errors.New("必須填寫 Discord 名稱")
 	// ErrFieldTooLong 是某個報名表欄位超長。
 	ErrFieldTooLong = errors.New("欄位過長")
-	// ErrPlayerNotFound 是查無此選手。
-	ErrPlayerNotFound = errors.New("選手不存在")
 	// ErrAlreadyBound 是這位選手已經綁定到**另一個**平台帳號。
 	// 綁定決定獎金匯給誰,改綁必須由裁判介入並留稽核紀錄,不走這條路。
 	ErrAlreadyBound = errors.New("這位選手已綁定其他平台帳號")
@@ -213,7 +211,7 @@ type Repo interface {
 	CreateRegistration(ctx context.Context, p CreateRegistrationParams) (Registration, error)
 
 	// CredentialByGameID 依遊戲ID 取本屆的選手與通行碼雜湊。
-	// 查無回 ErrPlayerNotFound —— 呼叫端**不得**把這個錯誤原樣回給使用者。
+	// 查無回 tournament.ErrPlayerNotFound —— 呼叫端**不得**把這個錯誤原樣回給使用者。
 	CredentialByGameID(ctx context.Context, tournamentID int64, gameID string) (Credential, error)
 
 	// PlayerByPublicID 在指定賽事內以 public_id 查選手。查無回 tournament.ErrPlayerNotFound。

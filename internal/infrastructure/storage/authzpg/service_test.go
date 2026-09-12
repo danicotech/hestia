@@ -161,8 +161,10 @@ func TestPermissionConstantsMatchSeed(t *testing.T) {
 			total++
 		}
 	}
-	if total != 21 {
-		t.Errorf("seed 應有 21 組角色權限,實際 %d(schemas/03-authz.md)", total)
+	// 24 = schemas/03-authz.md 的 21 組,加上 00030 給 owner / admin / judge
+	// 各一個 tournament.judge。
+	if total != 24 {
+		t.Errorf("seed 應有 24 組角色權限,實際 %d(schemas/03-authz.md + 00030)", total)
 	}
 
 	inCode := map[string]bool{}
@@ -170,6 +172,7 @@ func TestPermissionConstantsMatchSeed(t *testing.T) {
 		authz.PermEconomyGrant, authz.PermEconomyRefund, authz.PermEconomyConfig,
 		authz.PermShopManage, authz.PermRedemptionHandle, authz.PermUserRestrict,
 		authz.PermRolesManage, authz.PermLogsRead, authz.PermLogsReadDeleted,
+		authz.PermTournamentJudge,
 	} {
 		inCode[string(p)] = true
 	}
@@ -193,14 +196,30 @@ func TestPermissionConstantsMatchSeed(t *testing.T) {
 	}
 }
 
-// 映射表必須涵蓋 AdminEconomyService 的全部 RPC(啟動時斷言的測試版)。
-func TestProcedureMappingCoversAdminEconomyService(t *testing.T) {
+// 映射表必須涵蓋每一支需要權限的 RPC,而且不能多出沒人認得的條目
+// (啟動時斷言的測試版)。漏一條等於那支 RPC 沒有權限把關。
+func TestProcedureMappingCoversPrivilegedServices(t *testing.T) {
 	want := []string{
 		authz.ProcAdminEconomyGrant,
 		authz.ProcAdminEconomyDeduct,
 		authz.ProcAdminEconomyRefund,
 		authz.ProcAdminEconomyHandleRedemption,
 		authz.ProcAdminEconomyListEntries,
+
+		authz.ProcJudgeAdvancePhase,
+		authz.ProcJudgeAssignRank,
+		authz.ProcJudgeListUnranked,
+		authz.ProcJudgeDrawBracket,
+		authz.ProcJudgeSwapSeeds,
+		authz.ProcJudgeConfirmBracket,
+		authz.ProcJudgeOpenHandicap,
+		authz.ProcJudgeLockHandicap,
+		authz.ProcJudgeSetStreamUrl,
+		authz.ProcJudgeStartMatch,
+		authz.ProcJudgeReportResult,
+		authz.ProcJudgeWithdrawPlayer,
+		authz.ProcJudgeRegeneratePasscode,
+		authz.ProcJudgeAwardPrizes,
 	}
 	got := authz.ProcedurePermissions()
 	if len(got) != len(want) {
@@ -218,7 +237,7 @@ func TestProcedureMappingCoversAdminEconomyService(t *testing.T) {
 	}
 }
 
-// ── seed 四角色 × 五個 procedure ────────────────────────────────────
+// ── seed 五角色 × 全部 procedure ────────────────────────────────────
 
 func TestSeedRolesAgainstProcedures(t *testing.T) {
 	setup(t)
@@ -229,8 +248,8 @@ func TestSeedRolesAgainstProcedures(t *testing.T) {
 		roles = append(roles, k)
 	}
 	sort.Strings(roles)
-	if len(roles) != 4 {
-		t.Fatalf("seed 應有 4 個角色,實際 %v", roles)
+	if len(roles) != 5 {
+		t.Fatalf("seed 應有 5 個角色,實際 %v", roles)
 	}
 
 	mapping := authz.ProcedurePermissions()

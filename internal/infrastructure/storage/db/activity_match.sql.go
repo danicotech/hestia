@@ -1046,6 +1046,46 @@ func (q *Queries) MarkMatchReady(ctx context.Context, matchID int64) (MarkMatchR
 	return i, err
 }
 
+const notifyActivityWatch = `-- name: NotifyActivityWatch :exec
+
+SELECT pg_notify($1::text, $2::text)
+`
+
+type NotifyActivityWatchParams struct {
+	Channel string
+	Payload string
+}
+
+// ══ 即時戰況推播 ════════════════════════════════════════════════
+// 把一則變化的「信封」送進 LISTEN / NOTIFY 頻道(internal/core/activity/watch)。
+//
+// ── 為什麼扇出用 NOTIFY 而不是行程內的 hub ──────────────────────
+//
+// **NOTIFY 只在交易 commit 時才送出,rollback 的交易一個字都不會送。**
+// 行程內 hub 給不了這個保證:服務得記得在 commit 之後才發布,而「在 commit 之前
+// 發布」是很容易寫出來的一行 —— 症狀是觀眾看到一個後來被 rollback 的賽果。
+// 交給 Postgres 之後,那個 bug 在結構上不可能發生。
+//
+// 所以這一支的呼叫位置是固定的:**與領域變更同一個交易**,就寫在 AppendEvents
+// 寫 outbox 的旁邊(matchpg)。搬出去就失去上面那個唯一的理由。
+//
+// ── 為什麼只送信封 ──────────────────────────────────────────────
+//
+// NOTIFY 的 payload 上限是 8000 bytes,而封盤那則的讓武清單會超過 ——
+// 超過不是「被截斷」,是**整個交易失敗**,也就是裁判封不了盤。
+// 所以這裡只送 {賽事 slug, 種類, 參照 id},完整內容由 watchpg 收到後自己讀。
+//
+// ── 為什麼頻道名是參數 ──────────────────────────────────────────
+//
+// pg_notify(text, text) 收的是值不是識別字,所以頻道名可以由呼叫端帶。
+// 權威因此只有一個:internal/core/activity/watch 的 Channel 常數,LISTEN 那端
+// 也從它取。寫成 SQL 裡的字面值就會有兩份,而打錯一個字的症狀是
+// 「推播完全沒有反應,但每一支測試都過」。
+func (q *Queries) NotifyActivityWatch(ctx context.Context, arg NotifyActivityWatchParams) error {
+	_, err := q.db.Exec(ctx, notifyActivityWatch, arg.Channel, arg.Payload)
+	return err
+}
+
 const seatMatchPlayer = `-- name: SeatMatchPlayer :one
 WITH upd AS (
   UPDATE activity.matches

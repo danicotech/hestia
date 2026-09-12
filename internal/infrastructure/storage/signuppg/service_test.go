@@ -370,12 +370,12 @@ func TestCredentialByGameID(t *testing.T) {
 	}
 
 	// 查無此遊戲ID 與通行碼錯誤在上層是同一個錯誤,這裡只負責回「查不到」。
-	if _, err := svc.CredentialByGameID(ctx, tid, "不存在的ID"); !errors.Is(err, signup.ErrPlayerNotFound) {
+	if _, err := svc.CredentialByGameID(ctx, tid, "不存在的ID"); !errors.Is(err, tournament.ErrPlayerNotFound) {
 		t.Fatalf("查無應回 ErrPlayerNotFound,得到 %v", err)
 	}
 	// 別屆的遊戲ID 在這屆也查不到。
 	other := newTournament(t, tournament.PhaseSignup)
-	if _, err := svc.CredentialByGameID(ctx, other, id); !errors.Is(err, signup.ErrPlayerNotFound) {
+	if _, err := svc.CredentialByGameID(ctx, other, id); !errors.Is(err, tournament.ErrPlayerNotFound) {
 		t.Fatalf("跨屆應回 ErrPlayerNotFound,得到 %v", err)
 	}
 }
@@ -456,7 +456,7 @@ func TestUpdatePasscodeRejects(t *testing.T) {
 	}
 	if err := svc.UpdatePasscode(ctx, signup.UpdatePasscodeParams{
 		TournamentID: tid, PlayerID: reg.Player.ID + 100000, PasscodeHash: "x", ActorUserID: actor,
-	}); !errors.Is(err, signup.ErrPlayerNotFound) {
+	}); !errors.Is(err, tournament.ErrPlayerNotFound) {
 		t.Fatalf("查無選手應回 ErrPlayerNotFound,得到 %v", err)
 	}
 	// 兩次失敗都不該改到任何東西。

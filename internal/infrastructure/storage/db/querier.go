@@ -1223,6 +1223,50 @@ type Querier interface {
 	// 沒有它就變成「列出這些場次的所有投票」,那正是 VoteTalliesByMatch 註解裡
 	// 不能存在的那支查詢。要看別人投給誰,這裡沒有路。
 	MyVotesByMatch(ctx context.Context, arg MyVotesByMatchParams) ([]MyVotesByMatchRow, error)
+	// ══ 即時戰況推播 ════════════════════════════════════════════════
+	// 把一則變化的「信封」送進 LISTEN / NOTIFY 頻道(internal/core/activity/watch)。
+	//
+	// ── 為什麼扇出用 NOTIFY 而不是行程內的 hub ──────────────────────
+	//
+	// **NOTIFY 只在交易 commit 時才送出,rollback 的交易一個字都不會送。**
+	// 行程內 hub 給不了這個保證:服務得記得在 commit 之後才發布,而「在 commit 之前
+	// 發布」是很容易寫出來的一行 —— 症狀是觀眾看到一個後來被 rollback 的賽果。
+	// 交給 Postgres 之後,那個 bug 在結構上不可能發生。
+	//
+	// 所以這一支的呼叫位置是固定的:**與領域變更同一個交易**,就寫在 AppendEvents
+	// 寫 outbox 的旁邊(matchpg)。搬出去就失去上面那個唯一的理由。
+	//
+	// ── 為什麼只送信封 ──────────────────────────────────────────────
+	//
+	// NOTIFY 的 payload 上限是 8000 bytes,而封盤那則的讓武清單會超過 ——
+	// 超過不是「被截斷」,是**整個交易失敗**,也就是裁判封不了盤。
+	// 所以這裡只送 {賽事 slug, 種類, 參照 id},完整內容由 watchpg 收到後自己讀。
+	//
+	// ── 為什麼頻道名是參數 ──────────────────────────────────────────
+	//
+	// pg_notify(text, text) 收的是值不是識別字,所以頻道名可以由呼叫端帶。
+	// 權威因此只有一個:internal/core/activity/watch 的 Channel 常數,LISTEN 那端
+	// 也從它取。寫成 SQL 裡的字面值就會有兩份,而打錯一個字的症狀是
+	// 「推播完全沒有反應,但每一支測試都過」。
+	NotifyActivityWatch(ctx context.Context, arg NotifyActivityWatchParams) error
+	// ══ 即時戰況推播 ════════════════════════════════════════════════
+	// 投票改變了賠率,通知即時戰況的訂閱者(internal/core/activity/watch)。
+	//
+	// 為什麼投票要有自己的一支,而不是沿用 activity_match.sql 的 NotifyActivityWatch:
+	// 那一支收的是組好的信封字串,而投票路徑手上**只有 matches.id** ——
+	// UpsertVote 的參數就只有 (match_id, user_id, side)。要在 Go 裡組信封就得先查
+	// 一次 slug 與 public_id,那是**每一票**都要付的一次額外往返,只為了換一個
+	// 字串拼接的位置。所以這裡直接在同一句 SQL 裡把信封組好。
+	//
+	// 代價是信封的三個鍵名在這裡有一份鏡像(權威是 watch.Envelope 的 json tag)。
+	// 鍵名對不上的話推播會靜靜失效,所以 watchpg 的整合測試直接解析這一句送出的
+	// 信封並與 Go 的型別比對 —— 有一邊被改到,測試就會紅。
+	// 種類(k)與頻道名仍然由呼叫端從 Go 常數帶進來,不在 SQL 裡寫死。
+	//
+	// 查無此場次時 FROM 沒有列,自然不送通知 —— 那正是想要的行為。
+	// 同一個交易裡對同一場投兩次票只會送一則:Postgres 會把 (channel, payload)
+	// 完全相同的通知去重,而投票的信封不含票數,內容天生相同。
+	NotifyWatchOdds(ctx context.Context, arg NotifyWatchOddsParams) error
 	// 同上,只列未結算的。
 	//
 	// 分成獨立一支而不是在 BetsByUser 加一個 open_only 布林參數,是為了 bets_open_idx ——

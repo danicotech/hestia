@@ -122,7 +122,7 @@ func (f *fakeRepo) CredentialByGameID(_ context.Context, tournamentID int64, gam
 			return Credential{Player: r.player, PasscodeHash: r.hash, PasscodeIssuedAt: r.issued}, nil
 		}
 	}
-	return Credential{}, ErrPlayerNotFound
+	return Credential{}, tournament.ErrPlayerNotFound
 }
 
 func (f *fakeRepo) PlayerByPublicID(_ context.Context, tournamentID int64, publicID string) (tournament.Player, error) {

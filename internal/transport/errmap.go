@@ -6,6 +6,11 @@ import (
 
 	"connectrpc.com/connect"
 
+	"github.com/danicotech/hestia/internal/core/activity/betting"
+	"github.com/danicotech/hestia/internal/core/activity/handicap"
+	"github.com/danicotech/hestia/internal/core/activity/match"
+	"github.com/danicotech/hestia/internal/core/activity/signup"
+	"github.com/danicotech/hestia/internal/core/activity/tournament"
 	"github.com/danicotech/hestia/internal/core/platform/activitylog"
 	"github.com/danicotech/hestia/internal/core/platform/adminecon"
 	"github.com/danicotech/hestia/internal/core/platform/daily"
@@ -68,6 +73,91 @@ var errorCodes = []struct {
 	reason string
 }{
 	// ── 遊戲 / 開箱 / 抽獎 / 寵物(play,schemas/25)────────────────
+
+	// ── 活動層:報名與身分(signup)────────────────────────────
+	//
+	// ErrInvalidCredentials 刻意不區分「查無此遊戲ID」與「通行碼錯誤」——
+	// 遊戲ID 是公開資訊(對戰表上就有),區分等於送出一份帳號列舉工具。
+	{signup.ErrInvalidCredentials, connect.CodeUnauthenticated, "activity_invalid_credentials"},
+	{signup.ErrAlreadyRegistered, connect.CodeAlreadyExists, "activity_already_registered"},
+	{signup.ErrGameIDRequired, connect.CodeInvalidArgument, "activity_game_id_required"},
+	{signup.ErrInvalidGameID, connect.CodeInvalidArgument, "activity_invalid_game_id"},
+	{signup.ErrDiscordNameRequired, connect.CodeInvalidArgument, "activity_discord_name_required"},
+	{signup.ErrFieldTooLong, connect.CodeInvalidArgument, "activity_field_too_long"},
+	// 兩種「已綁」分開:前者要使用者先解綁自己的,後者是那個帳號被別人用了。
+	{signup.ErrAlreadyBound, connect.CodeFailedPrecondition, "activity_player_already_bound"},
+	{signup.ErrUserAlreadyBound, connect.CodeFailedPrecondition, "activity_user_already_bound"},
+	{signup.ErrUserRequired, connect.CodeUnauthenticated, "activity_platform_account_required"},
+
+	// ── 活動層:賽事與階段(tournament)────────────────────────
+	{tournament.ErrTournamentNotFound, connect.CodeNotFound, "tournament_not_found"},
+	{tournament.ErrPlayerNotFound, connect.CodeNotFound, "activity_player_not_found"},
+	// Aborted 而不是 FailedPrecondition:階段被別人搶先改了,重讀後重試是合理的。
+	{tournament.ErrPhaseConflict, connect.CodeAborted, "tournament_phase_conflict"},
+	{tournament.ErrWrongPhase, connect.CodeFailedPrecondition, "tournament_wrong_phase"},
+	{tournament.ErrIllegalTransition, connect.CodeFailedPrecondition, "tournament_illegal_transition"},
+	{tournament.ErrRanksLocked, connect.CodeFailedPrecondition, "tournament_ranks_locked"},
+	{tournament.ErrPlayersUnranked, connect.CodeFailedPrecondition, "tournament_players_unranked"},
+	{tournament.ErrInvalidRank, connect.CodeInvalidArgument, "activity_invalid_rank"},
+	{tournament.ErrActorRequired, connect.CodeInvalidArgument, "activity_actor_required"},
+	{tournament.ErrInvalidSeed, connect.CodeInvalidArgument, "tournament_invalid_seed"},
+	{tournament.ErrNoDrawablePlayers, connect.CodeFailedPrecondition, "tournament_no_drawable_players"},
+	{tournament.ErrPlayerNotSeeded, connect.CodeFailedPrecondition, "tournament_player_not_seeded"},
+	{tournament.ErrSamePlayer, connect.CodeInvalidArgument, "tournament_same_player"},
+
+	// ── 活動層:讓武 BP(handicap)──────────────────────────────
+	//
+	// BP 不足是 FailedPrecondition 不是 ResourceExhausted:BP 不是配額,
+	// 是這一場的固定預算,退掉一項就能再買 —— 前端該顯示餘額而不是「稍後再試」。
+	{handicap.ErrInvalidRequest, connect.CodeInvalidArgument, "handicap_invalid_request"},
+	{handicap.ErrInsufficientBP, connect.CodeFailedPrecondition, "insufficient_bp"},
+	{handicap.ErrNoBudget, connect.CodeFailedPrecondition, "handicap_no_budget"},
+	{handicap.ErrHandicapLocked, connect.CodeFailedPrecondition, "handicap_locked"},
+	{handicap.ErrAlreadyLocked, connect.CodeFailedPrecondition, "handicap_already_locked"},
+	{handicap.ErrHandicapClosed, connect.CodeFailedPrecondition, "handicap_wrong_phase"},
+	// 階段對但裁判還沒按開盤 —— 對選手的下一步不同(等公告 vs 這場不選購),故分開。
+	{handicap.ErrHandicapNotOpen, connect.CodeFailedPrecondition, "handicap_not_open"},
+	{handicap.ErrTargetNoteRequired, connect.CodeInvalidArgument, "handicap_target_note_required"},
+	{handicap.ErrNotSelectionOwner, connect.CodePermissionDenied, "handicap_not_selection_owner"},
+	{handicap.ErrItemNotFound, connect.CodeNotFound, "handicap_item_not_found"},
+	{handicap.ErrSelectionNotFound, connect.CodeNotFound, "handicap_selection_not_found"},
+	{handicap.ErrSelectionAlreadyVoided, connect.CodeAlreadyExists, "handicap_selection_already_voided"},
+	// spent 與選購紀錄對不起來:這是寫入路徑有 bug,不是使用者做錯什麼。
+	{handicap.ErrBudgetInconsistent, connect.CodeInternal, "handicap_budget_inconsistent"},
+
+	// ── 活動層:投票與下注(betting)──────────────────────────
+	{betting.ErrInvalidRequest, connect.CodeInvalidArgument, "bet_invalid_request"},
+	{betting.ErrSelfBet, connect.CodePermissionDenied, "bet_self_bet"},
+	{betting.ErrBettingClosed, connect.CodeFailedPrecondition, "bet_closed"},
+	{betting.ErrVotingClosed, connect.CodeFailedPrecondition, "vote_closed"},
+	// 賠率在送達前跑掉了。Aborted:重讀賠率後重試是正確的處置。
+	{betting.ErrOddsMoved, connect.CodeAborted, "bet_odds_moved"},
+	{betting.ErrStakeTooLarge, connect.CodeFailedPrecondition, "bet_stake_too_large"},
+	{betting.ErrDuplicateLeg, connect.CodeInvalidArgument, "bet_duplicate_leg"},
+	{betting.ErrTooManyLegs, connect.CodeInvalidArgument, "bet_too_many_legs"},
+	{betting.ErrMatchNotInTournament, connect.CodeInvalidArgument, "bet_match_not_in_tournament"},
+	{betting.ErrMatchNotDecided, connect.CodeFailedPrecondition, "bet_match_not_decided"},
+	{betting.ErrWalkoverMatch, connect.CodeFailedPrecondition, "bet_walkover_match"},
+	{betting.ErrNotWalkover, connect.CodeFailedPrecondition, "bet_not_walkover"},
+	{betting.ErrLedgerStateConflict, connect.CodeInternal, "bet_ledger_state_conflict"},
+
+	// ── 活動層:比賽生命週期(match)──────────────────────────
+	{match.ErrInvalidRequest, connect.CodeInvalidArgument, "match_invalid_request"},
+	{match.ErrMatchNotFound, connect.CodeNotFound, "activity_match_not_found"},
+	{match.ErrConfirmationRequired, connect.CodeInvalidArgument, "confirmation_required"},
+	{match.ErrWinnerNotInMatch, connect.CodeInvalidArgument, "winner_not_in_match"},
+	{match.ErrNotReady, connect.CodeFailedPrecondition, "match_not_ready"},
+	{match.ErrNotLocked, connect.CodeFailedPrecondition, "match_not_locked"},
+	{match.ErrNotLive, connect.CodeFailedPrecondition, "match_not_live"},
+	{match.ErrMatchFinished, connect.CodeFailedPrecondition, "match_finished"},
+	{match.ErrAlreadyOpen, connect.CodeFailedPrecondition, "match_already_open"},
+	{match.ErrAlreadyWithdrawn, connect.CodeAlreadyExists, "activity_player_already_withdrawn"},
+	{match.ErrPlayerWithdrawn, connect.CodeFailedPrecondition, "activity_player_withdrawn"},
+	{match.ErrPlayersNotSet, connect.CodeFailedPrecondition, "match_players_not_set"},
+	// 對戰表或晉級目標不見了:資料完整性失效,不是使用者錯誤。
+	{match.ErrBracketMissing, connect.CodeInternal, "activity_bracket_missing"},
+	{match.ErrAdvanceTargetMissing, connect.CodeInternal, "activity_advance_target_missing"},
+
 	{play.ErrNotFound, connect.CodeNotFound, "play_not_found"},
 	{play.ErrDisabled, connect.CodeFailedPrecondition, "play_disabled"},
 	// 到上限不是錯誤是規則。用 ResourceExhausted 讓 client 分得出

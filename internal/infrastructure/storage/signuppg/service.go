@@ -250,7 +250,7 @@ func (s *Service) CredentialByGameID(ctx context.Context, tournamentID int64, ga
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return signup.Credential{}, fmt.Errorf("賽事 %d 查無此遊戲ID: %w",
-				tournamentID, signup.ErrPlayerNotFound)
+				tournamentID, tournament.ErrPlayerNotFound)
 		}
 		return signup.Credential{}, fmt.Errorf("讀賽事 %d 的登入憑證: %w", tournamentID, err)
 	}
@@ -288,7 +288,7 @@ func (s *Service) UpdatePasscode(ctx context.Context, p signup.UpdatePasscodePar
 		}
 		if n == 0 {
 			return fmt.Errorf("賽事 %d 的選手 %d: %w",
-				p.TournamentID, p.PlayerID, signup.ErrPlayerNotFound)
+				p.TournamentID, p.PlayerID, tournament.ErrPlayerNotFound)
 		}
 
 		// after 只記「哪一屆的哪一位被換了碼」。明碼與雜湊都不進稽核紀錄 ——
@@ -351,7 +351,7 @@ func (s *Service) BindPlatformAccount(ctx context.Context, p signup.BindParams) 
 				if _, qerr := qtx.GetPlayerByID(ctx, db.GetPlayerByIDParams{
 					TournamentID: p.TournamentID, ID: p.PlayerID,
 				}); errors.Is(qerr, pgx.ErrNoRows) {
-					return fmt.Errorf("選手 %d: %w", p.PlayerID, signup.ErrPlayerNotFound)
+					return fmt.Errorf("選手 %d: %w", p.PlayerID, tournament.ErrPlayerNotFound)
 				} else if qerr != nil {
 					return fmt.Errorf("重讀選手 %d: %w", p.PlayerID, qerr)
 				}

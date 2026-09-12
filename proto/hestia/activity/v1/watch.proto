@@ -1,0 +1,177 @@
+syntax = "proto3";
+
+// 即時戰況推播(schemas/20、21)。
+//
+// ── 為什麼是 server streaming,不是輪詢 ─────────────────────────
+//
+// 使用者要的是「戰況即時同步」,不是畫面 reload 也不是定時 reload。
+// 輪詢在這個場景特別糟:決賽那幾分鐘所有觀眾都在看同一頁,輪詢會讓
+// 「沒有任何事發生」也產生等比於觀眾數的查詢,而真正有事發生的那一刻
+// 仍然要等到下一個輪詢週期 —— 最吵又最慢。
+//
+// 為什麼是 ConnectRPC streaming 而不是 SSE 或 WebSocket:專案鐵則 6
+// (契約自動生成,禁止手寫共用型別)。事件型別留在這份 proto 裡,
+// Go 伺服器與 TS 前端都從它生成;換成 SSE 就得手寫一份 TS 的事件型別,
+// 而那份型別會與這裡漂移,症狀是前端靜靜忽略一個後來新增的欄位。
+//
+// ── 這條流不是事實的唯一來源 ────────────────────────────────────
+//
+// 推播**會漏**:伺服器重啟、資料庫連線斷掉重連、觀眾的網路中斷,
+// 這期間發生的變化不會補送(沒有重播緩衝,刻意的 —— 觀眾要看的是「現在」,
+// 補一串三分鐘前的舊事件只會讓畫面倒退)。
+//
+// 所以前端的正確用法固定是三步,順序不能換:
+//
+//   1. 先訂閱 WatchTournament
+//   2. 再用 TournamentService 拉一次完整狀態
+//   3. 之後只套用串流送來的變化
+//
+// 先訂閱再拉取,中間那一瞬間發生的事會同時出現在兩邊(套用兩次同樣的狀態
+// 是無害的);反過來先拉後訂就會有一個永遠補不回來的缺口。
+// 連線中斷後重連也走同一套三步。
+//
+// ── 匿名可讀 ────────────────────────────────────────────────────
+//
+// 觀眾不必登入就能看戰況,理由與 tournament.proto 相同:這場活動的目的
+// 就是「闔家觀賞、強弱同樂」,看的人比打的人多。所以這條流裡**沒有任何
+// 因人而異的欄位** —— 同一屆賽事的每個訂閱者收到的位元組完全一樣。
+// 這不只是簡化,它是可以推播的前提:個人化的內容沒辦法扇出。
+package hestia.activity.v1;
+
+import "google/protobuf/timestamp.proto";
+import "hestia/activity/v1/betting.proto";
+import "hestia/activity/v1/common.proto";
+
+option go_package = "github.com/danicotech/hestia/gen/hestia/activity/v1;activityv1";
+
+// WatchService 是即時戰況的唯一出口。
+//
+// 只有一支 RPC 是刻意的:訂閱的單位是**一屆賽事**,不是一場比賽。
+// 觀眾看的是對戰表整頁(誰打到哪、哪一場在 LIVE、賠率怎麼跑),
+// 逐場訂閱會讓一個看八強頁的人開八條流,而伺服器要為此維護八份訂閱狀態。
+service WatchService {
+  // 訂閱一屆賽事的全部變化。連線直到 client 斷開或伺服器關閉為止。
+  rpc WatchTournament(WatchTournamentRequest) returns (stream WatchTournamentResponse) {}
+}
+
+message WatchTournamentRequest {
+  // 網址用的短代號,如 2026-baiye-shifeng。與 TournamentService 同一個定位方式。
+  string tournament_slug = 1;
+}
+
+// WatchTournamentResponse 是串流上的**一則變化**,不是一份完整快照。
+//
+// 名字之所以不是 TournamentUpdate:buf 的 STANDARD lint 要求回應型別跟著
+// 方法名走(RPC_RESPONSE_STANDARD_NAME),而 buf 設定不歸這支功能改。
+// 讀的時候就把它當成 one update 看。
+//
+// 用 oneof 而不是「kind + 一堆 optional 欄位」:oneof 在生成的 TS 裡是可辨識
+// 聯集,前端 switch 沒處理到的分支編譯器會講話;kind + optional 的話,
+// 新增一種變化時前端只會靜靜地什麼都不做,而那正是即時畫面最難察覺的 bug。
+message WatchTournamentResponse {
+  // 伺服器產生這則變化的時刻(伺服器時鐘)。
+  //
+  // 前端用它顯示「最後更新於」,也用它丟掉亂序的舊訊息 —— 同一條流不會亂序,
+  // 但「斷線重連 + 重新拉取完整狀態」與串流訊息之間會交錯。
+  google.protobuf.Timestamp emitted_at = 1;
+
+  oneof update {
+    // 場次狀態改變:開盤、封盤、開打、判定勝負、設直播連結。
+    MatchUpdate match = 2;
+    // 讓武封盤 —— 完整清單在這一刻對所有人公開。
+    HandicapLockedUpdate handicap_locked = 3;
+    // 賠率與票數變動。
+    OddsUpdate odds = 4;
+    // 賽事階段改變。
+    PhaseUpdate phase = 5;
+    // 冠軍產生。
+    ChampionUpdate champion = 6;
+    // 心跳。見 Heartbeat 的說明,它有兩個非裝飾性的用途。
+    Heartbeat heartbeat = 7;
+  }
+}
+
+// MatchUpdate 是一場比賽的最新狀態。
+//
+// 帶的是**整個 Match 而不是 diff**:diff 要求兩端對「上一個狀態」有共識,
+// 而觀眾可能是在比賽打到一半才打開頁面的。整場覆蓋讓「套用兩次」與
+// 「順序顛倒」都不會產生錯誤畫面,代價只是幾十個位元組。
+//
+// 刻意重用 common.proto 的 Match(狀態用 MatchStatus、勝者用 public_id):
+// 對戰表頁的那個 Match 與這裡推播的是同一個東西,定義兩份就會有兩個版本
+// (專案鐵則 9)。選手的顯示名不在裡面也是刻意的 —— 前端在第 2 步已經拉過
+// 完整對戰表,public_id 足以對上,重複送顯示名等於每一則推播都帶一份快照。
+message MatchUpdate {
+  Match match = 1;
+}
+
+// HandicapLockedUpdate 是封盤公示。
+//
+// 這是整條流裡唯一「內容變公開」而不只是「狀態變了」的一則:封盤前只有
+// 施加者本人看得到自己買了什麼,封盤後雙方與觀眾全部看得到。因此它一定
+// 帶完整清單,不能只送一個 match_public_id 讓前端自己去查 ——
+// 那樣的話「公開的是封盤當下那一份」就沒有人保證得了。
+//
+// 也因為清單可能很長(BP 夠的話一場買十幾項不奇怪),它是整個推播管線裡
+// 唯一會超過 NOTIFY 8000 bytes 上限的東西 —— 伺服器內部因此只用小信封扇出,
+// 完整內容由推播端讀出來再送。前端不需要知道這件事。
+message HandicapLockedUpdate {
+  MatchHandicaps handicaps = 1;
+}
+
+// OddsUpdate 是賠率與票數變動。有人投票就會發一則。
+//
+// 重用 betting.proto 的 MatchOdds:賠率的形狀(票數、毫分賠率、能不能下注)
+// 只該有一個定義,而那個定義是投票推導賠率那套公式的輸出。
+//
+// **唯一的例外是 my_vote:在這條流裡它恆為 0。** 推播是廣播,一則訊息要送給
+// 這一屆的所有訂閱者,不可能因人而異(見檔頭「匿名可讀」)。要知道自己投給誰,
+// 用 BettingService.GetOdds —— 那支才有請求者的身分。
+message OddsUpdate {
+  MatchOdds odds = 1;
+}
+
+// PhaseUpdate 是賽事階段改變(報名 → 評段 → 抽籤 → 比賽中 → 結束)。
+//
+// 只帶階段,不帶整個 Tournament:階段推進會讓整頁的可操作內容改變
+// (報名鈕消失、對戰表出現),前端本來就得重新拉一次完整狀態。
+// 在這裡塞一份 Tournament 只會讓前端有兩個來源可以選,而它們會在
+// 「推播比查詢早到」的時候給出不同答案。
+message PhaseUpdate {
+  TournamentPhase phase = 1;
+}
+
+// ChampionUpdate 是冠軍產生。
+//
+// 為什麼冠軍不是「決賽那場的 MatchUpdate」就好:冠軍是一屆賽事的結論,
+// 而決賽的賽果只是某一場的結果。混在一起的話,前端要自己判斷
+// 「這場是不是決賽」才知道要不要放煙火 —— 那個判斷需要總輪數,
+// 是伺服器才有的資訊(同 outbox 那則 tournament.champion 的理由)。
+//
+// 這一則帶顯示名與段位的快照,與 MatchUpdate 的取捨相反:冠軍橫幅是
+// 獨立於對戰表的一塊畫面,它不該為了顯示一個名字再回頭查對戰表。
+message ChampionUpdate {
+  // 決賽場次,前端要把橫幅連回那一場。
+  string final_match_public_id = 1;
+  string champion_player_public_id = 2;
+  // 報名當下的顯示名快照(與對戰表上顯示的是同一個)。
+  string champion_display_name = 3;
+  // 冠軍的本屆段位。放在這裡是因為橫幅要寫「無我 · 某某某」——
+  // 段位用 common.proto 的 Rank,數值即 rank_level,不另定一套。
+  Rank champion_rank = 4;
+  // 亞軍(決賽的敗方)。空 = 決賽是不戰而勝之類沒有敗方的情形。
+  string runner_up_player_public_id = 5;
+  string runner_up_display_name = 6;
+}
+
+// Heartbeat 是伺服器每隔一段時間送的空訊息。它不是裝飾,有兩個用途:
+//
+//  1. **穿過反向代理。** 部署形狀是 cloudflared + 同源 /api,閒置的
+//     HTTP 連線會被中間層在數十秒後收掉。一屆賽事在裁判兩個動作之間
+//     沉默好幾分鐘是常態,沒有心跳的話觀眾的流會被靜靜切斷,
+//     而「靜靜切斷」正是即時畫面最糟的失敗方式:畫面看起來完全正常,
+//     只是永遠停在三分鐘前。
+//  2. **訂閱成立的信號。** 伺服器在訂閱建立的當下立刻送第一則心跳。
+//     前端收到它才去拉完整狀態(檔頭的第 2 步),這樣「訂閱與拉取之間的
+//     缺口」在時序上就不存在。
+message Heartbeat {}

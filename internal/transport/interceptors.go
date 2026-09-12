@@ -11,6 +11,7 @@ import (
 
 	"connectrpc.com/connect"
 
+	"github.com/danicotech/hestia/gen/hestia/activity/v1/activityv1connect"
 	"github.com/danicotech/hestia/gen/hestia/platform/v1/platformv1connect"
 	"github.com/danicotech/hestia/internal/core/platform/activitylog"
 )
@@ -58,6 +59,50 @@ var publicProcedures = map[string]struct{}{
 	platformv1connect.AuthServiceLogoutProcedure:               {},
 	// 商品列表是公開型錄,未登入也要看得到(才有東西吸引人登入)。
 	platformv1connect.ShopServiceListItemsProcedure: {},
+
+	// ── 活動層(《百業試鋒》)────────────────────────────────
+	//
+	// 「公開」在這裡的意思是**不需要平台帳號的 Bearer**,不是「不需要身分」。
+	// 選手走的是另一軌:遊戲ID + 通行碼 → 活動層 cookie,由 handler 自己解。
+	// 報名不需要平台帳號是定案的門檻決定(grill Q12),所以這幾支必須繞過
+	// 這個攔截器,否則連報名頁都進不去。
+	activityv1connect.SignupServiceRegisterProcedure:    {},
+	activityv1connect.SignupServiceLoginProcedure:       {},
+	activityv1connect.SignupServiceLogoutProcedure:      {},
+	activityv1connect.SignupServiceGetMyPlayerProcedure: {},
+
+	// 讓武選購同樣走活動層 cookie。可見性(封盤前只看得到自己的)由領域層判斷,
+	// 不是靠這裡擋 —— 擋在這裡的話觀眾連封盤後的公開內容都看不到。
+	activityv1connect.HandicapServiceListItemsProcedure:         {},
+	activityv1connect.HandicapServiceGetMyBudgetProcedure:       {},
+	activityv1connect.HandicapServiceSelectProcedure:            {},
+	activityv1connect.HandicapServiceVoidSelectionProcedure:     {},
+	activityv1connect.HandicapServiceGetMatchHandicapsProcedure: {},
+
+	// 賽事的公開檢視。觀眾不必登入就能看對戰表與段位 ——
+	// 這場活動的目的本來就是「闔家觀賞」,看的人比打的人多。
+	activityv1connect.TournamentServiceGetTournamentProcedure: {},
+	activityv1connect.TournamentServiceListRanksProcedure:     {},
+	activityv1connect.TournamentServiceListPlayersProcedure:   {},
+	activityv1connect.TournamentServiceGetBracketProcedure:    {},
+	activityv1connect.TournamentServiceGetMatchProcedure:      {},
+
+	// 賠率匿名可讀。但它在 optionalAuthProcedures 裡也有一筆 ——
+	// 已登入的人要看得到自己投了哪一邊,見下方註解。
+	activityv1connect.BettingServiceGetOddsProcedure: {},
+}
+
+// optionalAuthProcedures 是「公開但有憑證就解」的 procedure。
+//
+// 為什麼需要第六類:publicProcedures 的路徑是完全不認證(直接 next),
+// 所以已登入使用者打 GetOdds 時 st.userID 也是 0,而 MatchOdds.my_vote
+// 是 proto 明確定義的欄位 —— 永遠回 0 等於那個欄位是壞的。
+//
+// 與 publicProcedures 的關係是**交集**而非替代:這裡列的必須同時在那裡,
+// 否則沒帶憑證的人會被擋。認證失敗一律當成匿名放行,不回錯 ——
+// 過期的 token 不該讓人連賠率都看不到。
+var optionalAuthProcedures = map[string]struct{}{
+	activityv1connect.BettingServiceGetOddsProcedure: {},
 }
 
 // privilegedServices 是「除了登入還要授權」的服務(schemas/03-authz.md)。
@@ -68,6 +113,10 @@ var publicProcedures = map[string]struct{}{
 // 用 proto descriptor 反查驗證(verifyProcedureCoverage),漏配置直接開不起來。
 var privilegedServices = []string{
 	platformv1connect.AdminEconomyServiceName,
+	// 裁判後台。用前綴的理由與 AdminEconomyService 完全相同:
+	// 逐條列舉在授權方向上是 fail open,而這個服務新增的每一支
+	// 都會是「能改變賽果的動作」——預設落在需要授權那一側才是對的。
+	activityv1connect.JudgeServiceName,
 }
 
 func requiresAuthorization(procedure string) bool {
@@ -250,6 +299,16 @@ func authInterceptor(
 			}
 
 			if _, ok := publicProcedures[procedure]; ok {
+				// 選配認證:有憑證就解出身分寫進便條,沒有或解不開就當匿名。
+				// 認證失敗**不回錯** —— 這些 procedure 的公開性是主要契約,
+				// 帶了一個過期 token 不該讓人連賠率都看不到。
+				if _, optional := optionalAuthProcedures[procedure]; optional && hasUser {
+					if userID, err := auth.Authenticate(ctx, token); err == nil && userID != 0 {
+						if st := stateFrom(ctx); st != nil {
+							st.setUserID(userID)
+						}
+					}
+				}
 				return next(ctx, req)
 			}
 			if !hasUser {

@@ -188,7 +188,7 @@ func (s *Service) Login(ctx context.Context, p LoginParams) (*tournament.Player,
 
 	cred, err := s.repo.CredentialByGameID(ctx, t.ID, gameID)
 	if err != nil {
-		if errors.Is(err, ErrPlayerNotFound) || errors.Is(err, tournament.ErrPlayerNotFound) {
+		if errors.Is(err, tournament.ErrPlayerNotFound) {
 			s.hasher.VerifyDummy(passcode)
 			return nil, ErrInvalidCredentials
 		}

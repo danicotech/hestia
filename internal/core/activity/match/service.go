@@ -142,7 +142,7 @@ func (s *Service[TX]) OpenHandicap(ctx context.Context, p OpenHandicapParams) (*
 		return nil, fmt.Errorf("%w: 缺少 match_public_id", ErrInvalidRequest)
 	}
 	if p.ActorUserID <= 0 {
-		return nil, ErrActorRequired
+		return nil, tournament.ErrActorRequired
 	}
 
 	var out *OpenHandicapResult
@@ -214,7 +214,7 @@ func (s *Service[TX]) LockHandicap(ctx context.Context, p LockHandicapParams) (*
 		return nil, fmt.Errorf("%w: 缺少 match_public_id", ErrInvalidRequest)
 	}
 	if p.ActorUserID <= 0 {
-		return nil, ErrActorRequired
+		return nil, tournament.ErrActorRequired
 	}
 	if !p.Confirm {
 		return nil, fmt.Errorf("封盤後選手不能再更動讓武: %w", ErrConfirmationRequired)
@@ -291,7 +291,7 @@ func (s *Service[TX]) StartMatch(ctx context.Context, p StartMatchParams) (*Matc
 		return nil, fmt.Errorf("%w: 缺少 match_public_id", ErrInvalidRequest)
 	}
 	if p.ActorUserID <= 0 {
-		return nil, ErrActorRequired
+		return nil, tournament.ErrActorRequired
 	}
 
 	var out *Match
@@ -342,7 +342,7 @@ func (s *Service[TX]) ReportResult(ctx context.Context, p ReportResultParams) (*
 	case p.WinnerPlayerPublicID == "":
 		return nil, fmt.Errorf("%w: 缺少 winner_player_public_id", ErrInvalidRequest)
 	case p.ActorUserID <= 0:
-		return nil, ErrActorRequired
+		return nil, tournament.ErrActorRequired
 	case !p.Confirm:
 		return nil, fmt.Errorf("判定勝負會觸發晉級與派彩: %w", ErrConfirmationRequired)
 	}
@@ -418,7 +418,7 @@ func (s *Service[TX]) WithdrawPlayer(ctx context.Context, p WithdrawPlayerParams
 	case p.PlayerPublicID == "":
 		return nil, fmt.Errorf("%w: 缺少 player_public_id", ErrInvalidRequest)
 	case p.ActorUserID <= 0:
-		return nil, ErrActorRequired
+		return nil, tournament.ErrActorRequired
 	case !p.Confirm:
 		return nil, fmt.Errorf("棄賽會判對手不戰而勝並退掉該場注單: %w", ErrConfirmationRequired)
 	}
@@ -511,7 +511,7 @@ func (s *Service[TX]) SetStreamURL(ctx context.Context, p SetStreamURLParams) (*
 		return nil, fmt.Errorf("%w: 缺少 match_public_id", ErrInvalidRequest)
 	}
 	if p.ActorUserID <= 0 {
-		return nil, ErrActorRequired
+		return nil, tournament.ErrActorRequired
 	}
 
 	var out *Match

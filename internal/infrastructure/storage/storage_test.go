@@ -8,7 +8,7 @@ import (
 )
 
 // TestMigrationsAndConstraints 是骨架煙霧測試:
-// 容器起得來、14 個 migration 套得上、且資料庫層的鐵則約束真的在擋。
+// 容器起得來、全部 migration 套得上、且資料庫層的鐵則約束真的在擋。
 func TestMigrationsAndConstraints(t *testing.T) {
 	if testing.Short() {
 		t.Skip("需要 Docker,-short 模式跳過")
@@ -26,7 +26,9 @@ func TestMigrationsAndConstraints(t *testing.T) {
 	if err := row.Scan(&currencies, &roles, &perms, &configs); err != nil {
 		t.Fatalf("查 seed 失敗: %v", err)
 	}
-	if currencies != 1 || roles != 4 || perms != 21 || configs != 22 {
+	// roles 5 / role_permissions 24:00030 加了 judge 角色與 tournament.judge,
+	// 後者給 owner / admin / judge 各一組。
+	if currencies != 1 || roles != 5 || perms != 24 || configs != 22 {
 		t.Fatalf("seed 數量不符: currencies=%d roles=%d perms=%d configs=%d", currencies, roles, perms, configs)
 	}
 

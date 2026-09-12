@@ -52,6 +52,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/danicotech/hestia/internal/core/activity/betting"
+	"github.com/danicotech/hestia/internal/core/activity/watch"
 	"github.com/danicotech/hestia/internal/core/platform/ledger"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/db"
 )
@@ -248,12 +249,29 @@ func (r *Repository) VoteTallies(ctx context.Context, tx pgx.Tx, matchIDs []int6
 
 // UpsertVote 一場一票,改票即覆蓋。權威是 votes_match_user_uq 這條 UNIQUE
 // (SQL 的 ON CONFLICT DO UPDATE),不是應用層的「先查再決定 insert 還是 update」。
+//
+// 投票**不寫 outbox**(一票不值得發一則 Discord 公告),但它會直接改變賠率,
+// 而賠率是觀眾盯著看的數字 —— 所以這裡單獨送一則即時戰況的推播通知。
+// 與寫票同一個 tx:NOTIFY 只在 commit 時送出,rollback 的投票不會讓任何人
+// 看到一個沒有發生的賠率變動。
 func (r *Repository) UpsertVote(ctx context.Context, tx pgx.Tx, matchID, userID int64, side betting.Side) error {
-	err := r.q.WithTx(tx).UpsertVote(ctx, db.UpsertVoteParams{
+	q := r.q.WithTx(tx)
+	err := q.UpsertVote(ctx, db.UpsertVoteParams{
 		MatchID: matchID, UserID: userID, Side: int16(side),
 	})
 	if err != nil {
 		return fmt.Errorf("寫入投票 match=%d user=%d: %w", matchID, userID, err)
+	}
+	// 信封由 SQL 組(投票路徑手上只有內部 id,在 Go 組就得多一次往返);
+	// 頻道與種類仍然來自 watch 的常數,不在 SQL 裡寫死。理由見 NotifyWatchOdds。
+	if err := q.NotifyWatchOdds(ctx, db.NotifyWatchOddsParams{
+		Channel: watch.Channel,
+		Kind:    string(watch.KindOdds),
+		MatchID: matchID,
+	}); err != nil {
+		// 不吞:pg_notify 出錯代表這個 transaction 已經 aborted,
+		// 繼續下去只會把成因換成一個看不懂的錯誤。
+		return fmt.Errorf("送賠率推播通知 match=%d: %w", matchID, err)
 	}
 	return nil
 }

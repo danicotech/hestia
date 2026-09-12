@@ -180,7 +180,7 @@ func TestOpenHandicapGates(t *testing.T) {
 		{
 			name:    "缺裁判身分",
 			params:  OpenHandicapParams{MatchPublicID: "M-R1S0"},
-			wantErr: ErrActorRequired,
+			wantErr: tournament.ErrActorRequired,
 		},
 		{
 			name:    "缺場次",
@@ -490,7 +490,7 @@ func TestReportResultGates(t *testing.T) {
 		{
 			name:    "缺裁判身分",
 			params:  ReportResultParams{MatchPublicID: "M-R1S0", WinnerPlayerPublicID: "P-A", Confirm: true},
-			wantErr: ErrActorRequired,
+			wantErr: tournament.ErrActorRequired,
 		},
 		{
 			name:    "還沒開打",
@@ -709,14 +709,14 @@ func TestWithdrawPlayerGates(t *testing.T) {
 	t.Run("查無此人", func(t *testing.T) {
 		f := fourPlayers(t)
 		_, err := f.svc.WithdrawPlayer(ctx, WithdrawPlayerParams{PlayerPublicID: "P-X", Confirm: true, ActorUserID: judgeID})
-		if !errors.Is(err, ErrPlayerNotFound) {
+		if !errors.Is(err, tournament.ErrPlayerNotFound) {
 			t.Fatalf("err = %v", err)
 		}
 	})
 	t.Run("缺裁判身分", func(t *testing.T) {
 		f := fourPlayers(t)
 		_, err := f.svc.WithdrawPlayer(ctx, WithdrawPlayerParams{PlayerPublicID: "P-A", Confirm: true})
-		if !errors.Is(err, ErrActorRequired) {
+		if !errors.Is(err, tournament.ErrActorRequired) {
 			t.Fatalf("err = %v", err)
 		}
 	})

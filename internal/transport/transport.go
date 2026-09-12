@@ -31,8 +31,35 @@ import (
 	"github.com/danicotech/hestia/internal/core/platform/shop"
 )
 
-// protoPackage 是本服務全部 RPC 的 proto package,啟動時的覆蓋率檢查用。
+// protoPackage 是平台層 RPC 的 proto package。
 const protoPackage protoreflect.FullName = "hestia.platform.v1"
+
+// activityProtoPackage 是活動層 RPC 的 proto package。
+//
+// 兩個 package 分開列而不是用前綴比對("hestia."):前綴會讓日後任何新的
+// hestia.* package 自動落進覆蓋率檢查,而那個檢查的內容(Admin 前綴要授權、
+// Activity 前綴只收服務身分)全是**平台層的命名慣例**。新 package 不見得
+// 遵守那些慣例,靜靜套用只會產生看不懂的啟動失敗。
+const activityProtoPackage protoreflect.FullName = "hestia.activity.v1"
+
+// scannedPackages 是啟動時覆蓋率檢查會走的 proto package。
+//
+// 漏掉一個 package 的症狀是:那個 package 的 RPC 全部不在 known 裡,
+// 於是白名單裡指向它們的每一條都被報成「proto 沒有這個 procedure」——
+// 這正是加活動層時第一次啟動看到的錯誤,而它報得很準。
+func scannedPackages() []protoreflect.FullName {
+	return []protoreflect.FullName{protoPackage, activityProtoPackage}
+}
+
+// isOurRPCPackage 回報這個 proto package 是不是本服務提供的。
+func isOurRPCPackage(name protoreflect.FullName) bool {
+	for _, p := range scannedPackages() {
+		if name == p {
+			return true
+		}
+	}
+	return false
+}
 
 // maxRequestBytes 是單一請求體的上限(1 MiB)。
 // 沒有上限等於任何人都能用一個請求吃掉伺服器記憶體;
@@ -265,7 +292,7 @@ func verifyProcedureCoverage() error {
 	var problems []string
 
 	protoregistry.GlobalFiles.RangeFiles(func(fd protoreflect.FileDescriptor) bool {
-		if fd.Package() != protoPackage {
+		if !isOurRPCPackage(fd.Package()) {
 			return true
 		}
 		services := fd.Services()
@@ -312,7 +339,7 @@ func verifyProcedureCoverage() error {
 	})
 
 	if len(known) == 0 {
-		return fmt.Errorf("找不到 %s 的 proto descriptor,生成碼可能沒被連進來", protoPackage)
+		return fmt.Errorf("找不到 %v 的 proto descriptor,生成碼可能沒被連進來", scannedPackages())
 	}
 	// 公開白名單裡的每一條都必須真的存在:改了 proto 卻留下舊字串,
 	// 結果是「本來想開放的 RPC 其實需要登入」——沉默的錯誤。

@@ -189,6 +189,68 @@ catch (e) {
 | `acting_user_provider_unsupported` | invalid_argument | 形狀對,但 provider 不在白名單內(目前只有 `discord`) |
 | `user_on_service_rpc` | permission_denied | 這支 RPC 只接受服務身分 |
 | `acting_user_required` | invalid_argument | 缺少 `X-Acting-User` |
+| `activity_invalid_credentials` | unauthenticated | 遊戲ID 或通行碼不正確 → **不區分哪個錯**,避免被拿來探測誰報名了 |
+| `activity_already_registered` | already_exists | 這個遊戲ID 已報名本屆 |
+| `activity_game_id_required` | invalid_argument | 遊戲ID 必填 |
+| `activity_invalid_game_id` | invalid_argument | 遊戲ID 格式不正確 |
+| `activity_discord_name_required` | invalid_argument | 必須填寫 Discord 名稱 |
+| `activity_field_too_long` | invalid_argument | 某個報名欄位超長 |
+| `activity_player_already_bound` | failed_precondition | 這位選手已綁定**其他**平台帳號 → 要改綁請找裁判 |
+| `activity_user_already_bound` | failed_precondition | 這個平台帳號已綁在另一位選手身上 |
+| `activity_platform_account_required` | unauthenticated | 綁定(領獎的前置)需要平台帳號 → **引導登入** |
+| `tournament_not_found` | not_found | 賽事不存在 |
+| `activity_player_not_found` | not_found | 這屆賽事裡查無此選手 |
+| `tournament_phase_conflict` | aborted | 階段已被其他裁判改變(樂觀鎖)→ **重讀後再決定**,不要盲目重試 |
+| `tournament_wrong_phase` | failed_precondition | 目前賽事階段不允許這個操作 |
+| `tournament_illegal_transition` | failed_precondition | 賽事階段轉換不合法(不能跳階段) |
+| `tournament_ranks_locked` | failed_precondition | 抽籤後不可再改段位,要改請先退回段位公布階段 |
+| `tournament_players_unranked` | failed_precondition | 尚有選手未評段,不能進入抽籤 |
+| `activity_invalid_rank` | invalid_argument | 段位不合法(只有 1–4) |
+| `activity_actor_required` | invalid_argument | 這個操作必須指明執行的裁判(要進 `admin_audit_logs`) |
+| `tournament_invalid_seed` | invalid_argument | 抽籤種子字串解析失敗 |
+| `tournament_no_drawable_players` | failed_precondition | 沒有可抽籤的選手 |
+| `tournament_player_not_seeded` | failed_precondition | 這位選手尚未抽到籤位 |
+| `tournament_same_player` | invalid_argument | 交換籤位需要兩位不同的選手 |
+| `handicap_invalid_request` | invalid_argument | 讓武選購參數不合法 |
+| `insufficient_bp` | failed_precondition | BP 不足以買下這個讓武項目 |
+| `handicap_no_budget` | failed_precondition | 本場沒有讓武預算(同段或高段方本來就沒有) |
+| `handicap_locked` | failed_precondition | 已封盤,讓武不可再更動 |
+| `handicap_already_locked` | failed_precondition | 重複封盤 —— 封盤不可逆,所以要出聲而不是默默成功 |
+| `handicap_wrong_phase` | failed_precondition | 這場不在讓武選購階段(pending / live / done) |
+| `handicap_not_open` | failed_precondition | 階段對了,但裁判還沒按開盤 → **等公告**,與上一個的下一步不同 |
+| `handicap_target_note_required` | invalid_argument | 此項目必須填寫指定內容(如「指定對手武學:XX」) |
+| `handicap_not_selection_owner` | permission_denied | 這筆讓武選擇不是你的 |
+| `handicap_item_not_found` | not_found | 讓武項目不存在 |
+| `handicap_selection_not_found` | not_found | 讓武選擇不存在 |
+| `handicap_selection_already_voided` | already_exists | 這筆讓武選擇已經退掉了 |
+| `handicap_budget_inconsistent` | internal | 已花費金額與選擇總和對不起來(不變量壞了) |
+| `bet_invalid_request` | invalid_argument | 下注 / 投票參數不合法 |
+| `bet_self_bet` | permission_denied | 選手不得對自己參與的場次下注(別場可以) |
+| `bet_closed` | failed_precondition | 這場已封盤,不能再下注 |
+| `vote_closed` | failed_precondition | 這場已不開放投票 |
+| `bet_odds_moved` | aborted | 賠率已變動 → **重新取賠率後讓使用者再確認一次**,不要靜默重送 |
+| `bet_stake_too_large` | failed_precondition | 超過單筆下注上限 |
+| `bet_duplicate_leg` | invalid_argument | 同一注單不可重複押同一場 |
+| `bet_too_many_legs` | invalid_argument | 串關腿數過多 |
+| `bet_match_not_in_tournament` | invalid_argument | 這場不屬於這屆賽事 |
+| `bet_match_not_decided` | failed_precondition | 場次尚未分出勝負,不能結算 |
+| `bet_walkover_match` | failed_precondition | 不戰而勝的場次要走退款路徑,不是正常結算 |
+| `bet_not_walkover` | failed_precondition | 這場不是不戰而勝,不該走退款路徑 |
+| `bet_ledger_state_conflict` | internal | 注單紀錄與帳本狀態矛盾 |
+| `match_invalid_request` | invalid_argument | 場次操作參數不合法 |
+| `activity_match_not_found` | not_found | 場次不存在 |
+| `confirmation_required` | invalid_argument | 不可逆動作(封盤 / 判勝負 / 棄賽)需要二次確認 |
+| `winner_not_in_match` | invalid_argument | 勝者必須是本場的選手 |
+| `match_not_ready` | failed_precondition | 這場不在讓武選購階段,無法封盤 |
+| `match_not_locked` | failed_precondition | 讓武尚未封盤,不能開打 |
+| `match_not_live` | failed_precondition | 這場尚未開打,不能判定勝負 |
+| `match_finished` | failed_precondition | 這場已完賽 |
+| `match_already_open` | failed_precondition | 這場已經開盤 |
+| `activity_player_already_withdrawn` | already_exists | 這位選手已經棄賽 |
+| `activity_player_withdrawn` | failed_precondition | 場上有一方已棄賽,不該再走正常流程 |
+| `match_players_not_set` | failed_precondition | 場次雙方尚未確定(等上一輪),還不能開盤 |
+| `activity_bracket_missing` | internal | 這屆賽事尚未抽籤卻走到需要對戰表的路徑 |
+| `activity_advance_target_missing` | internal | 晉級目標場次不存在(對戰表壞了) |
 | `not_found` | not_found | 泛用的查無此物(入口層 port) |
 | `unauthenticated` | unauthenticated | 沒有有效身分 |
 | `permission_denied` | permission_denied | 身分有效但無權執行 |
