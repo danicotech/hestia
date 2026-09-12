@@ -56,6 +56,23 @@ type ActivityMatches interface {
 	SetStreamURL(ctx context.Context, p match.SetStreamURLParams) (*match.Match, error)
 }
 
+// ActivityTournamentCreator 是「開一屆新賽事」的能力。
+//
+// # 為什麼它不是 ActivityTournament 的一個方法
+//
+// ActivityTournament 同時給**公開的** TournamentService 用
+// (activityTournamentHandler 也持有同一個值)。把 Create 併進去,
+// 等於讓公開 handler 在型別上也拿得到建賽事的能力 —— 少一個介面方法,
+// 就少一條「哪天有人在公開 handler 上呼叫它」的路。
+//
+// 它是 ActivityDeps 上**自己的一個欄位**,不是對 h.tournaments 做型別斷言。
+// 兩者都能達成上面那個隔離,但斷言的失敗是靜默的:組裝端哪天換成一個不會
+// 建賽事的實作,這一支會變成 Unimplemented 而不是編譯不過,而「漏接了什麼」
+// 在組裝處看不出來。具名欄位讓相依出現在 cmd/server 的那份清單上。
+type ActivityTournamentCreator interface {
+	Create(ctx context.Context, p tournament.CreateParams) (*tournament.CreateResult, error)
+}
+
 // ActivityPrizeParams 是一次發獎請求。
 type ActivityPrizeParams struct {
 	TournamentSlug string
@@ -97,6 +114,7 @@ type activityJudgeHandler struct {
 	prizes      ActivityPrizes
 	directory   Directory
 	authz       Authorizer
+	creator     ActivityTournamentCreator
 }
 
 // requireJudge 是本服務取裁判身分的統一入口。
@@ -115,6 +133,106 @@ func (h activityJudgeHandler) requireJudge(ctx context.Context, procedure string
 		return 0, toConnectError(err)
 	}
 	return userID, nil
+}
+
+// CreateTournament 開一屆新賽事,停在報名期。
+//
+// 建立賽事列與複製該屆的 34 項讓武目錄在同一個 transaction 裡完成
+// (理由見 tournament.CreateTournamentParams)。回應帶的 handicap_item_count
+// 就是那一份目錄的長度 —— 裁判在建立當下就看得到目錄有沒有進去。
+//
+// 規則旋鈕全部是具名欄位,**不收整包 config JSON**:那等於把 BP 級距、
+// 賠率與獎金的權威交給呼叫端,而且違反鐵則 6(契約自動生成,禁止手寫共用型別)。
+// 空欄位一律退回伺服器預設,預設值的唯一權威在 tournament.DefaultConfig。
+func (h activityJudgeHandler) CreateTournament(
+	ctx context.Context, req *connect.Request[activityv1.CreateTournamentRequest],
+) (*connect.Response[activityv1.CreateTournamentResponse], error) {
+	if h.creator == nil {
+		return nil, unimplemented("JudgeService.CreateTournament")
+	}
+	svc := h.creator
+	actorID, err := h.requireJudge(ctx, req.Spec().Procedure)
+	if err != nil {
+		return nil, err
+	}
+	community := strings.TrimSpace(req.Msg.GetCommunityPublicId())
+	if community == "" {
+		return nil, invalidArgument("community_public_id 必填")
+	}
+	if strings.TrimSpace(req.Msg.GetSlug()) == "" {
+		return nil, invalidArgument("slug 必填")
+	}
+	if strings.TrimSpace(req.Msg.GetName()) == "" {
+		return nil, invalidArgument("name 必填")
+	}
+
+	res, err := svc.Create(ctx, tournament.CreateParams{
+		CommunityPublicID: community,
+		Slug:              req.Msg.GetSlug(),
+		Name:              req.Msg.GetName(),
+		SignupBonus:       req.Msg.GetSignupBonus(),
+		Config:            configOverridesFromProto(req.Msg),
+		ActorUserID:       actorID,
+		// 建立賽事沒有「為什麼」可填:稽核紀錄上的 after 已經寫著它建了什麼,
+		// 而一屆新賽事不需要向任何人解釋(要解釋的是改動既有資料的那些動作)。
+		Reason: "",
+	})
+	if err != nil {
+		return nil, toConnectError(err)
+	}
+	// 人數直接給 0,不查 reader:一屆剛 INSERT 完的賽事必然沒有人報名,
+	// 為此多打一次資料庫只是把一個恆等式變成一次往返。
+	return connect.NewResponse(&activityv1.CreateTournamentResponse{
+		Tournament:        tournamentToProto(&res.View, 0),
+		HandicapItemCount: int32(res.HandicapItemCount),
+	}), nil
+}
+
+// configOverridesFromProto 把請求上的規則旋鈕轉成領域的覆寫形態。
+//
+// **0 一律解讀成「沒填」**,而不是「設成 0」:這幾個值設成 0 全都沒有意義
+// (分母為 0、賠率下限為 0、BP 級距為 0 等於整屆沒有讓武)。
+// 唯一的例外是 vig_bps —— 0 是合法的「不抽水」,所以 proto 那側把它開成
+// optional,這裡原樣把指標傳下去。
+//
+// 負數刻意**不在這裡擋**:它們會原樣傳進 NewConfig,由那一份唯一的驗證
+// 退回 ErrConfigMalformed。在入口再擋一次就是第二個權威位置。
+func configOverridesFromProto(msg *activityv1.CreateTournamentRequest) tournament.ConfigOverrides {
+	o := tournament.ConfigOverrides{
+		BPPerRankGap:       optInt64(msg.GetBpPerRankGap()),
+		HandicapItemMaxQty: optInt32(msg.GetHandicapItemMaxQty()),
+	}
+	if odds := msg.GetOdds(); odds != nil {
+		o.Smoothing = optInt64(odds.GetSmoothing())
+		o.VigBPS = odds.VigBps
+		o.MinOddsMilli = optInt64(odds.GetMinOddsMilli())
+		o.MaxOddsMilli = optInt64(odds.GetMaxOddsMilli())
+		o.MaxParlayMilli = optInt64(odds.GetMaxParlayMilli())
+	}
+	if pz := msg.GetPrizes(); pz != nil {
+		o.Prizes = &tournament.Prizes{
+			Champion:      pz.GetChampion(),
+			RunnerUp:      pz.GetRunnerUp(),
+			Third:         pz.GetThird(),
+			Participation: pz.GetParticipation(),
+		}
+	}
+	return o
+}
+
+// optInt64 / optInt32 把「0 = 用預設」的請求欄位轉成指標。
+func optInt64(v int64) *int64 {
+	if v == 0 {
+		return nil
+	}
+	return &v
+}
+
+func optInt32(v int32) *int32 {
+	if v == 0 {
+		return nil
+	}
+	return &v
 }
 
 // AdvancePhase 推進(或退回)賽事階段。

@@ -115,6 +115,12 @@ func TestToConnectError(t *testing.T) {
 		{signup.ErrUserRequired, connect.CodeUnauthenticated},
 
 		// 活動層:賽事與階段
+		// 活動層:賽事與階段
+		{tournament.ErrInvalidRequest, connect.CodeInvalidArgument},
+		{tournament.ErrConfigMalformed, connect.CodeInvalidArgument},
+		{tournament.ErrInvalidSlug, connect.CodeInvalidArgument},
+		{tournament.ErrSlugTaken, connect.CodeAlreadyExists},
+		{tournament.ErrCommunityNotFound, connect.CodeNotFound},
 		{tournament.ErrTournamentNotFound, connect.CodeNotFound},
 		{tournament.ErrPlayerNotFound, connect.CodeNotFound},
 		{tournament.ErrPhaseConflict, connect.CodeAborted},

@@ -34,7 +34,17 @@ var (
 
 func TestMain(m *testing.M) {
 	flag.Parse()
-	if !testing.Short() {
+	// -short 整包跳過,而不是靠每一支測試自己呼叫 setup(t)。
+	//
+	// 原本的寫法是逐測試 opt-in,而 summary_test.go 的九支全部漏掉了 ——
+	// 於是 -short 時 pool 是 nil,第一支就 panic,`go test -short ./...`
+	// 整個 repo 都停在這裡。這個套件沒有一支測試能在沒有資料庫時做事,
+	// 所以判斷只該有一處。
+	if testing.Short() {
+		fmt.Fprintln(os.Stderr, "readpg: 需要 Docker,-short 模式整包跳過")
+		os.Exit(0)
+	}
+	{
 		p, cleanup, err := testdb.StartShared(context.Background())
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "testdb:", err)
@@ -47,14 +57,12 @@ func TestMain(m *testing.M) {
 		cleanup()
 		os.Exit(code)
 	}
-	os.Exit(m.Run())
 }
 
+// setup 只是取 ctx。-short 的跳過在 TestMain,不在這裡 ——
+// 同一個判斷放兩處,漏掉的那一處就是 summary_test.go 當初出事的方式。
 func setup(t *testing.T) context.Context {
 	t.Helper()
-	if testing.Short() {
-		t.Skip("需要 Docker,-short 模式跳過")
-	}
 	return context.Background()
 }
 

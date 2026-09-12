@@ -27,6 +27,13 @@ option go_package = "github.com/danicotech/hestia/gen/hestia/activity/v1;activit
 
 // JudgeService 是裁判後台。全部需要裁判權限,全部進稽核紀錄。
 service JudgeService {
+  // 開一屆新賽事。建立出來就停在 SIGNUP(報名期)。
+  //
+  // 同一個 transaction 內會一併複製該屆的讓武項目目錄 —— 讓武項目是
+  // **逐屆一套**(價格要能逐屆調,而上屆的選購紀錄必須永遠指向上屆的價格),
+  // 所以它不是全域 seed,而是開賽事時複製進去的。
+  rpc CreateTournament(CreateTournamentRequest) returns (CreateTournamentResponse) {}
+
   // 推進賽事階段(報名截止、開始評段、公布段位、開始抽籤……)。
   rpc AdvancePhase(AdvancePhaseRequest) returns (AdvancePhaseResponse) {}
 
@@ -61,6 +68,86 @@ service JudgeService {
 
   // 發放賽事獎金。得獎者必須已綁定平台帳號。
   rpc AwardPrizes(AwardPrizesRequest) returns (AwardPrizesResponse) {}
+}
+
+// TournamentOddsSettings 是這一屆的賠率與抽水參數。
+//
+// 全部是整數:bps 是萬分之一、milli 是千分之一。賠率乘注額就是金額,
+// 中間只要出現一次浮點數,兩個人算同一張注單就可能差一塊錢(鐵則 3 的延伸)。
+//
+// **留 0 = 用伺服器預設**,不是「設成 0」——這幾個值設成 0 全都沒有意義
+// (分母為 0、賠率下限為 0)。唯一的例外是 vig_bps,所以只有它是 optional。
+message TournamentOddsSettings {
+  // 拉普拉斯平滑量,避免冷門方分母為 0。預設 5。
+  int64 smoothing = 1;
+  // 抽水,萬分之一。800 = 8%(預設)。
+  //
+  // 這裡用 optional 是因為 **0 是合法設定**(不抽水),與「沒填」是兩件事。
+  // 其餘欄位的 0 沒有合法解釋,所以不需要這一層。
+  optional int64 vig_bps = 2;
+  // 單場賠率下限,千分之一。1050 = 1.05 倍(預設)。
+  int64 min_odds_milli = 3;
+  // 單場賠率上限,壓住「一面倒的比賽開出天價賠率」的尾端風險。預設 12000。
+  int64 max_odds_milli = 4;
+  // 串關總賠率上限。預設 300000。
+  int64 max_parlay_milli = 5;
+}
+
+// TournamentPrizeSettings 是這一屆的獎金表,單位為平台代幣。**0 = 不發**。
+//
+// 沒有「預設獎金」這回事:一份沒填金額的設定該變成不發獎,
+// 而不是發一個隨便猜的數字。
+message TournamentPrizeSettings {
+  int64 champion = 1;
+  int64 runner_up = 2;
+  // 單淘汰沒有季軍賽,季軍推不出來。**填 0 以外的值會在發獎時被拒絕**,
+  // 那是刻意的 —— 不是 bug。
+  int64 third = 3;
+  // 參加獎,發給每一位報名並綁定平台帳號的選手。
+  int64 participation = 4;
+}
+
+// CreateTournamentRequest 開一屆新賽事。
+//
+// # 為什麼旋鈕是具名欄位而不是一包 config JSON
+//
+// tournaments.config 決定的是 BP 級距、賠率與獎金 —— 讓 client 直接送一包
+// 未經驗證的 JSON 進去,等於把那三件事的權威交出去,而且違反鐵則 6
+// (契約自動生成,禁止手寫共用型別)。要讓裁判調的參數就開成欄位。
+//
+// # 預設值只有一份
+//
+// 空欄位一律退回伺服器預設(internal/core/activity/tournament 的 DefaultConfig)。
+// 這份 proto **刻意不重述那些數字是多少**以外的事 —— 註解裡的數字是給人看的,
+// 真值在 Go 那一份,兩邊不同步時以 Go 為準。
+message CreateTournamentRequest {
+  // 這屆賽事掛在哪個社群底下。
+  string community_public_id = 1;
+  // 網址用的短代號,如 2026-baiye-shifeng。小寫英數與連字號,全域唯一。
+  //
+  // **建立後不可改**:它會出現在已經發出去的公告網址裡。
+  string slug = 2;
+  // 對外顯示的賽事名稱,如「百業試鋒 2026 春季賽」。
+  string name = 3;
+  // 報名獎勵(平台代幣),0 = 不發。
+  int64 signup_bonus = 4;
+  // 每差一段給多少 BP。0 = 用預設(8);差二段 16、差三段 24、同段 0。
+  int64 bp_per_rank_gap = 5;
+  // 賠率與抽水。整包留空 = 全部用預設。
+  TournamentOddsSettings odds = 6;
+  // 獎金表。整包留空 = 全部不發。
+  TournamentPrizeSettings prizes = 7;
+  // 單一讓武項目的重複購買上限。**0 = 不限制**,這是目前的定案值。
+  int32 handicap_item_max_qty = 8;
+}
+
+message CreateTournamentResponse {
+  Tournament tournament = 1;
+  // 本屆複製進去的讓武項目數。
+  //
+  // 回這個數字是為了讓「目錄有沒有進去」在建立當下就有答案 —— 否則要等到
+  // 選手走到選讓武那一步才發現沒東西可選,而那時候已經報名、評段、抽籤完了。
+  int32 handicap_item_count = 2;
 }
 
 message AdvancePhaseRequest {

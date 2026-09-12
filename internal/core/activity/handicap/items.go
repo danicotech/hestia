@@ -7,12 +7,16 @@ import (
 	"sync"
 )
 
-// seedJSON 是《百業試鋒》讓武項目總表。
+// seedJSON 是《百業試鋒》讓武項目總表,也是**唯一**的那一份。
 //
 // 內嵌而不是讀檔:這份清單是賽事規則本身,不是設定。跟 binary 一起走才保證
 // 「部署到哪裡,規則就是哪一份」—— 少一個「正式機上那個 JSON 是哪個版本」的問題。
 //
-//go:embed seed/handicap-items.json
+// 這份清單是**目錄不是資料**:開一屆賽事時整份複製進 activity.handicap_items,
+// 逐屆一套(價格要能逐屆調,而上屆的選購紀錄必須永遠指向上屆的價格)。
+// 複製的動作在 tournament.Service.Create,與建立賽事同一個 transaction。
+//
+//go:embed catalogue.json
 var seedJSON []byte
 
 // seedFile 是 JSON 的外層結構。$comment 與 version 刻意不解析:

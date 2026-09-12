@@ -110,6 +110,10 @@ type ActivityDeps struct {
 	Reader ActivityReader
 	// Prizes 是賽事獎金發放;nil = JudgeService.AwardPrizes 回 Unimplemented。
 	Prizes ActivityPrizes
+	// TournamentCreator 是「開一屆新賽事」。刻意與 Tournament 分開:
+	// 公開的 TournamentService 持有 Tournament,不該在型別上也拿得到
+	// 建賽事的能力(見 ActivityTournamentCreator)。
+	TournamentCreator ActivityTournamentCreator
 
 	// Sessions 簽發與驗證活動層 session(見 ActivitySessions)。
 	// nil = 所有需要選手身分的 RPC 回 Unimplemented —— 不是「放行」。
@@ -152,7 +156,7 @@ func MountActivity(mux *http.ServeMux, deps ActivityDeps, opts ...connect.Handle
 	mux.Handle(activityv1connect.NewJudgeServiceHandler(activityJudgeHandler{
 		tournaments: deps.Tournament, matches: deps.Matches, signup: deps.Signup,
 		reader: deps.Reader, prizes: deps.Prizes, directory: deps.Directory,
-		authz: deps.Authorizer,
+		authz: deps.Authorizer, creator: deps.TournamentCreator,
 	}, opts...))
 }
 

@@ -206,6 +206,7 @@ func TestProcedureMappingCoversPrivilegedServices(t *testing.T) {
 		authz.ProcAdminEconomyHandleRedemption,
 		authz.ProcAdminEconomyListEntries,
 
+		authz.ProcJudgeCreateTournament,
 		authz.ProcJudgeAdvancePhase,
 		authz.ProcJudgeAssignRank,
 		authz.ProcJudgeListUnranked,

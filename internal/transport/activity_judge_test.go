@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/reflect/protoregistry"
 
 	activityv1 "github.com/danicotech/hestia/gen/hestia/activity/v1"
 	"github.com/danicotech/hestia/gen/hestia/activity/v1/activityv1connect"
@@ -144,6 +146,13 @@ func judgeDeps() (ActivityDeps, *fakeActivityTournament, *fakeActivityMatches,
 	}
 	reader.matches = testBracketMatches()
 
+	deps.TournamentCreator = &fakeTournamentCreator{
+		fakeActivityTournament: tsvc,
+		res: &tournament.CreateResult{
+			View:              *testView(tournament.PhaseSignup),
+			HandicapItemCount: 34,
+		},
+	}
 	matches := &fakeActivityMatches{}
 	sgn := &fakeActivitySignup{regenRes: &signup.RegenerateResult{Passcode: "Z9X4W2"}}
 	prizes := &fakeActivityPrizes{awards: []ActivityPrizeAward{
@@ -222,9 +231,21 @@ func TestJudgeServiceWithoutAuthorizerDeniesEverything(t *testing.T) {
 // judgeCalls 回傳每一支裁判 RPC 的最小合法呼叫。
 //
 // 逐支列出而不是只測一兩支:漏掉權限檢查的那一支,正是會被人找到的那一支。
-// 這份清單與 proto 的服務定義必須一樣長 —— 新增 RPC 時測試會先提醒你。
+// 涵蓋完整性由 TestJudgeCallsCoversEveryRPC 對著 proto descriptor 保證。
 func judgeCalls(c activityv1connect.JudgeServiceClient) map[string]func(context.Context, bool) error {
 	return map[string]func(context.Context, bool) error{
+		"CreateTournament": func(ctx context.Context, in bool) error {
+			r := connect.NewRequest(&activityv1.CreateTournamentRequest{
+				CommunityPublicId: "01J0COMMUNITY",
+				Slug:              testSlug,
+				Name:              "百業試鋒",
+			})
+			if in {
+				withUser(r, testUserID)
+			}
+			_, err := c.CreateTournament(ctx, r)
+			return err
+		},
 		"AdvancePhase": func(ctx context.Context, in bool) error {
 			r := connect.NewRequest(&activityv1.AdvancePhaseRequest{
 				TournamentSlug: testSlug,
@@ -818,6 +839,40 @@ func TestUnmappedActivityErrorsStayOpaque(t *testing.T) {
 	for _, leak := range []string{"pq:", "relation", "activity.tournaments"} {
 		if strings.Contains(err.Error(), leak) {
 			t.Fatalf("錯誤訊息外洩了內部細節(%q):%v", leak, err)
+		}
+	}
+}
+
+// judgeCalls 必須涵蓋 proto 裡的每一支 JudgeService RPC。
+//
+// 判準取自 proto descriptor,不是另一個手寫數字。上一版靠的是
+// len(authz.procedures) == len(calls),但兩邊都是同一份 map 的投影 ——
+// 新增一支 RPC 卻忘了加進 map,兩個數字仍然相等,測試照樣綠。
+// CreateTournament 就是這樣溜過去的:它上線時這裡一聲都沒出。
+func TestJudgeCallsCoversEveryRPC(t *testing.T) {
+	d, err := protoregistry.GlobalFiles.FindDescriptorByName(
+		protoreflect.FullName(activityv1connect.JudgeServiceName))
+	if err != nil {
+		t.Fatalf("找不到 JudgeService 的 descriptor: %v", err)
+	}
+	sd, ok := d.(protoreflect.ServiceDescriptor)
+	if !ok {
+		t.Fatalf("%s 不是服務", activityv1connect.JudgeServiceName)
+	}
+	calls := judgeCalls(nil)
+	methods := sd.Methods()
+	for i := 0; i < methods.Len(); i++ {
+		name := string(methods.Get(i).Name())
+		if _, ok := calls[name]; !ok {
+			t.Errorf("proto 有 %s,judgeCalls 沒有 —— 這一支的權限檢查沒被測到", name)
+		}
+	}
+	if methods.Len() != len(calls) {
+		t.Errorf("judgeCalls 有 %d 支,proto 有 %d 支", len(calls), methods.Len())
+	}
+	for name := range calls {
+		if methods.ByName(protoreflect.Name(name)) == nil {
+			t.Errorf("judgeCalls 有 %s,但 proto 沒有這支 RPC(改名後留下的舊字串?)", name)
 		}
 	}
 }

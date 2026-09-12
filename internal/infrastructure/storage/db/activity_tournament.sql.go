@@ -592,47 +592,12 @@ func (q *Queries) GetPlayerSeedForUpdate(ctx context.Context, arg GetPlayerSeedF
 }
 
 const getTournamentBySlug = `-- name: GetTournamentBySlug :one
-
-
 SELECT id, public_id, slug, name, community_id, phase, config, signup_bonus,
        created_at, updated_at
 FROM activity.tournaments
 WHERE slug = $1::text
 `
 
-// 《百業試鋒》賽事核心 query(schemas/20 + schemas/26)。
-// 對應 port:internal/core/activity/tournament.Repo 與 internal/core/activity/signup.Repo。
-// 涵蓋 activity.tournaments / fencers / tournament_players / matches 四張表。
-//
-// ── 稽核 ──────────────────────────────────────────────────────
-// 破壞性操作(推進階段、抽籤、交換籤位、改段位、換發通行碼)必須寫
-// platform.admin_audit_logs,**且與資料變更同一個 transaction**。
-// 這裡**不另寫 insert** —— queries/audit.sql 的 InsertAdminAudit 就是那個權威位置
-// (鐵則 9)。adapter 在同一個 tx 裡呼叫它即可。
-//
-// ── 鎖序(activity 這一側的約定,全檔一致)──────────────────────
-//  1. 任何要寫 activity 子表的 transaction,**第一步先取賽事列的鎖**:
-//     LockTournamentShared    一般寫入(報名、綁定、換通行碼、評段)
-//     LockTournamentExclusive 裁判破壞性操作(抽籤、退回階段、交換籤位)
-//     共享鎖彼此不互斥(報名可以並發),但會擋住 UpdateTournamentPhase ——
-//     這正是「RequirePhase 檢查通過之後,階段不會在腳下被換掉」的來源。
-//     獨佔鎖讓「重抽 / 交換籤位 / 退回階段」三者對同一屆賽事完全串行化;
-//     它們都是低頻手動操作,用一列鎖換掉所有交錯情境很划算。
-//  2. 取得賽事列的鎖之後,一律依 tournament_players → fencers → matches 的順序寫。
-//     fencers 排在 tournament_players **之後**是因為 SetPlayerRank 必然是
-//     「先寫本屆段位、再回寫跨屆快照」;報名雖然要先讀/建 fencer,但那一步只會
-//     鎖到自己剛插入的新列(或等待並發的同 game_id 插入),不持有任何其他鎖。
-//  3. matches 只有第 1 條裡的獨佔那一組會寫,所以它不可能與 1/2 形成環。
-//     重抽開頭的 DeleteTournamentMatches 雖然在 tournament_players 之前動,
-//     但 DELETE 子表不對父表取鎖,同樣構不成環。
-//  4. 跨 schema(報名獎金走 Ledger.ApplyInTx)時,activity 的鎖永遠先取、
-//     platform 的鎖後取(users → user_balances,與 shop/daily 同向)。
-//
-// ── passcode_hash 的流向 ───────────────────────────────────────
-// 只有 GetCredentialByGameID 會 SELECT passcode_hash。其餘回傳選手的 query
-// 一律列舉欄位、刻意漏掉它 —— tournament.Player 結構本身也沒有這個欄位,
-// 一個查都沒查出來的值,不可能被誰不小心序列化到對戰表 API 上。
-// ═══ 賽事(tournaments)═══════════════════════════════════════
 // slug 在網址列上,不是秘密;查無回 ErrTournamentNotFound 由 adapter 轉。
 func (q *Queries) GetTournamentBySlug(ctx context.Context, slug string) (ActivityTournament, error) {
 	row := q.db.QueryRow(ctx, getTournamentBySlug, slug)
@@ -741,6 +706,101 @@ func (q *Queries) InsertMatches(ctx context.Context, arg InsertMatchesParams) (i
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const insertTournament = `-- name: InsertTournament :one
+
+
+INSERT INTO activity.tournaments (public_id, slug, name, community_id, phase, config, signup_bonus)
+SELECT $1::text,
+       $2::text,
+       $3::text,
+       (SELECT id FROM platform.communities WHERE public_id = $4::text),
+       'signup',
+       $5::jsonb,
+       $6::bigint
+RETURNING id, public_id, slug, name, community_id, phase, config, signup_bonus,
+          created_at, updated_at
+`
+
+type InsertTournamentParams struct {
+	PublicID          string
+	Slug              string
+	Name              string
+	CommunityPublicID string
+	Config            []byte
+	SignupBonus       int64
+}
+
+// 《百業試鋒》賽事核心 query(schemas/20 + schemas/26)。
+// 對應 port:internal/core/activity/tournament.Repo 與 internal/core/activity/signup.Repo。
+// 涵蓋 activity.tournaments / fencers / tournament_players / matches 四張表。
+//
+// ── 稽核 ──────────────────────────────────────────────────────
+// 破壞性操作(推進階段、抽籤、交換籤位、改段位、換發通行碼)必須寫
+// platform.admin_audit_logs,**且與資料變更同一個 transaction**。
+// 這裡**不另寫 insert** —— queries/audit.sql 的 InsertAdminAudit 就是那個權威位置
+// (鐵則 9)。adapter 在同一個 tx 裡呼叫它即可。
+//
+// ── 鎖序(activity 這一側的約定,全檔一致)──────────────────────
+//  1. 任何要寫 activity 子表的 transaction,**第一步先取賽事列的鎖**:
+//     LockTournamentShared    一般寫入(報名、綁定、換通行碼、評段)
+//     LockTournamentExclusive 裁判破壞性操作(抽籤、退回階段、交換籤位)
+//     共享鎖彼此不互斥(報名可以並發),但會擋住 UpdateTournamentPhase ——
+//     這正是「RequirePhase 檢查通過之後,階段不會在腳下被換掉」的來源。
+//     獨佔鎖讓「重抽 / 交換籤位 / 退回階段」三者對同一屆賽事完全串行化;
+//     它們都是低頻手動操作,用一列鎖換掉所有交錯情境很划算。
+//  2. 取得賽事列的鎖之後,一律依 tournament_players → fencers → matches 的順序寫。
+//     fencers 排在 tournament_players **之後**是因為 SetPlayerRank 必然是
+//     「先寫本屆段位、再回寫跨屆快照」;報名雖然要先讀/建 fencer,但那一步只會
+//     鎖到自己剛插入的新列(或等待並發的同 game_id 插入),不持有任何其他鎖。
+//  3. matches 只有第 1 條裡的獨佔那一組會寫,所以它不可能與 1/2 形成環。
+//     重抽開頭的 DeleteTournamentMatches 雖然在 tournament_players 之前動,
+//     但 DELETE 子表不對父表取鎖,同樣構不成環。
+//  4. 跨 schema(報名獎金走 Ledger.ApplyInTx)時,activity 的鎖永遠先取、
+//     platform 的鎖後取(users → user_balances,與 shop/daily 同向)。
+//
+// ── passcode_hash 的流向 ───────────────────────────────────────
+// 只有 GetCredentialByGameID 會 SELECT passcode_hash。其餘回傳選手的 query
+// 一律列舉欄位、刻意漏掉它 —— tournament.Player 結構本身也沒有這個欄位,
+// 一個查都沒查出來的值,不可能被誰不小心序列化到對戰表 API 上。
+// ═══ 賽事(tournaments)═══════════════════════════════════════
+// 開一屆新賽事。**階段固定 'signup'**,不由呼叫端指定 —— 一屆從「已經在評段中」
+// 開始的賽事是沒有意義的資料,而要跳過報名期有 UpdateTournamentPhase 那條路,
+// 那上面有樂觀鎖也有稽核紀錄。
+//
+// community_id 由 public_id 反查(鐵則 5:對外不出現內部 id)。用子查詢而不是
+// 兩句 SQL:少一個「查完到插入之間社群被刪掉」的窗口,而且查無此社群時
+// 子查詢回 NULL,直接撞 community_id 的 NOT NULL —— adapter 據此回
+// ErrCommunityNotFound(見那一側的錯誤分辨)。
+//
+// slug 撞 UNIQUE 時由 adapter 轉成 ErrSlugTaken:那是使用者輸入造成的結果,
+// 不該變成 500。
+//
+// public_id(ULID)由 adapter 產生後傳入,SQL 生不出 ULID。
+func (q *Queries) InsertTournament(ctx context.Context, arg InsertTournamentParams) (ActivityTournament, error) {
+	row := q.db.QueryRow(ctx, insertTournament,
+		arg.PublicID,
+		arg.Slug,
+		arg.Name,
+		arg.CommunityPublicID,
+		arg.Config,
+		arg.SignupBonus,
+	)
+	var i ActivityTournament
+	err := row.Scan(
+		&i.ID,
+		&i.PublicID,
+		&i.Slug,
+		&i.Name,
+		&i.CommunityID,
+		&i.Phase,
+		&i.Config,
+		&i.SignupBonus,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const insertTournamentPlayer = `-- name: InsertTournamentPlayer :one

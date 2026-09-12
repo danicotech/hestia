@@ -22,7 +22,7 @@ hestia/activity/v1/(活動層 ——《百業試鋒》賽事系統,schemas/20、
   tournament.proto      TournamentService  賽事、段位、選手、對戰表、場次(匿名可讀)
   handicap.proto        HandicapService    讓武項目、BP 預算、選購與退選、封盤後公開
   betting.proto         BettingService     投票驅動賠率、下注(單場與串關)、我的注單
-  judge.proto           JudgeService       裁判後台:評段、抽籤、開/封盤、賽果、棄賽、發獎
+  judge.proto           JudgeService       裁判後台:開賽事、評段、抽籤、開/封盤、賽果、棄賽、發獎
 
   **這個 package 刻意不 import hestia.platform.v1。** 活動層可以引用平台層的概念,
   平台層永遠不知道活動層存在(鐵則 1)。需要平台身分時只帶 user_public_id 字串,
@@ -198,6 +198,11 @@ catch (e) {
 | `activity_player_already_bound` | failed_precondition | 這位選手已綁定**其他**平台帳號 → 要改綁請找裁判 |
 | `activity_user_already_bound` | failed_precondition | 這個平台帳號已綁在另一位選手身上 |
 | `activity_platform_account_required` | unauthenticated | 綁定(領獎的前置)需要平台帳號 → **引導登入** |
+| `tournament_invalid_request` | invalid_argument | 建立賽事的請求少了必填欄位或帶了不可能成立的值 |
+| `tournament_invalid_config` | invalid_argument | 賽事規則旋鈕不合法(BP 級距、賠率、獎金) → 修正該欄位再送 |
+| `tournament_invalid_slug` | invalid_argument | 賽事代號格式不合法 → 只能用小寫英數與單一連字號,3–64 字 |
+| `tournament_slug_taken` | already_exists | 賽事代號已被使用 → **換一個**,不是格式問題 |
+| `community_not_found` | not_found | `community_public_id` 查無此社群 |
 | `tournament_not_found` | not_found | 賽事不存在 |
 | `activity_player_not_found` | not_found | 這屆賽事裡查無此選手 |
 | `tournament_phase_conflict` | aborted | 階段已被其他裁判改變(樂觀鎖)→ **重讀後再決定**,不要盲目重試 |

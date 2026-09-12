@@ -167,10 +167,12 @@ func run() error {
 	activityDeps := transport.ActivityDeps{
 		Signup:     signup.NewService(signupRepo, hasher),
 		Tournament: tournaments,
-		Handicap:   handicap.New(handicappg.New(pool)),
-		Betting:    bets,
-		Matches:    matches,
-		Reader:     activityRead,
+		// 建賽事是裁判專屬,與上面的唯讀 Tournament 分開注入。
+		TournamentCreator: tournaments,
+		Handicap:          handicap.New(handicappg.New(pool)),
+		Betting:           bets,
+		Matches:           matches,
+		Reader:            activityRead,
 		Prizes: prizeAdapter{svc: prize.New(
 			prizeRepo{Service: activityRead, tournaments: tournamentRepo}, led, "")},
 		Directory: read,

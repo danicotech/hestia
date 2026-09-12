@@ -57,6 +57,7 @@ import (
 // 沒有命名空間的話 "draw" 這種字串遲早會與別的子系統撞在一起,
 // 而稽核紀錄的用途正是事後撈出「某某動作做過幾次、誰做的」。
 const (
+	actionCreated      = "tournament.created"
 	actionPhaseChanged = "tournament.phase_changed"
 	actionRollback     = "tournament.rollback_to_ranked"
 	actionDraw         = "tournament.draw"
@@ -88,12 +89,22 @@ func New(pool *pgxpool.Pool) *Service {
 // 真要跨 schema 同 tx 動錢(報名獎金走 Ledger.ApplyInTx)時,那是組合的問題:
 // 由持有 tx 的那一側把 tx 傳進來,而不是讓 Service 偷偷記住一個 tx。
 func (s *Service) inTx(ctx context.Context, fn func(qtx *db.Queries) error) error {
+	return s.inTxRaw(ctx, func(_ pgx.Tx, qtx *db.Queries) error { return fn(qtx) })
+}
+
+// inTxRaw 與 inTx 相同,但額外把 pgx.Tx 本身交出去。
+//
+// 只有 Create 需要它:複製讓武目錄要把 handicappg 綁在**這個** tx 上
+// (handicappg.BindTx),而那個函式收的是 tx 不是 *db.Queries。
+// 大多數方法不該拿到 tx —— 拿得到就有人會在裡面自己 Commit,
+// 所以預設入口仍然是只給 *db.Queries 的 inTx。
+func (s *Service) inTxRaw(ctx context.Context, fn func(tx pgx.Tx, qtx *db.Queries) error) error {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return fmt.Errorf("開 transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if err := fn(s.q.WithTx(tx)); err != nil {
+	if err := fn(tx, s.q.WithTx(tx)); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -460,6 +471,22 @@ func marshalAudit(v any) ([]byte, error) {
 func isCheckViolation(err error, constraint string) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23514" && pgErr.ConstraintName == constraint
+}
+
+// isUniqueViolation 判斷是不是指定的 UNIQUE 約束把寫入擋下來。
+func isUniqueViolation(err error, constraint string) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == constraint
+}
+
+// isNotNullViolation 判斷是不是指定欄位的 NOT NULL 把寫入擋下來。
+//
+// 用在 InsertTournament:社群的 public_id 查不到時,子查詢回 NULL 而不是 0 列,
+// 於是失敗發生在 community_id 的 NOT NULL 上。分辨得出來才能回
+// ErrCommunityNotFound —— 否則裁判只會看到一句「內部錯誤」。
+func isNotNullViolation(err error, column string) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23502" && pgErr.ColumnName == column
 }
 
 func ptr[T any](v T) *T { return &v }

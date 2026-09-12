@@ -9,10 +9,14 @@ import (
 	"github.com/danicotech/hestia/internal/core/activity/bp"
 )
 
-// ErrConfigMalformed 表示 tournaments.config 有欄位讀不懂或超出合理範圍。
+// ErrConfigMalformed 表示賽事設定有欄位讀不懂或超出合理範圍。
 //
-// **收到這個錯誤時 Config 仍然可用** —— ParseConfig 保證回傳的一定是一份
-// 每個欄位都補過預設值的設定。理由寫在 ParseConfig 的註解裡。
+// 兩個產生它的地方對它的態度**刻意相反**,各自的理由寫在自己的註解裡:
+//
+//	ParseConfig  讀既存的 JSONB。收到錯誤時 Config 仍然可用(壞欄位已退回預設),
+//	             呼叫端該記 log 或在後台標紅,不是中止。
+//	NewConfig    讀裁判此刻填的表單。收到錯誤必須中止 —— 替他猜一個值,
+//	             等於開了一屆規則與他以為的不一樣的賽事。
 var ErrConfigMalformed = errors.New("賽事設定不合法")
 
 // 設定的預設值。全部集中在這裡,是為了讓「壞設定會退回什麼」這件事
@@ -197,6 +201,16 @@ func ParseConfig(data []byte) (Config, error) {
 		// 賽事還是要能開,只是規則是預設的那份。
 		return cfg, fmt.Errorf("%w: config 不是合法 JSON: %w", ErrConfigMalformed, err)
 	}
+	return applyRaw(raw)
+}
+
+// applyRaw 把一份線上形態疊到預設值上,壞欄位逐一退回預設並記進 problems。
+//
+// 抽出來是因為它有兩個入口:ParseConfig(從 JSONB 讀回來)與 NewConfig
+// (裁判在建立賽事時填的旋鈕)。兩邊各寫一次驗證的話,「vig_bps 可以是 0
+// 但不可以是負數」這種規則就會有兩個版本,而漂移的那一次沒有任何錯誤訊息。
+func applyRaw(raw rawConfig) (Config, error) {
+	cfg := DefaultConfig()
 
 	var problems []error
 	if raw.BPPerRankGap != nil {
@@ -325,4 +339,104 @@ func nonNegative(field string, v *int64, problems []error) (int64, []error) {
 		return 0, append(problems, fmt.Errorf("%s 不可為負數,得到 %d,退回 0", field, *v))
 	}
 	return *v, problems
+}
+
+// ── 建立賽事時的設定 ──────────────────────────────────────────
+
+// ConfigOverrides 是開一屆新賽事時裁判填的規則旋鈕。
+//
+// 每個欄位都是指標,nil = **用預設值**。與 rawConfig 同樣的理由:
+// 填 0 與沒填在這裡是兩件事(vig_bps 填 0 是「不抽水」,沒填是「抽 8%」)。
+//
+// 刻意不含 Ranks:段位措辭要逐屆改寫是罕見情況,而把四段的名稱、境界、
+// 描述全開成請求欄位會讓「開一屆賽事」這個動作多十二個欄位。
+// 真要改時走設定而不是建立流程 —— 那時候賽事已經存在,改起來風險也更低。
+type ConfigOverrides struct {
+	BPPerRankGap   *int64
+	Smoothing      *int64
+	VigBPS         *int64
+	MinOddsMilli   *int64
+	MaxOddsMilli   *int64
+	MaxParlayMilli *int64
+	// Prizes 整包 nil = 全部不發(0)。單項為 0 也是不發。
+	Prizes *Prizes
+	// HandicapItemMaxQty nil 或 <= 0 皆為不限制,但後者會回 ErrConfigMalformed
+	// ——「一項都不能買」不會是任何人的本意。
+	HandicapItemMaxQty *int32
+}
+
+// NewConfig 把裁判填的旋鈕疊到預設值上,產生一份完整的賽事設定。
+//
+// # 與 ParseConfig 的回傳約定不同:這裡的錯誤是**致命的**
+//
+// ParseConfig 讀的是資料庫裡既存的設定,壞欄位只能退回預設然後把賽事開起來
+// (理由見它的註解)。NewConfig 讀的是裁判**此刻**填的表單 —— 打錯了就當場說,
+// 靜靜替他退回預設等於開了一屆規則與他以為的不一樣的賽事,而那要等到
+// 第一場算 BP 時才有人看得出來。
+//
+// 所以呼叫端收到 err 必須中止;第一個回傳值在那種情況下不該被使用。
+func NewConfig(o ConfigOverrides) (Config, error) {
+	raw := rawConfig{
+		BPPerRankGap: o.BPPerRankGap,
+		Odds: &rawOdds{
+			Smoothing:      o.Smoothing,
+			VigBPS:         o.VigBPS,
+			MinOddsMilli:   o.MinOddsMilli,
+			MaxOddsMilli:   o.MaxOddsMilli,
+			MaxParlayMilli: o.MaxParlayMilli,
+		},
+		HandicapItemMaxQty: o.HandicapItemMaxQty,
+	}
+	if p := o.Prizes; p != nil {
+		raw.Prizes = &rawPrizes{
+			Champion:      &p.Champion,
+			RunnerUp:      &p.RunnerUp,
+			Third:         &p.Third,
+			Participation: &p.Participation,
+		}
+	}
+	return applyRaw(raw)
+}
+
+// MarshalConfig 把一份設定寫成 tournaments.config 的 JSONB 內容。
+//
+// # 為什麼寫**完整**的一份,而不是只寫與預設值不同的欄位
+//
+// 一屆賽事開下去之後,它的規則就該凍結。只寫差異的話,哪天有人調整
+// DefaultConfig 的數字,所有進行中的賽事會在半途換一套 BP 級距或賠率上限
+// —— 而且沒有任何紀錄顯示發生過這件事。
+//
+// 代價是每一列都存了一份看起來像預設值的內容,那是刻意付的:
+// 「這屆用的是哪一套規則」必須在資料上有答案,不是在當時的程式碼裡。
+//
+// 與 ParseConfig 互為反函式(config_test 釘住這個往返)。
+func MarshalConfig(c Config) ([]byte, error) {
+	raw := rawConfig{
+		BPPerRankGap: &c.BPPerRankGap,
+		Odds: &rawOdds{
+			Smoothing:      &c.Odds.Smoothing,
+			VigBPS:         &c.Odds.VigBPS,
+			MinOddsMilli:   &c.Odds.MinOddsMilli,
+			MaxOddsMilli:   &c.Odds.MaxOddsMilli,
+			MaxParlayMilli: &c.Odds.MaxParlayMilli,
+		},
+		Prizes: &rawPrizes{
+			Champion:      &c.Prizes.Champion,
+			RunnerUp:      &c.Prizes.RunnerUp,
+			Third:         &c.Prizes.Third,
+			Participation: &c.Prizes.Participation,
+		},
+		HandicapItemMaxQty: c.HandicapItemMaxQty,
+	}
+	for _, ri := range c.Ranks {
+		level := int8(ri.Rank)
+		raw.Ranks = append(raw.Ranks, rawRank{
+			Level: &level, Name: &ri.Name, Title: &ri.Title, Description: &ri.Description,
+		})
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil, fmt.Errorf("序列化賽事設定: %w", err)
+	}
+	return data, nil
 }

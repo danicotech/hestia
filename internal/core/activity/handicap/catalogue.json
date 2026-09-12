@@ -1,0 +1,312 @@
+{
+  "$comment": "《百業試鋒》讓武項目總表(34 項,依大類排序)。權威來源:schemas/20-activity-tournament.md,使用者 2026-09-12 提供。cost 單位為 BP。referee_note 為 2026-09-12 草擬,待御風羽逐項審定。",
+  "version": 2,
+  "items": [
+    {
+      "category": "weapon",
+      "sort_order": 10,
+      "cost": 20,
+      "repeatable": false,
+      "name": "指定對手武學",
+      "description": "由你指定對手本場使用的武學。",
+      "referee_note": "選購時就要寫下指定的武學名稱。開賽前裁判確認對手的武學欄位與指定相符,不符就當場改到相符再開打。對手若在場中換成別的武學,視同違反。"
+    },
+    {
+      "category": "weapon",
+      "sort_order": 20,
+      "cost": 12,
+      "repeatable": false,
+      "name": "隨機武學",
+      "description": "對手本場的武學由隨機決定。",
+      "referee_note": "由**裁判**當場隨機決定並公開結果,對手才照結果設定。不可由任一方代抽 —— 讓施加方抽等於讓他挑,那不是隨機。"
+    },
+    {
+      "category": "weapon",
+      "sort_order": 30,
+      "cost": 12,
+      "repeatable": false,
+      "name": "禁止切換武器",
+      "description": "對手全場不得切換武器。",
+      "referee_note": "全場觀察,對手切換武器的那一刻即為違反。若該場分回合,回合之間同樣不得換。"
+    },
+    {
+      "category": "weapon",
+      "sort_order": 40,
+      "cost": 5,
+      "repeatable": false,
+      "name": "雙方使用 16 級武庫武學裝備",
+      "description": "雙方一律使用 16 級武庫的武學裝備。注意:此項對你自己同樣生效。",
+      "referee_note": "開賽前雙方各自展示裝備欄由裁判確認。**此項對施加方同樣生效**,所以要看兩邊,只看對手是漏的。"
+    },
+    {
+      "category": "weapon",
+      "sort_order": 50,
+      "cost": 2,
+      "repeatable": false,
+      "name": "禁武學特效",
+      "description": "對手不得使用武學特效。",
+      "referee_note": "開賽前在設定中關閉。開打後畫面仍出現武學特效即為違反 —— 這一項用看的就認得出來,不需要問。"
+    },
+    {
+      "category": "skill",
+      "sort_order": 10,
+      "cost": 24,
+      "repeatable": false,
+      "name": "禁用兩種技能",
+      "description": "指定對手兩種技能不得使用(特殊技、武學技)。",
+      "referee_note": "選購時要指明是哪兩種(特殊技、武學技)。開賽前裁判向雙方各複誦一次,避免賽後才爭「我以為是另一個」。場中出現該技能的施放動作即為違反。"
+    },
+    {
+      "category": "skill",
+      "sort_order": 20,
+      "cost": 12,
+      "repeatable": false,
+      "name": "禁用一種技能",
+      "description": "指定對手一種技能不得使用(特殊技、武學技)。",
+      "referee_note": "同「禁用兩種技能」,一種。選購時指明、開賽前複誦。"
+    },
+    {
+      "category": "skill",
+      "sort_order": 30,
+      "cost": 12,
+      "repeatable": false,
+      "name": "禁用奇術",
+      "description": "對手全場不得使用奇術。",
+      "referee_note": "全場不得出現任何奇術。若同時買了「禁用任意奇術」,本項涵蓋範圍較大,以本項為準,不重複處置。"
+    },
+    {
+      "category": "skill",
+      "sort_order": 40,
+      "cost": 12,
+      "repeatable": false,
+      "name": "禁用普通攻擊",
+      "description": "對手全場不得使用普通攻擊。",
+      "referee_note": "對手只能靠技能造成傷害。判準以攻擊鍵的基礎攻擊為準,**連段中的基礎攻擊段同樣算**——這是最容易產生爭議的一點,開賽前先講清楚。"
+    },
+    {
+      "category": "skill",
+      "sort_order": 50,
+      "cost": 8,
+      "repeatable": false,
+      "name": "禁用處決",
+      "description": "對手全場不得使用處決。",
+      "referee_note": "對手觸發處決即為違反。但若處決是系統在特定條件下自動觸發、玩家沒有選擇餘地,裁判應判不違反並記錄下來,賽後再決定要不要調整這一項。"
+    },
+    {
+      "category": "skill",
+      "sort_order": 60,
+      "cost": 5,
+      "repeatable": true,
+      "name": "指定並更改技能位子",
+      "description": "指定對手的一個技能改放到你指定的鍵位。可重複購買,每次指定一個。",
+      "referee_note": "選購時逐次寫下「哪個技能移到哪個鍵位」。開賽前裁判看著對手改完並確認。可重複購買,每買一次指定一個。"
+    },
+    {
+      "category": "skill",
+      "sort_order": 70,
+      "cost": 3,
+      "repeatable": true,
+      "name": "禁用任意奇術",
+      "description": "指定對手的一個奇術不得使用。可重複購買,每次指定一個。",
+      "referee_note": "選購時逐次指定一個奇術名稱。裁判把清單記下,開賽前向雙方複誦 —— 買到三、四個時光靠記憶會漏。"
+    },
+    {
+      "category": "defense",
+      "sort_order": 10,
+      "cost": 20,
+      "repeatable": false,
+      "name": "禁用移動鍵",
+      "description": "對手全場不得使用移動鍵。",
+      "referee_note": "對手不得用移動鍵改變位置;**技能本身造成的位移不算違反**。這是全表最嚴苛的限制之一,開賽前務必確認雙方對判準的理解一致。"
+    },
+    {
+      "category": "defense",
+      "sort_order": 20,
+      "cost": 8,
+      "repeatable": false,
+      "name": "禁用解控",
+      "description": "對手全場不得解控。",
+      "referee_note": "對手被控制時不得使用解控,必須撐到控制自然結束。"
+    },
+    {
+      "category": "defense",
+      "sort_order": 30,
+      "cost": 8,
+      "repeatable": false,
+      "name": "禁用迴避",
+      "description": "對手全場不得迴避。",
+      "referee_note": "對手不得使用迴避動作。這一項動作明顯,認得出來。"
+    },
+    {
+      "category": "defense",
+      "sort_order": 40,
+      "cost": 4,
+      "repeatable": false,
+      "name": "禁用卸勢",
+      "description": "對手全場不得卸勢。",
+      "referee_note": "對手不得卸勢。"
+    },
+    {
+      "category": "defense",
+      "sort_order": 50,
+      "cost": 4,
+      "repeatable": false,
+      "name": "禁用防禦",
+      "description": "對手全場不得防禦。",
+      "referee_note": "對手不得進入防禦姿態。"
+    },
+    {
+      "category": "defense",
+      "sort_order": 60,
+      "cost": 2,
+      "repeatable": false,
+      "name": "禁跳躍",
+      "description": "對手全場不得跳躍。",
+      "referee_note": "對手不得主動跳躍;技能附帶的躍起不算違反。"
+    },
+    {
+      "category": "poison",
+      "sort_order": 10,
+      "cost": 24,
+      "repeatable": false,
+      "name": "對手讓出守關元",
+      "description": "對手開局即讓出守關元。",
+      "referee_note": "開局時由對手主動讓出,裁判確認完成後才開始正式交戰與計時。順序不能反 —— 先開打再讓,前面那段就白打了。"
+    },
+    {
+      "category": "poison",
+      "sort_order": 20,
+      "cost": 24,
+      "repeatable": false,
+      "name": "打亂上下左右鍵",
+      "description": "對手的方向鍵配置被打亂。",
+      "referee_note": "新的對應由**裁判**決定,不是施加方。這一項的價格是按「打亂」定的,讓施加方挑排列等於花打亂的錢買指定的效果(那是 12 BP 的「互換任意兩個按鍵」)。裁判決定後看著對手設定完成。"
+    },
+    {
+      "category": "poison",
+      "sort_order": 30,
+      "cost": 12,
+      "repeatable": false,
+      "name": "互換任意兩個按鍵",
+      "description": "指定對手的兩個按鍵互換。",
+      "referee_note": "與「打亂上下左右鍵」相反,這一項**由你指定**哪兩個鍵互換。開賽前裁判看著對手設定完成。"
+    },
+    {
+      "category": "poison",
+      "sort_order": 40,
+      "cost": 10,
+      "repeatable": false,
+      "name": "對手讓出半條血量",
+      "description": "對手開局血量為半條。",
+      "referee_note": "開局後由對手自行減至半血,或以遊戲內設定達成。裁判確認血條後才正式開打。"
+    },
+    {
+      "category": "victory",
+      "sort_order": 10,
+      "cost": 24,
+      "repeatable": false,
+      "name": "撐過 90 秒即獲勝",
+      "description": "你只要撐過 90 秒即判定獲勝。",
+      "referee_note": "由裁判計時,自**正式開打**起算(讓出守關元、讓血等前置動作不計入)。時間到的瞬間即判你獲勝,不論當下血量。"
+    },
+    {
+      "category": "victory",
+      "sort_order": 20,
+      "cost": 20,
+      "repeatable": false,
+      "name": "撐過 120 秒即獲勝",
+      "description": "你只要撐過 120 秒即判定獲勝。",
+      "referee_note": "同「撐過 90 秒即獲勝」,120 秒。"
+    },
+    {
+      "category": "victory",
+      "sort_order": 30,
+      "cost": 20,
+      "repeatable": false,
+      "name": "對手明顯損失半條血量即落敗",
+      "description": "對手血量明顯掉到半條以下即判定落敗。",
+      "referee_note": "以對手血條掉到一半以下為準,傷害來源不限(含他自己的失誤)。「明顯」由裁判認定 —— 卡在半條邊緣時以裁判當下判斷為準,不回放爭論。"
+    },
+    {
+      "category": "victory",
+      "sort_order": 40,
+      "cost": 10,
+      "repeatable": false,
+      "name": "時間結束即勝利",
+      "description": "時間結束時你即判定獲勝。",
+      "referee_note": "以該場原定時限為準,時限到時你即獲勝。與「撐過 N 秒即獲勝」同時買時,以最先達成的那個條件判定。"
+    },
+    {
+      "category": "victory",
+      "sort_order": 50,
+      "cost": 10,
+      "repeatable": false,
+      "name": "打出守關元即勝利",
+      "description": "你只要打出守關元即判定獲勝。",
+      "referee_note": "你打出守關元的瞬間即獲勝,不必再完成擊倒。裁判看到即喊停,避免對手在勝負已定後被多打。"
+    },
+    {
+      "category": "rule",
+      "sort_order": 10,
+      "cost": 17,
+      "repeatable": false,
+      "name": "對手不能主動追擊",
+      "description": "對手不得主動追擊。",
+      "referee_note": "對手在你脫離接戰後不得向你移動接近;他可以原地防守,也可以反擊你送上門的進攻。判準:**你後退時他有沒有縮短距離**。"
+    },
+    {
+      "category": "rule",
+      "sort_order": 20,
+      "cost": 17,
+      "repeatable": false,
+      "name": "對手未攻擊時必須待在角落",
+      "description": "對手在未進行攻擊的時候必須待在場地角落。",
+      "referee_note": "對手只有在進行攻擊動作時可以離開角落,攻擊動作結束後必須返回。判準:攻擊結束後有沒有明確的返回移動 —— 停在原地不動也算違反。"
+    },
+    {
+      "category": "rule",
+      "sort_order": 30,
+      "cost": 2,
+      "repeatable": false,
+      "name": "獲得先手權",
+      "description": "你取得本場先手權。",
+      "referee_note": "開場由你先動作,對手必須等你出手之後才能行動。裁判喊開始後注意誰先動。"
+    },
+    {
+      "category": "rule",
+      "sort_order": 40,
+      "cost": 1,
+      "repeatable": false,
+      "name": "指定對手外觀",
+      "description": "指定對手本場的外觀(可全身指定)。",
+      "referee_note": "選購時指定,開賽前裁判確認對手已更換。純娛樂性,不影響任何勝負判定。"
+    },
+    {
+      "category": "rule",
+      "sort_order": 50,
+      "cost": 1,
+      "repeatable": false,
+      "name": "對手必須在開賽前落下一句狠話",
+      "description": "對手必須在開賽前撂一句狠話。",
+      "referee_note": "開打前對手公開說一句狠話,裁判聽到即算完成。內容不限,但不得辱罵或人身攻擊。"
+    },
+    {
+      "category": "rule",
+      "sort_order": 60,
+      "cost": 1,
+      "repeatable": false,
+      "name": "對手若輸了必須聽從勝者的一個要求",
+      "description": "對手若落敗,必須聽從你的一個要求(對手可以拒絕)。",
+      "referee_note": "賽後執行,而且**對手可以拒絕**。裁判不負責強制執行,也不因為對手拒絕而改變賽果 —— 這一項買的是要求的權利,不是服從的保證。"
+    },
+    {
+      "category": "rule",
+      "sort_order": 70,
+      "cost": 1,
+      "repeatable": false,
+      "name": "指定對手開局時講一句話",
+      "description": "指定對手開局時要講的一句話(8 個字),沒講出來之前不能進行攻擊。",
+      "referee_note": "選購時寫下那八個字。開局後對手說完那句話之前不得攻擊,由裁判聽並確認。對手若搶先攻擊,依違反處置。"
+    }
+  ]
+}

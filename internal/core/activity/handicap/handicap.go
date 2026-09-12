@@ -109,7 +109,8 @@ type Item struct {
 	Category    Category
 	Name        string
 	Description string
-	// RefereeNote 是給裁判看的執行說明。seed 目前全為空 —— 待補,不是錯誤。
+	// RefereeNote 是給裁判看的執行說明(「怎麼確認對手真的遵守了」)。
+	// 空字串 = 這一項還沒寫 —— 待補,不是錯誤。
 	RefereeNote string
 	Cost        int64
 	// Repeatable 只供 UI 標示「(可重複)」,**不作強制**:所有項目都能重複買。
@@ -128,8 +129,8 @@ type ItemSpec struct {
 	Category    Category `json:"category"`
 	Name        string   `json:"name"`
 	Description string   `json:"description"`
-	// RefereeNote 在 seed 裡目前全是 null(待御風羽補),所以是指標而不是字串 ——
-	// 「還沒寫」與「寫了空字串」在裁判手冊補齊的過程中是兩件事。
+	// RefereeNote 是指標而不是字串:目錄補齊的過程中,「還沒寫」與
+	// 「寫了空字串」是兩件事。
 	RefereeNote *string `json:"referee_note"`
 	Cost        int64   `json:"cost"`
 	Repeatable  bool    `json:"repeatable"`

@@ -33,6 +33,31 @@
 
 -- ═══ 賽事(tournaments)═══════════════════════════════════════
 
+-- name: InsertTournament :one
+-- 開一屆新賽事。**階段固定 'signup'**,不由呼叫端指定 —— 一屆從「已經在評段中」
+-- 開始的賽事是沒有意義的資料,而要跳過報名期有 UpdateTournamentPhase 那條路,
+-- 那上面有樂觀鎖也有稽核紀錄。
+--
+-- community_id 由 public_id 反查(鐵則 5:對外不出現內部 id)。用子查詢而不是
+-- 兩句 SQL:少一個「查完到插入之間社群被刪掉」的窗口,而且查無此社群時
+-- 子查詢回 NULL,直接撞 community_id 的 NOT NULL —— adapter 據此回
+-- ErrCommunityNotFound(見那一側的錯誤分辨)。
+--
+-- slug 撞 UNIQUE 時由 adapter 轉成 ErrSlugTaken:那是使用者輸入造成的結果,
+-- 不該變成 500。
+--
+-- public_id(ULID)由 adapter 產生後傳入,SQL 生不出 ULID。
+INSERT INTO activity.tournaments (public_id, slug, name, community_id, phase, config, signup_bonus)
+SELECT sqlc.arg(public_id)::text,
+       sqlc.arg(slug)::text,
+       sqlc.arg(name)::text,
+       (SELECT id FROM platform.communities WHERE public_id = sqlc.arg(community_public_id)::text),
+       'signup',
+       sqlc.arg(config)::jsonb,
+       sqlc.arg(signup_bonus)::bigint
+RETURNING id, public_id, slug, name, community_id, phase, config, signup_bonus,
+          created_at, updated_at;
+
 -- name: GetTournamentBySlug :one
 -- slug 在網址列上,不是秘密;查無回 ErrTournamentNotFound 由 adapter 轉。
 SELECT id, public_id, slug, name, community_id, phase, config, signup_bonus,

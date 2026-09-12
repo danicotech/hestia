@@ -27,10 +27,25 @@ type fakeRepo struct {
 	swapCalls        []SwapSeedsParams
 	setRankCalls     []SetPlayerRankParams
 
+	createCalls []CreateTournamentParams
+
 	// 注入的錯誤。
 	tournamentErr  error
 	updatePhaseErr error
 	drawErr        error
+	createErr      error
+}
+
+func (f *fakeRepo) Create(_ context.Context, p CreateTournamentParams) (Tournament, error) {
+	f.createCalls = append(f.createCalls, p)
+	if f.createErr != nil {
+		return Tournament{}, f.createErr
+	}
+	return Tournament{
+		ID: 900, PublicID: "01J0TOURNAMENT", Slug: p.Slug, Name: p.Name,
+		CommunityID: 1, Phase: PhaseSignup, ConfigRaw: p.ConfigRaw,
+		SignupBonus: p.SignupBonus,
+	}, nil
 }
 
 func (f *fakeRepo) TournamentBySlug(_ context.Context, slug string) (Tournament, error) {

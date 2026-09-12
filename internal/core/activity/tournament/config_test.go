@@ -271,3 +271,57 @@ func TestDefaultConfigIsIsolated(t *testing.T) {
 		t.Error("DefaultConfig() 的段位切片被共用了,一次改動會污染所有賽事")
 	}
 }
+
+// MarshalConfig 與 ParseConfig 必須互為反函式。
+//
+// 這條性質是 Create 的前提:它把 NewConfig 算出來的那一份寫進 config,
+// 而之後每一次讀取都走 ParseConfig。兩者一旦分歧,賽事開出來的規則
+// 與讀回來的規則會不同,而且沒有任何地方會報錯。
+func TestMarshalConfigRoundTrip(t *testing.T) {
+	qty := int32(3)
+	cases := map[string]Config{
+		"全預設": DefaultConfig(),
+		"全部填滿": {
+			BPPerRankGap: 12,
+			Ranks: []RankInfo{
+				{Rank: bp.RankKaishan, Name: "一", Title: "壹", Description: "甲"},
+				{Rank: bp.RankDuanshui, Name: "二", Title: "貳", Description: "乙"},
+				{Rank: bp.RankFeihua, Name: "三", Title: "參", Description: "丙"},
+				{Rank: bp.RankWuwo, Name: "四", Title: "肆", Description: "丁"},
+			},
+			Odds: OddsConfig{
+				Smoothing: 7, VigBPS: 0, MinOddsMilli: 1100,
+				MaxOddsMilli: 9000, MaxParlayMilli: 200000,
+			},
+			Prizes:             Prizes{Champion: 5000, RunnerUp: 2000, Third: 0, Participation: 100},
+			HandicapItemMaxQty: &qty,
+		},
+	}
+	for name, want := range cases {
+		t.Run(name, func(t *testing.T) {
+			raw, err := MarshalConfig(want)
+			if err != nil {
+				t.Fatalf("MarshalConfig: %v", err)
+			}
+			got, err := ParseConfig(raw)
+			if err != nil {
+				t.Fatalf("ParseConfig: %v", err)
+			}
+			assertSameConfig(t, got, want)
+		})
+	}
+}
+
+// NewConfig 與 ParseConfig 共用同一份驗證(applyRaw),所以同一個壞值
+// 在兩邊的判定必須一致 —— 只是處置不同(退回預設 vs 中止)。
+func TestNewConfigSharesValidationWithParseConfig(t *testing.T) {
+	zero := int64(0)
+	cfg, err := NewConfig(ConfigOverrides{BPPerRankGap: &zero})
+	if !errors.Is(err, ErrConfigMalformed) {
+		t.Fatalf("err = %v,想要 ErrConfigMalformed", err)
+	}
+	// 即使回了錯誤,退化行為仍然與 ParseConfig 一樣:那一欄是預設值。
+	if cfg.BPPerRankGap != DefaultBPPerRankGap {
+		t.Errorf("退化後的 bp_per_rank_gap = %d,want %d", cfg.BPPerRankGap, DefaultBPPerRankGap)
+	}
+}

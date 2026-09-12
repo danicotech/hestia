@@ -70,6 +70,7 @@ const (
 	// 賽事裁判(activity)。逐條列是因為 privilegedServices 的前綴只決定
 	// 「要不要授權」,「需要哪個權限」仍然在這張表裡 —— 而啟動時的
 	// verifyProcedureCoverage 會走一遍 proto descriptor,漏掉一支直接開不起來。
+	ProcJudgeCreateTournament   = "/hestia.activity.v1.JudgeService/CreateTournament"
 	ProcJudgeAdvancePhase       = "/hestia.activity.v1.JudgeService/AdvancePhase"
 	ProcJudgeAssignRank         = "/hestia.activity.v1.JudgeService/AssignRank"
 	ProcJudgeListUnranked       = "/hestia.activity.v1.JudgeService/ListUnranked"
@@ -101,6 +102,7 @@ var procedurePermissions = map[string]Permission{
 	// 發獎走 economy.grant:它動的是平台代幣,而「能發錢」這個概念已經有權限了。
 	// 裁判要發獎就得另外拿到那個權限 —— 判勝負與發錢是兩件事,
 	// 同一個人能做不代表該用同一把鑰匙。
+	ProcJudgeCreateTournament:   PermTournamentJudge,
 	ProcJudgeAdvancePhase:       PermTournamentJudge,
 	ProcJudgeAssignRank:         PermTournamentJudge,
 	ProcJudgeListUnranked:       PermTournamentJudge,

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/danicotech/hestia/internal/core/activity/bp"
+	"github.com/danicotech/hestia/internal/core/activity/handicap"
 )
 
 // PlayerStatus 是參賽者在本屆的狀態。字面值等於 tournament_players.status 的 CHECK 值域。
@@ -120,6 +121,24 @@ var (
 	// ErrActorRequired 是破壞性操作沒帶裁判身分。
 	// 這些動作全部要進 admin_audit_logs,沒有 actor 就記不出「是誰做的」。
 	ErrActorRequired = errors.New("這個操作必須指明執行的裁判")
+	// ErrInvalidRequest 是請求少了必填欄位或帶了不可能成立的值。
+	// 與其餘 sentinel 的分工:那些描述的是「系統狀態不允許」,這個是
+	// 「你送來的東西本身就不成立」,重送同樣的內容一定還是失敗。
+	ErrInvalidRequest = errors.New("賽事請求參數不合法")
+	// ErrInvalidSlug 是賽事代號的形狀不合法(見 ValidateSlug)。
+	ErrInvalidSlug = errors.New("賽事代號不合法")
+	// ErrSlugTaken 是這個代號已經有一屆賽事在用。
+	//
+	// 與 ErrInvalidSlug 分開:前者重打一個代號就會成功,後者是格式要改。
+	// 兩件事共用一個錯誤的話,裁判只會看到「代號不行」然後開始亂猜。
+	ErrSlugTaken = errors.New("賽事代號已被使用")
+	// ErrCommunityNotFound 是 community_public_id 查無此社群。
+	//
+	// 定義在活動層而不是平台層,是因為平台目前沒有 community 的契約套件,
+	// 而 tournaments.community_id 是**弱參照**(跨 schema,沒有 FK)——
+	// 「這個社群存不存在」這道檢查只在建立賽事這一條路徑上發生。
+	// 哪天平台補了 community 套件,這個 sentinel 應該收斂過去。
+	ErrCommunityNotFound = errors.New("社群不存在")
 )
 
 // ── Repository port ────────────────────────────────────────────
@@ -134,6 +153,42 @@ var (
 // 那樣一來「資料改了但稽核沒記上」就是一個能真實發生的狀態,而抽籤種子一旦漏記,
 // 就再也無法向人證明那張對戰表是怎麼抽出來的。
 // 綁在同一個 transaction 裡,這個狀態在結構上不存在。
+
+// CreateTournamentParams 是開一屆新賽事。
+//
+// 實作必須在**單一 transaction** 內做完四件事:
+//
+//  1. 以 CommunityPublicID 查出內部 id(查無回 ErrCommunityNotFound)。
+//  2. INSERT activity.tournaments。phase 一律 'signup',public_id 由實作
+//     產生 ULID(core 不碰 ULID 生成)。slug 撞 UNIQUE 回 ErrSlugTaken ——
+//     那是使用者輸入造成的結果,不該變成 500。
+//  3. 依 HandicapItems 建立本屆的讓武項目目錄,**實際插入的列數必須等於
+//     len(HandicapItems)**,少一列就整筆失敗。
+//  4. 寫 admin_audit_logs。
+//
+// # 為什麼第 3 步非得跟第 2 步同一個 tx
+//
+// 讓武項目是逐屆一套(價格逐屆可調,而上屆的選購紀錄必須永遠指向上屆的價格),
+// 所以它是開賽事時複製進去的,不是全域 seed。
+// 一屆賽事存在但沒有讓武項目,不會有任何東西出聲 —— 選手會走到選讓武那一步
+// 才發現沒東西可選,而那時候已經報名、評段、抽籤完了。
+type CreateTournamentParams struct {
+	// CommunityPublicID 是 platform.communities.public_id(鐵則 5:對外不出現內部 id)。
+	CommunityPublicID string
+	Slug              string
+	Name              string
+	SignupBonus       int64
+	// ConfigRaw 是已經序列化好的 tournaments.config 內容。
+	//
+	// 傳位元組而不是 Config:port 的形狀要貼著 SQL 能直接做到的事,
+	// 與 Tournament.ConfigRaw 同一個約定 —— 序列化是 MarshalConfig 的職責,
+	// 兩邊各做一次就會有兩種寫法。
+	ConfigRaw []byte
+	// HandicapItems 是本屆的讓武項目目錄。空切片是呼叫端的 bug,實作應拒絕。
+	HandicapItems []handicap.ItemSpec
+	ActorUserID   int64
+	Reason        string
+}
 
 // UpdatePhaseParams 是一次階段推進。
 type UpdatePhaseParams struct {
@@ -243,6 +298,9 @@ type SetPlayerRankParams struct {
 
 // Repo 是本套件對儲存層的需求。每個方法都對應一到兩句 SQL。
 type Repo interface {
+	// Create 開一屆新賽事並複製讓武目錄,見 CreateTournamentParams。
+	Create(ctx context.Context, p CreateTournamentParams) (Tournament, error)
+
 	// TournamentBySlug 查一屆賽事。查無回 ErrTournamentNotFound。
 	TournamentBySlug(ctx context.Context, slug string) (Tournament, error)
 

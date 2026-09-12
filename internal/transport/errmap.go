@@ -92,6 +92,15 @@ var errorCodes = []struct {
 	{signup.ErrUserRequired, connect.CodeUnauthenticated, "activity_platform_account_required"},
 
 	// ── 活動層:賽事與階段(tournament)────────────────────────
+	{tournament.ErrInvalidRequest, connect.CodeInvalidArgument, "tournament_invalid_request"},
+	// 設定壞掉在**建立賽事**這條路上是致命的(NewConfig),所以有 code 可回;
+	// 讀既存 config 時壞欄位會退回預設而不產生錯誤,走不到這裡。
+	{tournament.ErrConfigMalformed, connect.CodeInvalidArgument, "tournament_invalid_config"},
+	// 代號格式錯與代號被占用分兩個 reason:前者要改寫法,後者換一個就好。
+	// 合成一個的話,裁判只會看到「代號不行」然後開始亂猜。
+	{tournament.ErrInvalidSlug, connect.CodeInvalidArgument, "tournament_invalid_slug"},
+	{tournament.ErrSlugTaken, connect.CodeAlreadyExists, "tournament_slug_taken"},
+	{tournament.ErrCommunityNotFound, connect.CodeNotFound, "community_not_found"},
 	{tournament.ErrTournamentNotFound, connect.CodeNotFound, "tournament_not_found"},
 	{tournament.ErrPlayerNotFound, connect.CodeNotFound, "activity_player_not_found"},
 	// Aborted 而不是 FailedPrecondition:階段被別人搶先改了,重讀後重試是合理的。

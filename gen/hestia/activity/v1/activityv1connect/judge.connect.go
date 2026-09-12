@@ -52,6 +52,9 @@ const (
 // reflection-formatted method names, remove the leading slash and convert the remaining slash to a
 // period.
 const (
+	// JudgeServiceCreateTournamentProcedure is the fully-qualified name of the JudgeService's
+	// CreateTournament RPC.
+	JudgeServiceCreateTournamentProcedure = "/hestia.activity.v1.JudgeService/CreateTournament"
 	// JudgeServiceAdvancePhaseProcedure is the fully-qualified name of the JudgeService's AdvancePhase
 	// RPC.
 	JudgeServiceAdvancePhaseProcedure = "/hestia.activity.v1.JudgeService/AdvancePhase"
@@ -95,6 +98,12 @@ const (
 
 // JudgeServiceClient is a client for the hestia.activity.v1.JudgeService service.
 type JudgeServiceClient interface {
+	// 開一屆新賽事。建立出來就停在 SIGNUP(報名期)。
+	//
+	// 同一個 transaction 內會一併複製該屆的讓武項目目錄 —— 讓武項目是
+	// **逐屆一套**(價格要能逐屆調,而上屆的選購紀錄必須永遠指向上屆的價格),
+	// 所以它不是全域 seed,而是開賽事時複製進去的。
+	CreateTournament(context.Context, *connect.Request[v1.CreateTournamentRequest]) (*connect.Response[v1.CreateTournamentResponse], error)
 	// 推進賽事階段(報名截止、開始評段、公布段位、開始抽籤……)。
 	AdvancePhase(context.Context, *connect.Request[v1.AdvancePhaseRequest]) (*connect.Response[v1.AdvancePhaseResponse], error)
 	// 評定單一選手的段位。只在 RANKING 與 RANKED 階段可行。
@@ -136,6 +145,12 @@ func NewJudgeServiceClient(httpClient connect.HTTPClient, baseURL string, opts .
 	baseURL = strings.TrimRight(baseURL, "/")
 	judgeServiceMethods := v1.File_hestia_activity_v1_judge_proto.Services().ByName("JudgeService").Methods()
 	return &judgeServiceClient{
+		createTournament: connect.NewClient[v1.CreateTournamentRequest, v1.CreateTournamentResponse](
+			httpClient,
+			baseURL+JudgeServiceCreateTournamentProcedure,
+			connect.WithSchema(judgeServiceMethods.ByName("CreateTournament")),
+			connect.WithClientOptions(opts...),
+		),
 		advancePhase: connect.NewClient[v1.AdvancePhaseRequest, v1.AdvancePhaseResponse](
 			httpClient,
 			baseURL+JudgeServiceAdvancePhaseProcedure,
@@ -225,6 +240,7 @@ func NewJudgeServiceClient(httpClient connect.HTTPClient, baseURL string, opts .
 
 // judgeServiceClient implements JudgeServiceClient.
 type judgeServiceClient struct {
+	createTournament   *connect.Client[v1.CreateTournamentRequest, v1.CreateTournamentResponse]
 	advancePhase       *connect.Client[v1.AdvancePhaseRequest, v1.AdvancePhaseResponse]
 	assignRank         *connect.Client[v1.AssignRankRequest, v1.AssignRankResponse]
 	listUnranked       *connect.Client[v1.ListUnrankedRequest, v1.ListUnrankedResponse]
@@ -239,6 +255,11 @@ type judgeServiceClient struct {
 	withdrawPlayer     *connect.Client[v1.WithdrawPlayerRequest, v1.WithdrawPlayerResponse]
 	regeneratePasscode *connect.Client[v1.RegeneratePasscodeRequest, v1.RegeneratePasscodeResponse]
 	awardPrizes        *connect.Client[v1.AwardPrizesRequest, v1.AwardPrizesResponse]
+}
+
+// CreateTournament calls hestia.activity.v1.JudgeService.CreateTournament.
+func (c *judgeServiceClient) CreateTournament(ctx context.Context, req *connect.Request[v1.CreateTournamentRequest]) (*connect.Response[v1.CreateTournamentResponse], error) {
+	return c.createTournament.CallUnary(ctx, req)
 }
 
 // AdvancePhase calls hestia.activity.v1.JudgeService.AdvancePhase.
@@ -313,6 +334,12 @@ func (c *judgeServiceClient) AwardPrizes(ctx context.Context, req *connect.Reque
 
 // JudgeServiceHandler is an implementation of the hestia.activity.v1.JudgeService service.
 type JudgeServiceHandler interface {
+	// 開一屆新賽事。建立出來就停在 SIGNUP(報名期)。
+	//
+	// 同一個 transaction 內會一併複製該屆的讓武項目目錄 —— 讓武項目是
+	// **逐屆一套**(價格要能逐屆調,而上屆的選購紀錄必須永遠指向上屆的價格),
+	// 所以它不是全域 seed,而是開賽事時複製進去的。
+	CreateTournament(context.Context, *connect.Request[v1.CreateTournamentRequest]) (*connect.Response[v1.CreateTournamentResponse], error)
 	// 推進賽事階段(報名截止、開始評段、公布段位、開始抽籤……)。
 	AdvancePhase(context.Context, *connect.Request[v1.AdvancePhaseRequest]) (*connect.Response[v1.AdvancePhaseResponse], error)
 	// 評定單一選手的段位。只在 RANKING 與 RANKED 階段可行。
@@ -350,6 +377,12 @@ type JudgeServiceHandler interface {
 // and JSON codecs. They also support gzip compression.
 func NewJudgeServiceHandler(svc JudgeServiceHandler, opts ...connect.HandlerOption) (string, http.Handler) {
 	judgeServiceMethods := v1.File_hestia_activity_v1_judge_proto.Services().ByName("JudgeService").Methods()
+	judgeServiceCreateTournamentHandler := connect.NewUnaryHandler(
+		JudgeServiceCreateTournamentProcedure,
+		svc.CreateTournament,
+		connect.WithSchema(judgeServiceMethods.ByName("CreateTournament")),
+		connect.WithHandlerOptions(opts...),
+	)
 	judgeServiceAdvancePhaseHandler := connect.NewUnaryHandler(
 		JudgeServiceAdvancePhaseProcedure,
 		svc.AdvancePhase,
@@ -436,6 +469,8 @@ func NewJudgeServiceHandler(svc JudgeServiceHandler, opts ...connect.HandlerOpti
 	)
 	return "/hestia.activity.v1.JudgeService/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case JudgeServiceCreateTournamentProcedure:
+			judgeServiceCreateTournamentHandler.ServeHTTP(w, r)
 		case JudgeServiceAdvancePhaseProcedure:
 			judgeServiceAdvancePhaseHandler.ServeHTTP(w, r)
 		case JudgeServiceAssignRankProcedure:
@@ -472,6 +507,10 @@ func NewJudgeServiceHandler(svc JudgeServiceHandler, opts ...connect.HandlerOpti
 
 // UnimplementedJudgeServiceHandler returns CodeUnimplemented from all methods.
 type UnimplementedJudgeServiceHandler struct{}
+
+func (UnimplementedJudgeServiceHandler) CreateTournament(context.Context, *connect.Request[v1.CreateTournamentRequest]) (*connect.Response[v1.CreateTournamentResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("hestia.activity.v1.JudgeService.CreateTournament is not implemented"))
+}
 
 func (UnimplementedJudgeServiceHandler) AdvancePhase(context.Context, *connect.Request[v1.AdvancePhaseRequest]) (*connect.Response[v1.AdvancePhaseResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("hestia.activity.v1.JudgeService.AdvancePhase is not implemented"))
