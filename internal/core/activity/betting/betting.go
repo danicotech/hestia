@@ -257,6 +257,7 @@ type Bet struct {
 	// 不設 FK 是因為 token_entries 是按月分區表,分區表無法由 DB 保證全域唯一。
 	LedgerStakeEntryID  int64
 	LedgerRefundEntryID int64
+	LedgerPayoutEntryID int64
 	Legs                []Leg
 	CreatedAt           time.Time
 	// SettledAt nil = 尚未結算(對應 bets_settled_at_check:status='open' ⇔ NULL)。
@@ -292,6 +293,12 @@ type BetUpdate struct {
 	PotentialPayout *int64
 	// LedgerRefundEntryID 非 nil = 本次退款的分錄 id(稽核鏈)。
 	LedgerRefundEntryID *int64
+	// LedgerPayoutEntryID 非 nil = 本次派彩的分錄 id(稽核鏈)。
+	//
+	// 三種金流都存分錄 id,是為了讓「拿著注單跳到帳本」對三者都成立。
+	// 派彩是金額最大、也最可能被質疑的一筆(「我明明中了為什麼沒收到」),
+	// 偏偏原本是唯一需要從 token_entries 反查的 —— 那個不對稱在對帳時最傷。
+	LedgerPayoutEntryID *int64
 }
 
 // IdempotencyRecord 是一把已存在的冪等鍵。

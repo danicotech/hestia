@@ -704,6 +704,7 @@ func (s *Service[TX]) applyOutcomes(ctx context.Context, tx TX, m Match, betIDs 
 				return nil, err
 			}
 			oc.Amount, oc.LedgerEntryID = payout, entryID
+			upd.LedgerPayoutEntryID = &entryID
 		case BetVoid:
 			// 全額退本金。退款同樣是新的正數分錄,絕不改舊紀錄。
 			entryID, err := s.moveMoney(ctx, tx, b, refundKeyPrefix+b.PublicID,
