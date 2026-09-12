@@ -391,6 +391,34 @@ func verifyProcedureCoverage() error {
 			problems = append(problems, svc+" 在服務身分清單裡但 proto 沒有這個服務")
 		}
 	}
+	// 活動層的每一支 procedure 都必須落在某一份清單裡。
+	//
+	// 這一條擋的是實際發生過的事:新增一支玩家端 RPC(UpdateRegistration)
+	// 忘了登記進 publicProcedures,結果它靜默變成「需要平台帳號」,而選手
+	// 看到的只是「未認證」—— 那條線索不會指向 interceptors.go。
+	//
+	// 方向仍然是 fail closed(漏登記 = 要登入,不是裸奔),所以這不是安全洞;
+	// 它是一個沉默的功能故障,而沉默正是它值得在啟動時就炸掉的理由。
+	for procedure := range known {
+		if !strings.HasPrefix(procedure, "/"+string(activityProtoPackage)+".") {
+			continue
+		}
+		_, public := publicProcedures[procedure]
+		_, platformAuth := platformAuthActivityProcedures[procedure]
+		if !public && !platformAuth && !requiresAuthorization(procedure) {
+			problems = append(problems,
+				procedure+" 是活動層的 RPC,但沒有登記在 publicProcedures、"+
+					"platformAuthActivityProcedures 或 privilegedServices 任何一份裡")
+		}
+	}
+	// 反過來:清單裡列的 procedure 必須真的存在,否則改了 proto 留下舊字串,
+	// 那一支會落回「沒登記」而沒有人發現。
+	for procedure := range platformAuthActivityProcedures {
+		if _, ok := known[procedure]; !ok {
+			problems = append(problems,
+				procedure+" 在 platformAuthActivityProcedures 裡但 proto 沒有這個 procedure")
+		}
+	}
 	// 授權映射表與 privilegedServices 是同一件事的兩半:前者說「這支 RPC 要哪個
 	// 權限」,後者決定「攔截器會不會去查」。兩邊對不起來時的失敗是沉默的 ——
 	// 映射表登記了權限,但服務沒進 privilegedServices,結果是任何登入使用者都

@@ -72,6 +72,9 @@ var publicProcedures = map[string]struct{}{
 	activityv1connect.SignupServiceLoginProcedure:       {},
 	activityv1connect.SignupServiceLogoutProcedure:      {},
 	activityv1connect.SignupServiceGetMyPlayerProcedure: {},
+	// 改自己的報名資料。與 GetMyPlayer 同一條路:身分是活動層 session,
+	// handler 自己解;能改的只有自己那一列。
+	activityv1connect.SignupServiceUpdateRegistrationProcedure: {},
 
 	// 讓武選購同樣走活動層 cookie。可見性(封盤前只看得到自己的)由領域層判斷,
 	// 不是靠這裡擋 —— 擋在這裡的話觀眾連封盤後的公開內容都看不到。
@@ -89,6 +92,11 @@ var publicProcedures = map[string]struct{}{
 	activityv1connect.TournamentServiceGetBracketProcedure:    {},
 	activityv1connect.TournamentServiceGetMatchProcedure:      {},
 
+	// 即時戰況推播。觀眾不必登入就能看對戰表,那條 stream 自然也不該要登入 ——
+	// 少了這一筆,「畫面自動更新」只對登入過的人成立,而那與這場活動的目的
+	// (看的人比打的人多)正好相反。
+	activityv1connect.WatchServiceWatchTournamentProcedure: {},
+
 	// 賠率匿名可讀。但它在 optionalAuthProcedures 裡也有一筆 ——
 	// 已登入的人要看得到自己投了哪一邊,見下方註解。
 	activityv1connect.BettingServiceGetOddsProcedure: {},
@@ -105,6 +113,23 @@ var publicProcedures = map[string]struct{}{
 // 過期的 token 不該讓人連賠率都看不到。
 var optionalAuthProcedures = map[string]struct{}{
 	activityv1connect.BettingServiceGetOddsProcedure: {},
+}
+
+// platformAuthActivityProcedures 是活動層裡**刻意**需要平台帳號的 procedure。
+//
+// 活動層絕大多數是給選手走的(活動層 session),少數是給動平台代幣的人走的。
+// 這份清單存在不是為了擋誰,是為了讓「需要平台帳號」變成一個**寫下來的決定**:
+// 沒有它,一支新的玩家端 RPC 忘了登記進 publicProcedures 就會靜默變成
+// 「要先用 Discord 登入」,而症狀是選手按下按鈕收到「未認證」—— 那條線索
+// 不會指向這個檔案。verifyProcedureCoverage 會要求每一支活動層 procedure
+// 都落在某一份清單裡,漏掉的直接開不起來。
+var platformAuthActivityProcedures = map[string]struct{}{
+	// 綁定平台帳號本來就需要平台帳號 —— 那正是這支 RPC 在做的事。
+	activityv1connect.SignupServiceBindPlatformAccountProcedure: {},
+	// 下注與投票要動平台代幣。
+	activityv1connect.BettingServicePlaceBetProcedure:   {},
+	activityv1connect.BettingServiceVoteProcedure:       {},
+	activityv1connect.BettingServiceListMyBetsProcedure: {},
 }
 
 // privilegedServices 是「除了登入還要授權」的服務(schemas/03-authz.md)。
