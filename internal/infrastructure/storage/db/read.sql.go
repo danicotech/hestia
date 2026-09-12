@@ -10,6 +10,43 @@ import (
 	"time"
 )
 
+const getDeployedPet = `-- name: GetDeployedPet :one
+SELECT ps.item_instance_id,
+       ii.public_id,
+       COALESCE(ps.nickname, idf.name) AS name,
+       idf.icon_url,
+       idf.rarity,
+       ps.xp
+FROM platform.pet_states ps
+JOIN platform.item_instances ii ON ii.id = ps.item_instance_id
+JOIN platform.item_definitions idf ON idf.id = ii.definition_id
+WHERE ps.owner_id = $1 AND ps.deployed
+`
+
+type GetDeployedPetRow struct {
+	ItemInstanceID int64
+	PublicID       string
+	Name           string
+	IconUrl        *string
+	Rarity         *string
+	Xp             int64
+}
+
+// 出戰中的寵物。一個人最多一隻(部分唯一索引保證),查無列 = 沒有出戰寵物。
+func (q *Queries) GetDeployedPet(ctx context.Context, ownerID int64) (GetDeployedPetRow, error) {
+	row := q.db.QueryRow(ctx, getDeployedPet, ownerID)
+	var i GetDeployedPetRow
+	err := row.Scan(
+		&i.ItemInstanceID,
+		&i.PublicID,
+		&i.Name,
+		&i.IconUrl,
+		&i.Rarity,
+		&i.Xp,
+	)
+	return i, err
+}
+
 const getUserPrivacy = `-- name: GetUserPrivacy :one
 
 SELECT p.opt_out_logging, p.opt_out_ai_corpus, p.updated_at
@@ -40,6 +77,49 @@ func (q *Queries) GetUserPrivacy(ctx context.Context, userID int64) (GetUserPriv
 	var i GetUserPrivacyRow
 	err := row.Scan(&i.OptOutLogging, &i.OptOutAiCorpus, &i.UpdatedAt)
 	return i, err
+}
+
+const leaderboardByXP = `-- name: LeaderboardByXP :many
+SELECT u.public_id, u.display_name, ux.xp
+FROM platform.user_xp ux
+JOIN platform.users u ON u.id = ux.user_id
+JOIN platform.communities c ON c.id = ux.community_id
+WHERE c.public_id = $1 AND u.deleted_at IS NULL
+ORDER BY ux.xp DESC, u.id
+LIMIT $2
+`
+
+type LeaderboardByXPParams struct {
+	PublicID string
+	Limit    int32
+}
+
+type LeaderboardByXPRow struct {
+	PublicID    string
+	DisplayName *string
+	Xp          int64
+}
+
+// 排行榜。ORDER BY user_xp.xp 走既有索引,不必掃 xp_events ——
+// XP 不進帳本的理由之一就是這個(grill 2026-08-24 Q3)。
+func (q *Queries) LeaderboardByXP(ctx context.Context, arg LeaderboardByXPParams) ([]LeaderboardByXPRow, error) {
+	rows, err := q.db.Query(ctx, leaderboardByXP, arg.PublicID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []LeaderboardByXPRow
+	for rows.Next() {
+		var i LeaderboardByXPRow
+		if err := rows.Scan(&i.PublicID, &i.DisplayName, &i.Xp); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listLedgerEntries = `-- name: ListLedgerEntries :many
@@ -238,6 +318,55 @@ func (q *Queries) ListListedItems(ctx context.Context, arg ListListedItemsParams
 	return items, nil
 }
 
+const listUserBadges = `-- name: ListUserBadges :many
+SELECT ii.public_id, idf.name, idf.rarity, idf.icon_url, ii.acquired_at
+FROM platform.item_instances ii
+JOIN platform.item_definitions idf ON idf.id = ii.definition_id
+WHERE ii.owner_id = $1 AND idf.category = 'badge'
+ORDER BY ii.acquired_at DESC
+LIMIT $2
+`
+
+type ListUserBadgesParams struct {
+	OwnerID int64
+	Limit   int32
+}
+
+type ListUserBadgesRow struct {
+	PublicID   string
+	Name       string
+	Rarity     *string
+	IconUrl    *string
+	AcquiredAt time.Time
+}
+
+// 徽章就是 category='badge' 的物品 —— 不是另一套系統(schemas/25)。
+func (q *Queries) ListUserBadges(ctx context.Context, arg ListUserBadgesParams) ([]ListUserBadgesRow, error) {
+	rows, err := q.db.Query(ctx, listUserBadges, arg.OwnerID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListUserBadgesRow
+	for rows.Next() {
+		var i ListUserBadgesRow
+		if err := rows.Scan(
+			&i.PublicID,
+			&i.Name,
+			&i.Rarity,
+			&i.IconUrl,
+			&i.AcquiredAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listUserBalances = `-- name: ListUserBalances :many
 SELECT b.currency, b.balance
 FROM platform.user_balances b
@@ -395,6 +524,54 @@ func (q *Queries) ListUserRedemptions(ctx context.Context, arg ListUserRedemptio
 			&i.Note,
 			&i.CreatedAt,
 			&i.HandledAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listUserXP = `-- name: ListUserXP :many
+SELECT c.public_id AS community_public_id,
+       c.name      AS community_name,
+       ux.xp,
+       r.config    AS ruleset_config
+FROM platform.user_xp ux
+JOIN platform.communities c ON c.id = ux.community_id
+LEFT JOIN platform.xp_rulesets r ON r.id = c.xp_ruleset_id
+WHERE ux.user_id = $1
+ORDER BY ux.xp DESC
+`
+
+type ListUserXPRow struct {
+	CommunityPublicID string
+	CommunityName     string
+	Xp                int64
+	RulesetConfig     []byte
+}
+
+// 個人檔案用:這個人在各社群的 XP。
+//
+// LEFT JOIN xp_rulesets:community 沒指派 ruleset 時 config 為 NULL,
+// 呼叫端用預設曲線 —— 與 GetCommunityXpConfig 同樣的處置,不另發明。
+func (q *Queries) ListUserXP(ctx context.Context, userID int64) ([]ListUserXPRow, error) {
+	rows, err := q.db.Query(ctx, listUserXP, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListUserXPRow
+	for rows.Next() {
+		var i ListUserXPRow
+		if err := rows.Scan(
+			&i.CommunityPublicID,
+			&i.CommunityName,
+			&i.Xp,
+			&i.RulesetConfig,
 		); err != nil {
 			return nil, err
 		}

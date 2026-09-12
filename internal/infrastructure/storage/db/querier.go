@@ -144,6 +144,8 @@ type Querier interface {
 	// 經濟設定:不覆寫舊值,讀取取「生效時間最新」的一筆
 	GetCurrentConfig(ctx context.Context, key string) ([]byte, error)
 	GetDailyState(ctx context.Context, userID int64) (PlatformUserDailyState, error)
+	// 出戰中的寵物。一個人最多一隻(部分唯一索引保證),查無列 = 沒有出戰寵物。
+	GetDeployedPet(ctx context.Context, ownerID int64) (GetDeployedPetRow, error)
 	// manual 購買的押款分錄 ref 指向 redemption;免費 manual 商品沒有分錄 → no rows。
 	GetHoldEntryForRedemption(ctx context.Context, refID *int64) (GetHoldEntryForRedemptionRow, error)
 	GetIdempotencyKey(ctx context.Context, key string) (PlatformIdempotencyKey, error)
@@ -330,6 +332,9 @@ type Querier interface {
 	// 拿來計時會讓 voice 高頻入帳餓死 message 的冷卻、admin 修正也會重置計時(QA 中1)。
 	// 無列(ErrNoRows)= 該 source 從未入帳 = 無冷卻。呼叫前必須已 LockUserXp(串行化)
 	LastXpEventAtBySource(ctx context.Context, arg LastXpEventAtBySourceParams) (time.Time, error)
+	// 排行榜。ORDER BY user_xp.xp 走既有索引,不必掃 xp_events ——
+	// XP 不進帳本的理由之一就是這個(grill 2026-08-24 Q3)。
+	LeaderboardByXP(ctx context.Context, arg LeaderboardByXPParams) ([]LeaderboardByXPRow, error)
 	ListActiveSessionIDs(ctx context.Context, userID int64) ([]int64, error)
 	ListAdminAuditByActor(ctx context.Context, arg ListAdminAuditByActorParams) ([]PlatformAdminAuditLog, error)
 	ListChannelPurposes(ctx context.Context) ([]ListChannelPurposesRow, error)
@@ -382,6 +387,8 @@ type Querier interface {
 	ListSpaceChannels(ctx context.Context, spaceID int64) ([]ListSpaceChannelsRow, error)
 	ListSpacePurposes(ctx context.Context, spaceID int64) ([]ListSpacePurposesRow, error)
 	ListSpaces(ctx context.Context) ([]ListSpacesRow, error)
+	// 徽章就是 category='badge' 的物品 —— 不是另一套系統(schemas/25)。
+	ListUserBadges(ctx context.Context, arg ListUserBadgesParams) ([]ListUserBadgesRow, error)
 	// 多幣別:一列一幣別。**沒有列 = 沒有那個幣別的餘額 = 0**(與 ledger.GetBalance
 	// 的「無列視為 0」同一口徑),不在這裡替不存在的幣別補零列——
 	// 餘額的權威只有 user_balances,補零就是在讀取側偽造資料。
@@ -405,6 +412,11 @@ type Querier interface {
 	// status 為 NULL = 不過濾(全部狀態)。狀態值的封閉枚舉在 core/platform/shop,
 	// 這裡不重複列舉。
 	ListUserRedemptions(ctx context.Context, arg ListUserRedemptionsParams) ([]ListUserRedemptionsRow, error)
+	// 個人檔案用:這個人在各社群的 XP。
+	//
+	// LEFT JOIN xp_rulesets:community 沒指派 ruleset 時 config 為 NULL,
+	// 呼叫端用預設曲線 —— 與 GetCommunityXpConfig 同樣的處置,不另發明。
+	ListUserXP(ctx context.Context, userID int64) ([]ListUserXPRow, error)
 	// 沒有 UNIQUE 約束可用時的併發防線:把「同一個天然鍵」的併發寫入串行化,
 	// 讓「先查再寫」不會兩個 tx 同時通過檢查。tx 結束自動釋放。
 	// hash 碰撞只會造成無關鍵之間偶爾互等,不影響正確性。

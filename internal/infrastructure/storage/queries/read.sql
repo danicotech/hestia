@@ -229,3 +229,51 @@ SET opt_out_logging   = COALESCE(sqlc.narg(opt_out_logging)::bool,
                                  platform.user_privacy_settings.opt_out_ai_corpus),
     updated_at        = now()
 RETURNING opt_out_logging, opt_out_ai_corpus, updated_at;
+
+-- name: ListUserXP :many
+-- 個人檔案用:這個人在各社群的 XP。
+--
+-- LEFT JOIN xp_rulesets:community 沒指派 ruleset 時 config 為 NULL,
+-- 呼叫端用預設曲線 —— 與 GetCommunityXpConfig 同樣的處置,不另發明。
+SELECT c.public_id AS community_public_id,
+       c.name      AS community_name,
+       ux.xp,
+       r.config    AS ruleset_config
+FROM platform.user_xp ux
+JOIN platform.communities c ON c.id = ux.community_id
+LEFT JOIN platform.xp_rulesets r ON r.id = c.xp_ruleset_id
+WHERE ux.user_id = $1
+ORDER BY ux.xp DESC;
+
+-- name: GetDeployedPet :one
+-- 出戰中的寵物。一個人最多一隻(部分唯一索引保證),查無列 = 沒有出戰寵物。
+SELECT ps.item_instance_id,
+       ii.public_id,
+       COALESCE(ps.nickname, idf.name) AS name,
+       idf.icon_url,
+       idf.rarity,
+       ps.xp
+FROM platform.pet_states ps
+JOIN platform.item_instances ii ON ii.id = ps.item_instance_id
+JOIN platform.item_definitions idf ON idf.id = ii.definition_id
+WHERE ps.owner_id = $1 AND ps.deployed;
+
+-- name: ListUserBadges :many
+-- 徽章就是 category='badge' 的物品 —— 不是另一套系統(schemas/25)。
+SELECT ii.public_id, idf.name, idf.rarity, idf.icon_url, ii.acquired_at
+FROM platform.item_instances ii
+JOIN platform.item_definitions idf ON idf.id = ii.definition_id
+WHERE ii.owner_id = $1 AND idf.category = 'badge'
+ORDER BY ii.acquired_at DESC
+LIMIT $2;
+
+-- name: LeaderboardByXP :many
+-- 排行榜。ORDER BY user_xp.xp 走既有索引,不必掃 xp_events ——
+-- XP 不進帳本的理由之一就是這個(grill 2026-08-24 Q3)。
+SELECT u.public_id, u.display_name, ux.xp
+FROM platform.user_xp ux
+JOIN platform.users u ON u.id = ux.user_id
+JOIN platform.communities c ON c.id = ux.community_id
+WHERE c.public_id = $1 AND u.deleted_at IS NULL
+ORDER BY ux.xp DESC, u.id
+LIMIT $2;

@@ -31,9 +31,11 @@ type SourceRule struct {
 }
 
 // Config 是 xp_rulesets.config 的 Go 形狀。
-// curve 欄位 M1 不讀(level 恆 0,schemas/06),等級功能上線時再補型別。
 type Config struct {
 	Sources map[string]SourceRule `json:"sources"`
+	// Curve 是等級曲線(schemas/24)。空值 = 用預設(見 curve.go),
+	// 所以尚未指派 ruleset 的 community 照樣算得出等級。
+	Curve Curve `json:"curve"`
 }
 
 // ParseConfig 解析 xp_rulesets.config。raw 為空(community 尚未指派 ruleset,
