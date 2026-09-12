@@ -199,10 +199,19 @@ service ActivityInteractionService {
 message Announcement {
   // 事件的唯一識別子。stentor 用它去重(至少一次投遞 → 重放時不重貼)。
   string event_id = 1;
-  // 邏輯頻道名(例:`announcements`),由 stentor 的設定對到實際 channel id。
-  // 不直接給 channel id:頻道搬家是部署設定的事,不該讓後端知道。
+  // 邏輯頻道用途(例:`announcements`)。保留它是為了讓閘道在記錄與除錯時
+  // 說得出「這是哪一種公告」,**投遞看的是 channel_id 不是它**。
   string channel_key = 2;
   View view = 3;
   // 嵌入卡之外的純文字(要 @ 人的時候用)。
   optional string content = 4;
+  // 實際要貼的頻道(Discord snowflake),由 hestia 從 space_channel_purposes 解出。
+  //
+  // 為什麼由後端給:對應關係存在資料庫,而只有 hestia 有資料庫憑證。
+  // 這個欄位取代了閘道舊有的 CHANNEL_MAP 環境變數 —— 那是一份全域對應,
+  // bot 進到第二個伺服器時就沒有正確答案可給。
+  //
+  // **空字串 = 略過這一則**:該用途沒設頻道,或多個空間都設了而無法決定。
+  // 略過不是錯誤,閘道記一筆 warn 即可(照樣 Ack,否則它會永遠重來)。
+  string channel_id = 5;
 }

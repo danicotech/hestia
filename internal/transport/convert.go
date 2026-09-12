@@ -203,6 +203,9 @@ func announcementToProto(a notification.Announcement) *renderv1.Announcement {
 	return &renderv1.Announcement{
 		EventId:    a.EventID,
 		ChannelKey: a.ChannelKey,
+		// 空字串是合法的:該用途沒設頻道,或多個空間都設了而無法決定。
+		// 閘道據此略過(照樣 Ack,否則它會永遠重來)。
+		ChannelId: a.ChannelID,
 		View: &renderv1.View{
 			Title:     a.Title,
 			Fields:    fields,

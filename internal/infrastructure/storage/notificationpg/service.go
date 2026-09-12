@@ -201,6 +201,8 @@ func (s *Service) Pull(ctx context.Context, max int32, visibility time.Duration)
 		return nil, err
 	}
 
+	channels := s.resolveChannels(ctx, events)
+
 	out := make([]notification.Announcement, 0, len(events))
 	for _, ev := range events {
 		a, err := notification.Render(ev, names)
@@ -213,9 +215,46 @@ func (s *Service) Pull(ctx context.Context, max int32, visibility time.Duration)
 				"event_id", ev.ID, "topic", ev.Topic, "err", err)
 			continue
 		}
+		a.ChannelID = channels[a.ChannelKey]
 		out = append(out, a)
 	}
 	return out, nil
+}
+
+// resolveChannels 把這一批用到的邏輯用途解成實際頻道 id。
+//
+// 一批一次查,不是一則一次:這條路徑每幾秒就跑一次,N+1 在這裡特別貴。
+//
+// **多個空間設了同一個用途時刻意留空。** 目前的 outbox 事件不帶「發生在哪個
+// 空間」(schemas/22 的 A 方案尚未落地),所以這裡沒有資訊可以決定貼哪一個。
+// 猜一個的話,公告會出現在錯的伺服器 —— 那比不貼嚴重得多,而且很久沒有人
+// 會發現。留空會讓閘道略過並記 warn,同時這裡也記一筆說明原因。
+func (s *Service) resolveChannels(ctx context.Context, events []notification.Event) map[string]string {
+	keys := map[string]struct{}{}
+	for _, ev := range events {
+		if k := notification.ChannelKeyFor(ev.Topic); k != "" {
+			keys[k] = struct{}{}
+		}
+	}
+	out := make(map[string]string, len(keys))
+	for key := range keys {
+		rows, err := s.q.ResolveChannelsForPurpose(ctx, key)
+		if err != nil {
+			s.log.Error("通知拉取:解析頻道失敗", "purpose", key, "err", err)
+			continue
+		}
+		switch len(rows) {
+		case 0:
+			// 這個部署沒設這個用途。不是錯誤:不是每個社群都要每種公告。
+		case 1:
+			out[key] = rows[0].ChannelExternalID
+		default:
+			s.log.Warn("通知拉取:多個空間設了同一個用途,無法決定投遞目標,已略過",
+				"purpose", key, "spaces", len(rows),
+				"fix", "事件需帶 space_id(schemas/22 A 方案)")
+		}
+	}
+	return out
 }
 
 // resolveNames 批次查出這一批事件要用到的顯示名稱。

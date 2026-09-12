@@ -531,6 +531,13 @@ type Querier interface {
 	// 取消後又按回來:復用同一列。activity_daily.reactions **不再加一次** ——
 	// 否則按了取消再按就是無限刷參與度。
 	ReopenReaction(ctx context.Context, arg ReopenReactionParams) error
+	// 投遞時把邏輯用途解成真的 channel id。
+	//
+	// 回傳**全部**符合的空間而不是一筆:一個社群可能有多個 Discord 伺服器,
+	// 而目前的 outbox 事件還沒帶「發生在哪個空間」(schemas/22 的 A 方案)。
+	// 呼叫端在只有一筆時直接用,多筆時拒絕猜 —— 猜錯會把公告貼到錯的伺服器,
+	// 那比不貼嚴重。
+	ResolveChannelsForPurpose(ctx context.Context, purpose string) ([]ResolveChannelsForPurposeRow, error)
 	// API 讀取側(readpg)。這個檔案只有 SELECT,唯一的例外是 SetUserTimezone
 	// ——它是 users.timezone 的**寫入入口**(dailypg 的註解指名的那一個),放在這裡
 	// 是因為 transport 的 ProfileStore 把「讀檔案」與「改時區」綁在同一個 port。

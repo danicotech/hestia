@@ -1199,12 +1199,21 @@ type Announcement struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// 事件的唯一識別子。stentor 用它去重(至少一次投遞 → 重放時不重貼)。
 	EventId string `protobuf:"bytes,1,opt,name=event_id,json=eventId,proto3" json:"event_id,omitempty"`
-	// 邏輯頻道名(例:`announcements`),由 stentor 的設定對到實際 channel id。
-	// 不直接給 channel id:頻道搬家是部署設定的事,不該讓後端知道。
+	// 邏輯頻道用途(例:`announcements`)。保留它是為了讓閘道在記錄與除錯時
+	// 說得出「這是哪一種公告」,**投遞看的是 channel_id 不是它**。
 	ChannelKey string `protobuf:"bytes,2,opt,name=channel_key,json=channelKey,proto3" json:"channel_key,omitempty"`
 	View       *View  `protobuf:"bytes,3,opt,name=view,proto3" json:"view,omitempty"`
 	// 嵌入卡之外的純文字(要 @ 人的時候用)。
-	Content       *string `protobuf:"bytes,4,opt,name=content,proto3,oneof" json:"content,omitempty"`
+	Content *string `protobuf:"bytes,4,opt,name=content,proto3,oneof" json:"content,omitempty"`
+	// 實際要貼的頻道(Discord snowflake),由 hestia 從 space_channel_purposes 解出。
+	//
+	// 為什麼由後端給:對應關係存在資料庫,而只有 hestia 有資料庫憑證。
+	// 這個欄位取代了閘道舊有的 CHANNEL_MAP 環境變數 —— 那是一份全域對應,
+	// bot 進到第二個伺服器時就沒有正確答案可給。
+	//
+	// **空字串 = 略過這一則**:該用途沒設頻道,或多個空間都設了而無法決定。
+	// 略過不是錯誤,閘道記一筆 warn 即可(照樣 Ack,否則它會永遠重來)。
+	ChannelId     string `protobuf:"bytes,5,opt,name=channel_id,json=channelId,proto3" json:"channel_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1263,6 +1272,13 @@ func (x *Announcement) GetView() *View {
 func (x *Announcement) GetContent() string {
 	if x != nil && x.Content != nil {
 		return *x.Content
+	}
+	return ""
+}
+
+func (x *Announcement) GetChannelId() string {
+	if x != nil {
+		return x.ChannelId
 	}
 	return ""
 }
@@ -1369,13 +1385,15 @@ const file_hestia_render_v1_render_proto_rawDesc = "" +
 	"\x17DescribeCommandsRequest\"k\n" +
 	"\x18DescribeCommandsResponse\x123\n" +
 	"\bcommands\x18\x01 \x03(\v2\x17.google.protobuf.StructR\bcommands\x12\x1a\n" +
-	"\bprefixes\x18\x02 \x03(\tR\bprefixes\"\xa1\x01\n" +
+	"\bprefixes\x18\x02 \x03(\tR\bprefixes\"\xc0\x01\n" +
 	"\fAnnouncement\x12\x19\n" +
 	"\bevent_id\x18\x01 \x01(\tR\aeventId\x12\x1f\n" +
 	"\vchannel_key\x18\x02 \x01(\tR\n" +
 	"channelKey\x12*\n" +
 	"\x04view\x18\x03 \x01(\v2\x16.hestia.render.v1.ViewR\x04view\x12\x1d\n" +
-	"\acontent\x18\x04 \x01(\tH\x00R\acontent\x88\x01\x01B\n" +
+	"\acontent\x18\x04 \x01(\tH\x00R\acontent\x88\x01\x01\x12\x1d\n" +
+	"\n" +
+	"channel_id\x18\x05 \x01(\tR\tchannelIdB\n" +
 	"\n" +
 	"\b_content*\xab\x01\n" +
 	"\vActionStyle\x12\x1c\n" +

@@ -89,3 +89,13 @@ WHERE p.space_id = $1 ORDER BY p.purpose;
 -- 查無列 = 沒設定,呼叫端應略過而不是報錯(部署可能刻意不設某個用途)。
 SELECT channel_external_id FROM platform.space_channel_purposes
 WHERE space_id = $1 AND purpose = $2;
+
+-- name: ResolveChannelsForPurpose :many
+-- 投遞時把邏輯用途解成真的 channel id。
+--
+-- 回傳**全部**符合的空間而不是一筆:一個社群可能有多個 Discord 伺服器,
+-- 而目前的 outbox 事件還沒帶「發生在哪個空間」(schemas/22 的 A 方案)。
+-- 呼叫端在只有一筆時直接用,多筆時拒絕猜 —— 猜錯會把公告貼到錯的伺服器,
+-- 那比不貼嚴重。
+SELECT space_id, channel_external_id FROM platform.space_channel_purposes
+WHERE purpose = $1 ORDER BY space_id;

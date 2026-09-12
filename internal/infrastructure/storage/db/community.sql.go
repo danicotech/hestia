@@ -392,6 +392,42 @@ func (q *Queries) ListSpaces(ctx context.Context) ([]ListSpacesRow, error) {
 	return items, nil
 }
 
+const resolveChannelsForPurpose = `-- name: ResolveChannelsForPurpose :many
+SELECT space_id, channel_external_id FROM platform.space_channel_purposes
+WHERE purpose = $1 ORDER BY space_id
+`
+
+type ResolveChannelsForPurposeRow struct {
+	SpaceID           int64
+	ChannelExternalID string
+}
+
+// 投遞時把邏輯用途解成真的 channel id。
+//
+// 回傳**全部**符合的空間而不是一筆:一個社群可能有多個 Discord 伺服器,
+// 而目前的 outbox 事件還沒帶「發生在哪個空間」(schemas/22 的 A 方案)。
+// 呼叫端在只有一筆時直接用,多筆時拒絕猜 —— 猜錯會把公告貼到錯的伺服器,
+// 那比不貼嚴重。
+func (q *Queries) ResolveChannelsForPurpose(ctx context.Context, purpose string) ([]ResolveChannelsForPurposeRow, error) {
+	rows, err := q.db.Query(ctx, resolveChannelsForPurpose, purpose)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ResolveChannelsForPurposeRow
+	for rows.Next() {
+		var i ResolveChannelsForPurposeRow
+		if err := rows.Scan(&i.SpaceID, &i.ChannelExternalID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const setChannelPurpose = `-- name: SetChannelPurpose :one
 INSERT INTO platform.space_channel_purposes (space_id, purpose, channel_external_id)
 VALUES ($1, $2, $3)

@@ -146,8 +146,18 @@ type Field struct {
 type Announcement struct {
 	EventID    string
 	ChannelKey string
-	Title      string
-	Fields     []Field
+	// ChannelID 是 ChannelKey 解析後的實際頻道(Discord snowflake)。
+	//
+	// 解析在 hestia 做,不在閘道做:對應關係存在 space_channel_purposes,
+	// 而只有 hestia 碰得到資料庫。閘道拿到的是「貼到這裡」,不必自己查表 ——
+	// 舊的 CHANNEL_MAP 環境變數是一份全域對應,bot 進第二個伺服器就沒有
+	// 正確答案可給,那正是這個欄位要取代的東西。
+	//
+	// 空字串 = 這個部署沒有為該用途設頻道,或無法決定是哪一個(見儲存層)。
+	// 呼叫端應略過並記 warn,那是預期行為不是錯誤。
+	ChannelID string
+	Title     string
+	Fields    []Field
 }
 
 // Refs 是渲染前要先查好的外部名稱。
@@ -404,3 +414,9 @@ func sanitize(s string) string {
 	}
 	return out
 }
+
+// ChannelKeyFor 回傳 topic 對應的邏輯頻道用途;不在清單內回空字串。
+//
+// 匯出它是為了讓儲存層能先把一批事件要用到的用途收集起來、一次查完,
+// 而不必為此把 discordChannels 這張表複製一份出去(專案第 9 條)。
+func ChannelKeyFor(topic string) string { return discordChannels[topic] }
