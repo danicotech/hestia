@@ -3,7 +3,12 @@
 version: "2"
 sql:
   - engine: "postgresql"
-    schema: "migrations/platform"
+    # 兩個 schema 都要餵給解析器,否則 activity 的查詢會被當成「表不存在」。
+    # 順序即依賴方向:platform 先,activity 後。
+    # 抽成 themis 的那天,activity 那行連同 migrations/activity 一起搬走。
+    schema:
+      - "migrations/platform"
+      - "migrations/activity"
     queries: "internal/infrastructure/storage/queries"
     gen:
       go:
