@@ -177,7 +177,7 @@ func TestGetParsesConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v.Config.BPPerRankGap != 12 {
+	if v.Config.BP.PerRankGap != 12 {
 		t.Errorf("設定沒解析進來:%+v", v.Config)
 	}
 	if v.ConfigErr != nil {
@@ -198,8 +198,8 @@ func TestGetSurvivesBrokenConfig(t *testing.T) {
 	if !errors.Is(v.ConfigErr, ErrConfigMalformed) {
 		t.Errorf("ConfigErr 要是 ErrConfigMalformed,得到 %v", v.ConfigErr)
 	}
-	if v.Config.BPPerRankGap != DefaultBPPerRankGap {
-		t.Errorf("壞設定要退回預設 %d,得到 %d", DefaultBPPerRankGap, v.Config.BPPerRankGap)
+	if v.Config.BP.PerRankGap != bp.DefaultPerRankGap {
+		t.Errorf("壞設定要退回預設 %d,得到 %d", bp.DefaultPerRankGap, v.Config.BP.PerRankGap)
 	}
 }
 

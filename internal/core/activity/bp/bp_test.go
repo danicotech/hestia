@@ -3,6 +3,8 @@ package bp
 import (
 	"errors"
 	"testing"
+
+	"github.com/danicotech/hestia/internal/core/activity/rules"
 )
 
 // TestBudgetAllRankPairs 窮舉四段位的全部 16 種組合。
@@ -244,5 +246,33 @@ func TestMaxPossibleBudget(t *testing.T) {
 	}
 	if max != 24 {
 		t.Errorf("最大 BP = %d,但規則文案對外承諾的是 24", max)
+	}
+}
+
+// TestBudgetForDispatchesOnKind 確認 kind 是分派點:linear_gap 走既有公式,
+// 未知 kind 回 ErrUnknownKind 而不是靜靜退回 linear_gap。
+func TestBudgetForDispatchesOnKind(t *testing.T) {
+	t.Parallel()
+
+	linear := rules.BPRule{Kind: rules.BPKindLinearGap, PerRankGap: 10}
+	got, err := BudgetFor(linear, RankKaishan, RankWuwo)
+	if err != nil || got != 30 {
+		t.Errorf("BudgetFor(linear_gap 10, 開山 vs 無我) = %d, %v,要 30", got, err)
+	}
+	budget, isP1, err := HolderFor(linear, RankWuwo, RankDuanshui)
+	if err != nil || budget != 20 || isP1 {
+		t.Errorf("HolderFor(linear_gap 10, 無我 vs 斷水) = %d, %v, %v,要 20 給 P2", budget, isP1, err)
+	}
+
+	unknown := rules.BPRule{Kind: "quadratic", PerRankGap: 10}
+	if _, err := BudgetFor(unknown, RankKaishan, RankWuwo); !errors.Is(err, ErrUnknownKind) {
+		t.Errorf("未知 kind 要回 ErrUnknownKind,得到 %v", err)
+	}
+	if _, _, err := HolderFor(unknown, RankKaishan, RankWuwo); !errors.Is(err, ErrUnknownKind) {
+		t.Errorf("未知 kind 要回 ErrUnknownKind,得到 %v", err)
+	}
+	// 預設規則必須走得通,且用的就是 rules 那一個 8。
+	if got, err := BudgetFor(rules.Default().BP, RankKaishan, RankDuanshui); err != nil || got != DefaultPerRankGap {
+		t.Errorf("BudgetFor(Default) = %d, %v,要 %d", got, err, DefaultPerRankGap)
 	}
 }

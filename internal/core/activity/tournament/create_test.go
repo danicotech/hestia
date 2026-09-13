@@ -2,10 +2,13 @@ package tournament
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/danicotech/hestia/internal/core/activity/handicap"
+	"github.com/danicotech/hestia/internal/core/activity/rules"
 )
 
 func validCreate() CreateParams {
@@ -53,11 +56,11 @@ func TestCreate_DefaultsAndCatalogue(t *testing.T) {
 	}
 
 	// 沒填任何旋鈕 = 全部預設,而且寫進 config 的位元組要能解回同一份。
-	if res.Config.BPPerRankGap != DefaultBPPerRankGap {
-		t.Errorf("bp_per_rank_gap = %d,想要預設 %d", res.Config.BPPerRankGap, DefaultBPPerRankGap)
+	if res.Config.BP.PerRankGap != rules.DefaultPerRankGap {
+		t.Errorf("bp.per_rank_gap = %d,想要預設 %d", res.Config.BP.PerRankGap, rules.DefaultPerRankGap)
 	}
-	if res.Config.Odds.VigBPS != DefaultVigBPS {
-		t.Errorf("vig_bps = %d,想要預設 %d", res.Config.Odds.VigBPS, DefaultVigBPS)
+	if res.Config.Betting.Odds.VigBPS != rules.DefaultVigBPS {
+		t.Errorf("vig_bps = %d,想要預設 %d", res.Config.Betting.Odds.VigBPS, rules.DefaultVigBPS)
 	}
 	// 獎金未定案,預設全 0(季軍獎金 > 0 會被 prize 套件拒發,那是刻意的)。
 	if res.Config.Prizes != (Prizes{}) {
@@ -67,7 +70,17 @@ func TestCreate_DefaultsAndCatalogue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("寫出去的 config 解不回來: %v", err)
 	}
-	assertSameConfig(t, parsed, res.Config)
+	if !reflect.DeepEqual(parsed, res.Config) {
+		t.Errorf("寫出去的 config 解回來不同:got %+v / want %+v", parsed, res.Config)
+	}
+	// 寫進去的一定是 v2(rules.Marshal 一律寫完整 v2)。
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(got.ConfigRaw, &top); err != nil {
+		t.Fatal(err)
+	}
+	if string(top["version"]) != "2" {
+		t.Errorf("config.version = %s,want 2", top["version"])
+	}
 }
 
 // 旋鈕有填就要照填的走,而 vig_bps = 0 必須是「不抽水」而不是「沒填」。
@@ -78,11 +91,15 @@ func TestCreate_Overrides(t *testing.T) {
 	zero := int64(0)
 	gap := int64(12)
 	qty := int32(3)
+	bestOf := 3
+	third := true
 	p := validCreate()
 	p.SignupBonus = 500
 	p.Config = ConfigOverrides{
 		BPPerRankGap:       &gap,
 		VigBPS:             &zero,
+		BestOf:             &bestOf,
+		ThirdPlaceMatch:    &third,
 		Prizes:             &Prizes{Champion: 5000, RunnerUp: 2000},
 		HandicapItemMaxQty: &qty,
 	}
@@ -91,21 +108,24 @@ func TestCreate_Overrides(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if res.Config.BPPerRankGap != 12 {
-		t.Errorf("bp_per_rank_gap = %d,want 12", res.Config.BPPerRankGap)
+	if res.Config.BP.PerRankGap != 12 {
+		t.Errorf("bp.per_rank_gap = %d,want 12", res.Config.BP.PerRankGap)
 	}
-	if res.Config.Odds.VigBPS != 0 {
-		t.Errorf("vig_bps = %d,want 0(填 0 是不抽水,不是沒填)", res.Config.Odds.VigBPS)
+	if res.Config.Betting.Odds.VigBPS != 0 {
+		t.Errorf("vig_bps = %d,want 0(填 0 是不抽水,不是沒填)", res.Config.Betting.Odds.VigBPS)
 	}
 	// 沒填的那些仍然是預設。
-	if res.Config.Odds.MinOddsMilli != DefaultMinOddsMilli {
-		t.Errorf("min_odds_milli = %d,want %d", res.Config.Odds.MinOddsMilli, DefaultMinOddsMilli)
+	if res.Config.Betting.Odds.MinOddsMilli != rules.DefaultMinOddsMilli {
+		t.Errorf("min_odds_milli = %d,want %d", res.Config.Betting.Odds.MinOddsMilli, rules.DefaultMinOddsMilli)
+	}
+	if res.Config.Format.BestOf != 3 || !res.Config.Format.ThirdPlaceMatch {
+		t.Errorf("format = %+v,want 三局兩勝 + 季軍戰", res.Config.Format)
 	}
 	if res.Config.Prizes.Champion != 5000 || res.Config.Prizes.Third != 0 {
 		t.Errorf("獎金 = %+v", res.Config.Prizes)
 	}
-	if res.Config.HandicapItemMaxQty == nil || *res.Config.HandicapItemMaxQty != 3 {
-		t.Errorf("handicap_item_max_qty = %v,want 3", res.Config.HandicapItemMaxQty)
+	if res.Config.Handicap.ItemMaxQty == nil || *res.Config.Handicap.ItemMaxQty != 3 {
+		t.Errorf("handicap.item_max_qty = %v,want 3", res.Config.Handicap.ItemMaxQty)
 	}
 	if repo.createCalls[0].SignupBonus != 500 {
 		t.Errorf("signup_bonus = %d,want 500", repo.createCalls[0].SignupBonus)
@@ -117,10 +137,12 @@ func TestCreate_Overrides(t *testing.T) {
 func TestCreate_BadConfigIsFatal(t *testing.T) {
 	neg := int64(-1)
 	bigMin := int64(99999)
+	even := 2
 	cases := map[string]ConfigOverrides{
 		"bp_per_rank_gap 為負":       {BPPerRankGap: &neg},
 		"vig_bps 為負":               {VigBPS: &neg},
 		"下限高於上限":                   {MinOddsMilli: &bigMin},
+		"best_of 偶數":               {BestOf: &even},
 		"獎金為負":                     {Prizes: &Prizes{Champion: -1}},
 		"handicap_item_max_qty 為負": {HandicapItemMaxQty: ptrOf(int32(-1))},
 	}
@@ -210,32 +232,3 @@ func TestValidateSlug(t *testing.T) {
 }
 
 func ptrOf[T any](v T) *T { return &v }
-
-// assertSameConfig 比對兩份設定的每一個欄位(Ranks 是切片,不能直接 ==)。
-func assertSameConfig(t *testing.T, got, want Config) {
-	t.Helper()
-	if got.BPPerRankGap != want.BPPerRankGap {
-		t.Errorf("bp_per_rank_gap = %d,want %d", got.BPPerRankGap, want.BPPerRankGap)
-	}
-	if got.Odds != want.Odds {
-		t.Errorf("odds = %+v,want %+v", got.Odds, want.Odds)
-	}
-	if got.Prizes != want.Prizes {
-		t.Errorf("prizes = %+v,want %+v", got.Prizes, want.Prizes)
-	}
-	switch {
-	case got.HandicapItemMaxQty == nil && want.HandicapItemMaxQty == nil:
-	case got.HandicapItemMaxQty == nil || want.HandicapItemMaxQty == nil:
-		t.Errorf("handicap_item_max_qty = %v,want %v", got.HandicapItemMaxQty, want.HandicapItemMaxQty)
-	case *got.HandicapItemMaxQty != *want.HandicapItemMaxQty:
-		t.Errorf("handicap_item_max_qty = %d,want %d", *got.HandicapItemMaxQty, *want.HandicapItemMaxQty)
-	}
-	if len(got.Ranks) != len(want.Ranks) {
-		t.Fatalf("段位 %d 段,want %d 段", len(got.Ranks), len(want.Ranks))
-	}
-	for i := range want.Ranks {
-		if got.Ranks[i] != want.Ranks[i] {
-			t.Errorf("第 %d 段 = %+v,want %+v", i, got.Ranks[i], want.Ranks[i])
-		}
-	}
-}

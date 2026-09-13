@@ -22,7 +22,12 @@
 // 也是為什麼這裡只有「計算能施加多少限制」,沒有任何關於勝負的邏輯。
 package bp
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+
+	"github.com/danicotech/hestia/internal/core/activity/rules"
+)
 
 // Rank 是試鋒段位。數值刻意等於資料庫的 rank_level 與 proto 的 enum 值,
 // 三處一致才不會在轉換層出錯。
@@ -42,14 +47,21 @@ const (
 )
 
 // DefaultPerRankGap 是每差一段給多少 BP。
-// 逐屆可在 tournaments.config 覆寫,這裡只是預設值。
-const DefaultPerRankGap int64 = 8
+// 逐屆可在 tournaments.config 覆寫;字面值的權威在 rules(config 的契約),
+// 這裡只是別名,不另外寫一個 8。
+const DefaultPerRankGap = rules.DefaultPerRankGap
 
 // MinRank 與 MaxRank 界定有效的已評定段位。
 const (
 	MinRank = RankKaishan
 	MaxRank = RankWuwo
 )
+
+// ErrUnknownKind 表示 config 的 bp.kind 不是這個套件實作的任何一種。
+//
+// 不退回 linear_gap:kind 是裁判選的公式,替他換一個公式比算不出來更糟 ——
+// rules.Validate 在寫入時就擋掉未知 kind,走到這裡代表 config 是繞過驗證寫進去的。
+var ErrUnknownKind = errors.New("未知的 BP 規則")
 
 // ErrUnranked 表示至少有一方尚未評定段位,無法計算 BP。
 //
@@ -101,6 +113,29 @@ func Budget(self, opponent Rank, perGap int64) (int64, error) {
 		return 0, nil
 	}
 	return gap * perGap, nil
+}
+
+// BudgetFor 依 config 的 bp 規則算出 self 對上 opponent 時取得的 BP。
+//
+// 這是「kind 選實作」的分派點(schemas/28):linear_gap 走 Budget,
+// 未知 kind 回 ErrUnknownKind。要加一種新公式就是在這裡多一個 case。
+func BudgetFor(rule rules.BPRule, self, opponent Rank) (int64, error) {
+	switch rule.Kind {
+	case rules.BPKindLinearGap:
+		return Budget(self, opponent, rule.PerRankGap)
+	default:
+		return 0, fmt.Errorf("%w: %q", ErrUnknownKind, rule.Kind)
+	}
+}
+
+// HolderFor 是 Holder 的 config 版:依 bp 規則回報由誰取得 BP、取得多少。
+func HolderFor(rule rules.BPRule, p1, p2 Rank) (budget int64, holderIsP1 bool, err error) {
+	switch rule.Kind {
+	case rules.BPKindLinearGap:
+		return Holder(p1, p2, rule.PerRankGap)
+	default:
+		return 0, false, fmt.Errorf("%w: %q", ErrUnknownKind, rule.Kind)
+	}
 }
 
 // Holder 回報一場對決中由誰取得 BP、取得多少。

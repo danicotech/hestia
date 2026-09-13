@@ -164,13 +164,62 @@ func Shape(totalRounds int) *Bracket {
 
 // Advance 回報某場的勝者該進到哪裡。
 //
-// 回傳 ok = false 代表這是決賽,沒有下一場 —— 勝者即冠軍。
+// 回傳 ok = false 代表沒有下一場:決賽(勝者即冠軍)、季軍戰(勝者是季軍,
+// 不晉級)、或根本不在樹上的位置。三者都不區分 —— 呼叫端要問的只有
+// 「要不要把勝者寫進下一場」,而三種情況的答案都是不要。
 func (b *Bracket) Advance(round, slot int) (nextRound, nextSlot int, isP1, ok bool) {
 	if round < 1 || round >= b.TotalRounds {
 		return 0, 0, false, false
 	}
+	// slot 超出該輪的寬度就不是樹上的位置。季軍戰落在決賽輪所以已被上一條擋掉,
+	// 這條擋的是其他非法輸入;不擋的話 feedsInto 會算出一個不存在的目標。
+	if slot < 0 || slot >= b.Size>>round {
+		return 0, 0, false, false
+	}
 	ns, p1 := feedsInto(slot)
 	return round + 1, ns, p1, true
+}
+
+// Position 是樹上的一個座標。
+type Position struct {
+	Round int
+	Slot  int
+}
+
+// ThirdPlaceSlot 回報季軍戰該放在哪個 (round, slot)。
+//
+// # 為什麼是「決賽那一輪、slot 1」
+//
+// 季軍戰不屬於晉級樹:它的兩位選手是準決賽的敗者,勝者不晉級。所以它不能
+// 佔用樹上任何一個由 feedsInto 推得出來的位置,否則 Advance 會把某場的勝者
+// 送進季軍戰。決賽輪只有 slot 0 一場(Size >> TotalRounds == 1),slot 1 在樹上
+// 不存在、Advance 對它回 ok=false,又與決賽同輪(對戰表上並排放,前端不必
+// 為它多開一輪),這是 schemas/20 待確認 ⑥ 選的方案,已同意。
+//
+// 另一個候選是 round = 決賽輪 + 1:那會讓 total_rounds = MAX(matches.round)
+// 這條推導多算一輪,所有靠它還原樹形的地方(Shape、RoundLabel)都要特判。
+//
+// 季軍戰**不在 Build 的輸出裡**:它是準決賽兩場都打完才建的(schemas/20),
+// Build 的「總場數 = N−1」不因它改變。
+//
+// ok = false 代表這棵樹沒有準決賽(不到 4 人),沒有季軍戰可打。
+func (b *Bracket) ThirdPlaceSlot() (round, slot int, ok bool) {
+	if b.TotalRounds < 2 {
+		return 0, 0, false
+	}
+	return b.TotalRounds, 1, true
+}
+
+// SemifinalPositions 回報準決賽兩場的座標(決賽前一輪的 slot 0 與 1)。
+//
+// 給 match 套件用:準決賽兩場都 done 時要建季軍戰,得知道去看哪兩場的敗者。
+// 不到 4 人時沒有準決賽,回 nil。
+func (b *Bracket) SemifinalPositions() []Position {
+	if b.TotalRounds < 2 {
+		return nil
+	}
+	semi := b.TotalRounds - 1
+	return []Position{{Round: semi, Slot: 0}, {Round: semi, Slot: 1}}
 }
 
 // RoundLabel 是一輪的顯示名稱,如「首輪」「八強」「四強」「決賽」。

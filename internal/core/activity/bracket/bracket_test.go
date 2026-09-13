@@ -404,3 +404,107 @@ func TestShapeRejectsEmpty(t *testing.T) {
 func name(n int) string {
 	return string(rune('0'+n/10)) + string(rune('0'+n%10)) + "人"
 }
+
+// TestThirdPlaceSlot 釘住季軍戰的位置:決賽那一輪、slot 1(schemas/20 待確認 ⑥)。
+//
+// 它必須不在 Build 的輸出裡(總場數仍是 N−1,見 TestBuildInvariants ①),
+// 且 Advance 對它回 ok=false —— 季軍戰的勝者不晉級。
+func TestThirdPlaceSlot(t *testing.T) {
+	t.Parallel()
+
+	for _, n := range []int{4, 5, 8, 13, 16, 32} {
+		t.Run(name(n), func(t *testing.T) {
+			t.Parallel()
+
+			b, err := Build(players(n), newRand(uint64(n)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			round, slot, ok := b.ThirdPlaceSlot()
+			if !ok {
+				t.Fatalf("%d 人有準決賽,應該有季軍戰位置", n)
+			}
+			if round != b.TotalRounds || slot != 1 {
+				t.Errorf("季軍戰位置 = (%d, %d),要 (%d, 1)", round, slot, b.TotalRounds)
+			}
+			// 不能撞到樹上任何一場。
+			if m := b.find(round, slot); m != nil {
+				t.Errorf("季軍戰位置 (%d, %d) 與樹上的場次重疊:%+v", round, slot, *m)
+			}
+			// 勝者不晉級。
+			if nr, ns, _, ok := b.Advance(round, slot); ok {
+				t.Errorf("季軍戰的勝者不該晉級,Advance 卻回 (%d, %d)", nr, ns)
+			}
+			// 只有形狀的表也要給同一個答案。
+			sr, ss, sok := Shape(b.TotalRounds).ThirdPlaceSlot()
+			if sr != round || ss != slot || sok != ok {
+				t.Errorf("Shape 的季軍戰位置 (%d,%d,%v) 與 Build 的 (%d,%d,%v) 不同", sr, ss, sok, round, slot, ok)
+			}
+		})
+	}
+
+	// 不到 4 人沒有準決賽,也就沒有季軍戰。
+	for _, n := range []int{1, 2, 3} {
+		b, err := Build(players(n), newRand(uint64(n)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n == 3 {
+			// 3 人補到 4,樹寬 4、兩輪,有準決賽(其中一場是輪空者直接進第二輪)。
+			if _, _, ok := b.ThirdPlaceSlot(); !ok {
+				t.Errorf("3 人樹寬 4,有準決賽,應有季軍戰位置")
+			}
+			continue
+		}
+		if _, _, ok := b.ThirdPlaceSlot(); ok {
+			t.Errorf("%d 人沒有準決賽,不該有季軍戰位置", n)
+		}
+		if got := b.SemifinalPositions(); got != nil {
+			t.Errorf("%d 人沒有準決賽,得到 %v", n, got)
+		}
+	}
+}
+
+// TestSemifinalPositions 準決賽兩場都要匯進決賽 slot 0,而且是決賽的兩側。
+func TestSemifinalPositions(t *testing.T) {
+	t.Parallel()
+
+	for _, n := range []int{4, 7, 8, 16, 23} {
+		b, err := Build(players(n), newRand(uint64(n)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		semis := b.SemifinalPositions()
+		if len(semis) != 2 {
+			t.Fatalf("%d 人應有兩場準決賽,得到 %v", n, semis)
+		}
+		for i, p := range semis {
+			if p.Round != b.TotalRounds-1 || p.Slot != i {
+				t.Errorf("%d 人準決賽[%d] = %+v,要 (round=%d, slot=%d)", n, i, p, b.TotalRounds-1, i)
+			}
+			if b.find(p.Round, p.Slot) == nil {
+				t.Errorf("%d 人準決賽 %+v 不在樹上", n, p)
+			}
+			nr, ns, isP1, ok := b.Advance(p.Round, p.Slot)
+			if !ok || nr != b.TotalRounds || ns != 0 || isP1 != (i == 0) {
+				t.Errorf("%d 人準決賽 %+v 的勝者應進決賽 (round=%d, slot=0) 的 %s 側,得到 (%d,%d,%v,%v)",
+					n, p, b.TotalRounds, map[bool]string{true: "P1", false: "P2"}[i == 0], nr, ns, isP1, ok)
+			}
+		}
+	}
+}
+
+// TestAdvanceRejectsOutOfRangeSlot 超出該輪寬度的 slot 不是樹上的位置。
+func TestAdvanceRejectsOutOfRangeSlot(t *testing.T) {
+	t.Parallel()
+
+	b := Shape(3) // 8 人:第 1 輪 4 場、第 2 輪 2 場
+	for _, c := range []struct{ round, slot int }{{1, 4}, {1, -1}, {2, 2}, {3, 1}} {
+		if _, _, _, ok := b.Advance(c.round, c.slot); ok {
+			t.Errorf("Advance(%d, %d) 不在樹上,不該回 ok", c.round, c.slot)
+		}
+	}
+	if _, _, _, ok := b.Advance(2, 1); !ok {
+		t.Error("Advance(2, 1) 是準決賽第二場,應該回 ok")
+	}
+}

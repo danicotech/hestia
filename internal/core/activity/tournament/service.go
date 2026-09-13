@@ -26,7 +26,7 @@ func NewService(repo Repo) *Service {
 // View 是一屆賽事加上解析好的設定。
 //
 // 綁在一起回傳是因為呼叫端幾乎沒有「只要 Tournament 不要 Config」的場合:
-// 規則頁要段位措辭、抽籤要 bp_per_rank_gap、下注要 max_stake。
+// 規則頁要段位措辭、抽籤要 bp.per_rank_gap、下注要 max_stake。
 // 分開兩個方法的結果是每個呼叫端都要記得呼叫第二次,而忘記的那次會拿到零值。
 type View struct {
 	Tournament Tournament
