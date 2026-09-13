@@ -64,10 +64,34 @@ var errStub = errors.New("替身注入的失敗")
 
 // 兩個替身都有 mu:併發測試會有兩位裁判同時呼叫它們,而那正是要測的場景。
 type stubHandicaps struct {
-	mu        sync.Mutex
-	granted   []string
-	locked    []string
-	failGrant bool
+	mu         sync.Mutex
+	granted    []string
+	locked     []string
+	refunded   []string
+	failGrant  bool
+	failRefund error
+
+	// 代退回傳值由測試填:請求只帶 selection_public_id,替身沒有別的辦法
+	// 知道它屬於哪一場、哪一位選手。
+	refundMatchID   int64
+	refundMatchRef  string
+	refundPlayerID  int64
+	refundPlayerRef string
+
+	// refereeSelections 是裁判端檢視回的清單(設定確認清單由它推導),由測試填。
+	refereeSelections []handicap.Selection
+}
+
+// RefereeViewInTx 是裁判端檢視的替身:讀真的場次狀態,清單由測試給。
+func (h *stubHandicaps) RefereeViewInTx(ctx context.Context, tx pgx.Tx, matchPublicID string) (*handicap.MatchHandicaps, error) {
+	m, err := db.New(tx).GetMatchForJudge(ctx, matchPublicID)
+	if err != nil {
+		return nil, fmt.Errorf("替身讀場次: %w", err)
+	}
+	return &handicap.MatchHandicaps{
+		MatchPublicID: matchPublicID, Status: m.Status, LockedAt: m.HandicapLockedAt,
+		Revealed: m.HandicapLockedAt != nil, Selections: h.refereeSelections,
+	}, nil
 }
 
 func (h *stubHandicaps) GrantBudgetInTx(_ context.Context, _ pgx.Tx, matchPublicID string) (*handicap.Budget, error) {
@@ -103,11 +127,103 @@ func (h *stubHandicaps) LockInTx(ctx context.Context, tx pgx.Tx, matchPublicID s
 	}, nil
 }
 
+// RefundSelectionInTx 是代退的替身。
+//
+// 它不碰讓武資料表(那是 handicappg 的責任,在那邊對真 Postgres 測過)——
+// 本套件要驗的是另一半:退點成立時稽核紀錄真的落進 platform.admin_audit_logs,
+// 而退點失敗時整個 tx 一起消失。
+func (h *stubHandicaps) RefundSelectionInTx(
+	_ context.Context, _ pgx.Tx, selectionPublicID string,
+) (*handicap.RefundResult, error) {
+	if h.failRefund != nil {
+		return nil, h.failRefund
+	}
+	h.mu.Lock()
+	h.refunded = append(h.refunded, selectionPublicID)
+	h.mu.Unlock()
+	return &handicap.RefundResult{
+		MatchID:       h.refundMatchID,
+		MatchPublicID: h.refundMatchRef,
+		Selection: handicap.Selection{
+			PublicID: selectionPublicID, MatchID: h.refundMatchID,
+			MatchPublicID: h.refundMatchRef, ItemName: "禁用任意奇術",
+			Category: handicap.CategorySkill, Cost: 3, TargetNote: "踏雪無痕", Voided: true,
+		},
+		Budget: handicap.Budget{
+			MatchID: h.refundMatchID, PlayerID: h.refundPlayerID,
+			PlayerPublicID: h.refundPlayerRef, Budget: 16, Spent: 12,
+		},
+	}, nil
+}
+
 type stubBets struct {
-	mu         sync.Mutex
-	settled    []string
-	voided     []string
-	failSettle bool
+	mu              sync.Mutex
+	opened          []string
+	closed          []string
+	settledRounds   []string
+	settled         []string
+	voided          []string
+	failSettle      bool
+	failSettleRound bool
+}
+
+// OpenMarketsInTx 真的建一個整場勝負盤(activity.markets):f.bet 要押的就是它,
+// 而關盤那一步要有東西可關。要求場次已是 ready —— 順序寫反時這裡直接失敗。
+func (b *stubBets) OpenMarketsInTx(ctx context.Context, tx pgx.Tx, matchPublicID string) ([]betting.Market, error) {
+	m, err := db.New(tx).GetMatchForJudge(ctx, matchPublicID)
+	if err != nil {
+		return nil, fmt.Errorf("替身讀場次: %w", err)
+	}
+	if m.Status != string(match.StatusReady) {
+		return nil, fmt.Errorf("建盤口時場次還不是 ready:status=%s", m.Status)
+	}
+	var id int64
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO activity.markets (public_id, match_id, kind)
+		VALUES (gen_random_uuid()::text, $1, 'match_winner') RETURNING id`, m.ID).Scan(&id); err != nil {
+		return nil, fmt.Errorf("替身建盤口: %w", err)
+	}
+	b.mu.Lock()
+	b.opened = append(b.opened, matchPublicID)
+	b.mu.Unlock()
+	return []betting.Market{{ID: id, MatchID: m.ID, Kind: betting.MarketKind("match_winner")}}, nil
+}
+
+// CloseMarketsInTx 把這場還開著的盤口標成 closed,回關掉的數量。
+func (b *stubBets) CloseMarketsInTx(ctx context.Context, tx pgx.Tx, matchPublicID string) (int, error) {
+	tag, err := tx.Exec(ctx, `
+		UPDATE activity.markets mk SET status = 'closed'
+		  FROM activity.matches m
+		 WHERE m.id = mk.match_id AND m.public_id = $1 AND mk.status = 'open'`, matchPublicID)
+	if err != nil {
+		return 0, fmt.Errorf("替身關盤: %w", err)
+	}
+	b.mu.Lock()
+	b.closed = append(b.closed, matchPublicID)
+	b.mu.Unlock()
+	return int(tag.RowsAffected()), nil
+}
+
+// SettleRoundInTx 要求該回合在資料庫裡已經 finished:那是「先寫 match_rounds 再結算」
+// 的順序要求;順序寫反時這裡直接失敗,而不是靜靜算出一樣的結果。
+func (b *stubBets) SettleRoundInTx(ctx context.Context, tx pgx.Tx, matchPublicID string, roundNo int) (*betting.SettleResult, error) {
+	if b.failSettleRound {
+		return nil, errStub
+	}
+	var finished bool
+	if err := tx.QueryRow(ctx, `
+		SELECT r.finished_at IS NOT NULL AND r.winner_player_id IS NOT NULL
+		  FROM activity.match_rounds r JOIN activity.matches m ON m.id = r.match_id
+		 WHERE m.public_id = $1 AND r.round_no = $2`, matchPublicID, roundNo).Scan(&finished); err != nil {
+		return nil, fmt.Errorf("替身讀回合: %w", err)
+	}
+	if !finished {
+		return nil, betting.ErrRoundNotFinished
+	}
+	b.mu.Lock()
+	b.settledRounds = append(b.settledRounds, fmt.Sprintf("%s#%d", matchPublicID, roundNo))
+	b.mu.Unlock()
+	return &betting.SettleResult{MatchPublicID: matchPublicID}, nil
 }
 
 // SettleMatchInTx 把押到這場的注單標成 won。
@@ -320,31 +436,118 @@ func nullID(id int64) any {
 // ── 斷言用的讀取 ────────────────────────────────────────────────
 
 type matchState struct {
-	Status     match.Status
-	ResultKind match.ResultKind
-	Winner     int64
-	P1, P2     int64
-	Open       bool
-	LockedAt   *time.Time
-	StartedAt  *time.Time
-	FinishedAt *time.Time
-	StreamURL  *string
+	Status      match.Status
+	ResultKind  match.ResultKind
+	Kind        match.MatchKind
+	Winner      int64
+	P1, P2      int64
+	Open        bool
+	LockedAt    *time.Time
+	StartedAt   *time.Time
+	FinishedAt  *time.Time
+	ConfirmedAt *time.Time
+	ConfirmedBy int64
+	StreamURL   *string
 }
 
 func (f *fixture) state(publicID string) matchState {
 	f.t.Helper()
 	var st matchState
-	var winner, p1, p2 *int64
+	var winner, p1, p2, confirmedBy *int64
 	if err := pool.QueryRow(context.Background(), `
-		SELECT status, result_kind, winner_player_id, p1_player_id, p2_player_id,
-		       handicap_open, handicap_locked_at, started_at, finished_at, stream_url
+		SELECT status, result_kind, kind, winner_player_id, p1_player_id, p2_player_id,
+		       handicap_open, handicap_locked_at, started_at, finished_at,
+		       setup_confirmed_at, setup_confirmed_by, stream_url
 		  FROM activity.matches WHERE public_id = $1`, publicID,
-	).Scan(&st.Status, &st.ResultKind, &winner, &p1, &p2,
-		&st.Open, &st.LockedAt, &st.StartedAt, &st.FinishedAt, &st.StreamURL); err != nil {
+	).Scan(&st.Status, &st.ResultKind, &st.Kind, &winner, &p1, &p2,
+		&st.Open, &st.LockedAt, &st.StartedAt, &st.FinishedAt,
+		&st.ConfirmedAt, &confirmedBy, &st.StreamURL); err != nil {
 		f.t.Fatalf("讀場次狀態 %s: %v", publicID, err)
 	}
-	st.Winner, st.P1, st.P2 = derefID(winner), derefID(p1), derefID(p2)
+	st.Winner, st.P1, st.P2, st.ConfirmedBy = derefID(winner), derefID(p1), derefID(p2), derefID(confirmedBy)
 	return st
+}
+
+// roundState 是 match_rounds 一列的斷言用讀取。
+type roundState struct {
+	RoundNo    int
+	StartedAt  time.Time
+	FinishedAt *time.Time
+	Winner     int64
+}
+
+func (f *fixture) rounds(matchID int64) []roundState {
+	f.t.Helper()
+	rows, err := pool.Query(context.Background(), `
+		SELECT round_no, started_at, finished_at, winner_player_id
+		  FROM activity.match_rounds WHERE match_id = $1 ORDER BY round_no`, matchID)
+	if err != nil {
+		f.t.Fatalf("讀回合: %v", err)
+	}
+	defer rows.Close()
+	var out []roundState
+	for rows.Next() {
+		var r roundState
+		var winner *int64
+		if err := rows.Scan(&r.RoundNo, &r.StartedAt, &r.FinishedAt, &winner); err != nil {
+			f.t.Fatalf("掃回合: %v", err)
+		}
+		r.Winner = derefID(winner)
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		f.t.Fatalf("讀回合: %v", err)
+	}
+	return out
+}
+
+func (f *fixture) violationCount(matchID int64) int {
+	f.t.Helper()
+	var n int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM activity.match_violations WHERE match_id = $1`, matchID).Scan(&n); err != nil {
+		f.t.Fatalf("數違規: %v", err)
+	}
+	return n
+}
+
+// thirdPlace 讀本屆的季軍戰;沒有回 nil。
+func (f *fixture) thirdPlace() *matchState {
+	f.t.Helper()
+	var publicID string
+	err := pool.QueryRow(context.Background(),
+		`SELECT public_id FROM activity.matches WHERE tournament_id = $1 AND kind = 'third_place'`, f.id).Scan(&publicID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		f.t.Fatalf("讀季軍戰: %v", err)
+	}
+	st := f.state(publicID)
+	return &st
+}
+
+// setConfig 改本屆的賽制設定(best_of、季軍戰)。
+func (f *fixture) setConfig(bestOf int, thirdPlace bool) {
+	f.t.Helper()
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE activity.tournaments SET config = $2::jsonb WHERE id = $1`, f.id,
+		fmt.Sprintf(`{"version":2,"format":{"best_of":%d,"third_place_match":%t}}`, bestOf, thirdPlace)); err != nil {
+		f.t.Fatalf("設定賽制: %v", err)
+	}
+}
+
+// item 建一個本屆的讓武項目(違規紀錄要指到它)。
+func (f *fixture) item(key, name string) string {
+	f.t.Helper()
+	var publicID string
+	if err := pool.QueryRow(context.Background(), `
+		INSERT INTO activity.handicap_items (public_id, tournament_id, key, category, name, cost)
+		VALUES (gen_random_uuid()::text, $1, $2, split_part($2, '.', 1), $3, 1)
+		RETURNING public_id`, f.id, key, name).Scan(&publicID); err != nil {
+		f.t.Fatalf("建讓武項目 %s: %v", key, err)
+	}
+	return publicID
 }
 
 func derefID(p *int64) int64 {
@@ -463,10 +666,25 @@ func (f *fixture) topics() []string {
 	return out
 }
 
-// bet 建一張押某場的注單,讓 rollback 與結算計數驗得出來。
+// bet 建一張押某場整場勝負盤的注單,讓 rollback 與結算計數驗得出來。
+//
+// 盤口若還不存在(場次沒經過開盤)就順手建一個:腿一定要指到一個盤口(00007)。
 func (f *fixture) bet(matchID int64) int64 {
 	f.t.Helper()
 	ctx := context.Background()
+	var marketID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO activity.markets (public_id, match_id, kind)
+		VALUES (gen_random_uuid()::text, $1, 'match_winner')
+		ON CONFLICT DO NOTHING RETURNING id`, matchID).Scan(&marketID); err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			f.t.Fatalf("建盤口: %v", err)
+		}
+		if err := pool.QueryRow(ctx,
+			`SELECT id FROM activity.markets WHERE match_id = $1 AND kind = 'match_winner'`, matchID).Scan(&marketID); err != nil {
+			f.t.Fatalf("讀盤口: %v", err)
+		}
+	}
 	var betID int64
 	if err := pool.QueryRow(ctx, `
 		INSERT INTO activity.bets (public_id, tournament_id, user_id, stake, potential_payout)
@@ -475,8 +693,8 @@ func (f *fixture) bet(matchID int64) int64 {
 		f.t.Fatalf("建注單: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO activity.bet_legs (bet_id, match_id, side, odds_milli)
-		VALUES ($1, $2, 1, 1800)`, betID, matchID); err != nil {
+		INSERT INTO activity.bet_legs (bet_id, match_id, market_id, outcome, odds_milli)
+		VALUES ($1, $2, $3, 'p1', 1800)`, betID, matchID, marketID); err != nil {
 		f.t.Fatalf("建注單腿: %v", err)
 	}
 	return betID
@@ -494,8 +712,8 @@ func (f *fixture) betStatus(betID int64) string {
 
 // ── 常用動作 ────────────────────────────────────────────────────
 
-// runToLive 把一場比賽帶到 live(開盤 → 封盤 → 開打),回傳最後的狀態。
-func (f *fixture) runToLive(m mrec) {
+// runToLocked 把一場比賽帶到「可以開打」:開盤 → 封盤 → 設定確認。
+func (f *fixture) runToLocked(m mrec) {
 	f.t.Helper()
 	ctx := context.Background()
 	if _, err := f.svc.OpenHandicap(ctx, match.OpenHandicapParams{
@@ -508,11 +726,39 @@ func (f *fixture) runToLive(m mrec) {
 	}); err != nil {
 		f.t.Fatalf("封盤 %s: %v", m.publicID, err)
 	}
-	if _, err := f.svc.StartMatch(ctx, match.StartMatchParams{
+	if _, err := f.svc.ConfirmSetup(ctx, m.publicID, f.judge); err != nil {
+		f.t.Fatalf("設定確認 %s: %v", m.publicID, err)
+	}
+}
+
+// runToLive 把一場比賽帶到 live(開盤 → 封盤 → 設定確認 → 開打 = 第一回合開始)。
+func (f *fixture) runToLive(m mrec) {
+	f.t.Helper()
+	f.runToLocked(m)
+	if _, err := f.svc.StartMatch(context.Background(), match.StartMatchParams{
 		MatchPublicID: m.publicID, ActorUserID: f.judge, Reason: "開打",
 	}); err != nil {
 		f.t.Fatalf("開打 %s: %v", m.publicID, err)
 	}
+}
+
+// startRound / finishRound 是多回合流程的快捷鍵。
+func (f *fixture) startRound(m mrec) *match.RoundStart {
+	f.t.Helper()
+	rs, err := f.svc.StartRound(context.Background(), m.publicID, f.judge)
+	if err != nil {
+		f.t.Fatalf("開始回合 %s: %v", m.publicID, err)
+	}
+	return rs
+}
+
+func (f *fixture) finishRound(m mrec, roundNo int, winner player) *match.RoundFinish {
+	f.t.Helper()
+	rf, err := f.svc.FinishRound(context.Background(), match.FinishRoundParams{MatchPublicID: m.publicID, RoundNo: roundNo, WinnerPublicID: winner.publicID, ActorUserID: f.judge, Note: "", Confirm: true})
+	if err != nil {
+		f.t.Fatalf("結束回合 %s#%d: %v", m.publicID, roundNo, err)
+	}
+	return rf
 }
 
 func contains(list []string, want string) bool {

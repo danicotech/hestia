@@ -344,6 +344,8 @@ func TestEveryMatchTopicMapsToAKind(t *testing.T) {
 		match.TopicMatchStarted:   []byte(`{"tournament_slug":"` + slug + `","match_public_id":"m1"}`),
 		match.TopicMatchFinished:  []byte(`{"tournament_slug":"` + slug + `","match_public_id":"m1"}`),
 		match.TopicChampion:       []byte(`{"tournament_slug":"` + slug + `","final_match_public_id":"m9"}`),
+		match.TopicRoundStarted:   []byte(`{"tournament_slug":"` + slug + `","match_public_id":"m1"}`),
+		match.TopicRoundFinished:  []byte(`{"tournament_slug":"` + slug + `","match_public_id":"m1"}`),
 	}
 	for topic, payload := range payloads {
 		e, ok := watch.EnvelopeForEvent(topic, payload)
@@ -361,6 +363,16 @@ func TestEveryMatchTopicMapsToAKind(t *testing.T) {
 	if e, ok := watch.EnvelopeForEvent(match.TopicHandicapLocked, payloads[match.TopicHandicapLocked]); !ok ||
 		e.Kind != watch.KindHandicapLocked {
 		t.Errorf("封盤要是 handicap_locked,得到 %+v", e)
+	}
+	// 回合的兩則不進 outbox(只推),但一樣要路由成 round、參照場次。
+	for _, topic := range []string{match.TopicRoundStarted, match.TopicRoundFinished} {
+		if (match.Event{Topic: topic}).Announced() {
+			t.Errorf("%s 不該進 outbox(沒有人認領)", topic)
+		}
+		e, ok := watch.EnvelopeForEvent(topic, payloads[topic])
+		if !ok || e.Kind != watch.KindRound || e.Ref != "m1" {
+			t.Errorf("%s 要是 round 且參照場次,得到 %+v", topic, e)
+		}
 	}
 }
 

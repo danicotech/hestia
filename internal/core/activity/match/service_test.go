@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/danicotech/hestia/internal/core/activity/activityerr"
@@ -98,8 +99,14 @@ func decodeMatchEvent(t *testing.T, e Event) MatchEvent {
 	return m
 }
 
-// 走完一場的前半段(開盤 → 封盤 → 開打),讓 ReportResult 有東西可判。
-func (f *fixture) runToLive(t *testing.T, matchPublicID string) {
+// config 設定本屆賽制(best_of、季軍戰)。預設是 rules.Default:單場定勝負、無季軍戰。
+func (f *fixture) config(bestOf int, thirdPlace bool) {
+	f.db.tournaments[1].ConfigRaw = []byte(fmt.Sprintf(
+		`{"version":2,"format":{"best_of":%d,"third_place_match":%t}}`, bestOf, thirdPlace))
+}
+
+// runToLocked 走完開盤 → 封盤 → 設定確認,停在「可以開打」的那一刻。
+func (f *fixture) runToLocked(t *testing.T, matchPublicID string) {
 	t.Helper()
 	ctx := context.Background()
 	if _, err := f.svc.OpenHandicap(ctx, OpenHandicapParams{MatchPublicID: matchPublicID, ActorUserID: judgeID}); err != nil {
@@ -108,9 +115,37 @@ func (f *fixture) runToLive(t *testing.T, matchPublicID string) {
 	if _, err := f.svc.LockHandicap(ctx, LockHandicapParams{MatchPublicID: matchPublicID, Confirm: true, ActorUserID: judgeID}); err != nil {
 		t.Fatalf("封盤: %v", err)
 	}
-	if _, err := f.svc.StartMatch(ctx, StartMatchParams{MatchPublicID: matchPublicID, ActorUserID: judgeID}); err != nil {
+	if _, err := f.svc.ConfirmSetup(ctx, matchPublicID, judgeID); err != nil {
+		t.Fatalf("設定確認: %v", err)
+	}
+}
+
+// 走完一場的前半段(開盤 → 封盤 → 設定確認 → 開打 = 第一回合開始),讓 ReportResult 有東西可判。
+func (f *fixture) runToLive(t *testing.T, matchPublicID string) {
+	t.Helper()
+	f.runToLocked(t, matchPublicID)
+	if _, err := f.svc.StartMatch(context.Background(), StartMatchParams{MatchPublicID: matchPublicID, ActorUserID: judgeID}); err != nil {
 		t.Fatalf("開打: %v", err)
 	}
+}
+
+// startRound / finishRound 是多回合流程的兩個快捷鍵。
+func (f *fixture) startRound(t *testing.T, matchPublicID string) *RoundStart {
+	t.Helper()
+	rs, err := f.svc.StartRound(context.Background(), matchPublicID, judgeID)
+	if err != nil {
+		t.Fatalf("開始回合 %s: %v", matchPublicID, err)
+	}
+	return rs
+}
+
+func (f *fixture) finishRound(t *testing.T, matchPublicID string, roundNo int, winner string) *RoundFinish {
+	t.Helper()
+	rf, err := f.svc.FinishRound(context.Background(), FinishRoundParams{MatchPublicID: matchPublicID, RoundNo: roundNo, WinnerPublicID: winner, ActorUserID: judgeID, Note: "", Confirm: true})
+	if err != nil {
+		t.Fatalf("結束回合 %s#%d: %v", matchPublicID, roundNo, err)
+	}
+	return rf
 }
 
 // ── 開盤 ────────────────────────────────────────────────────────
@@ -337,12 +372,182 @@ func TestLockHandicapGates(t *testing.T) {
 	})
 }
 
+// ── 裁判代退讓武 ────────────────────────────────────────────────
+
+// twoSelections 佈置一場已開盤、買了兩項的比賽(16 BP 花掉 14)。
+func twoSelections(t *testing.T) *fixture {
+	t.Helper()
+	f := fourPlayers(t)
+	f.db.matches[10].status = StatusReady
+	f.db.matches[10].handicapOpen = true
+	f.db.selections[10] = []handicap.Selection{
+		{PublicID: "S-1", MatchID: 10, MatchPublicID: "M-R1S0", PlayerID: 1,
+			ItemRef: "I-1", ItemName: "禁用奇術", Category: handicap.CategorySkill, Cost: 12},
+		{PublicID: "S-2", MatchID: 10, MatchPublicID: "M-R1S0", PlayerID: 1,
+			ItemRef: "I-2", ItemName: "禁跳躍", Category: handicap.CategoryDefense, Cost: 2},
+	}
+	f.db.budgets[10].Spent = 14
+	return f
+}
+
+// 代退成功:BP 回到預算,而且一定留下一筆稽核紀錄。
+//
+// 稽核是這支 RPC 存在的條件之一 —— 它拿走的是選手已經買到手的東西,
+// 沒有留痕的話,事後沒有人分得出「依規則返還」與「裁判把它刪掉」。
+func TestRefundSelection(t *testing.T) {
+	f := twoSelections(t)
+	res, err := f.svc.RefundSelection(context.Background(), RefundSelectionParams{
+		SelectionPublicID: "S-1",
+		ActorUserID:       judgeID,
+		Reason:            "同時買了禁用任意奇術,依項目規則返還",
+	})
+	if err != nil {
+		t.Fatalf("代退失敗: %v", err)
+	}
+	if res.MatchPublicID != "M-R1S0" || res.Selection.ItemName != "禁用奇術" {
+		t.Fatalf("回傳的不是被退掉的那一筆: %+v", res)
+	}
+	if res.Budget.Spent != 2 || res.Budget.Remaining() != 14 {
+		t.Fatalf("BP 沒有退回來: spent=%d remaining=%d", res.Budget.Spent, res.Budget.Remaining())
+	}
+	if f.db.budgets[10].Spent != 2 {
+		t.Fatalf("預算列沒有更新: spent=%d", f.db.budgets[10].Spent)
+	}
+
+	var rec *JudgeAction
+	for i := range f.db.audits {
+		if f.db.audits[i].Action == ActionRefundSelection {
+			rec = &f.db.audits[i]
+		}
+	}
+	if rec == nil {
+		t.Fatal("代退沒有寫稽核紀錄")
+	}
+	if rec.ActorUserID != judgeID || rec.TargetType != AuditTargetMatch || rec.TargetID != 10 {
+		t.Fatalf("稽核指向錯的對象: %+v", rec)
+	}
+	if rec.Reason == "" {
+		t.Fatal("稽核沒有記下理由")
+	}
+	var after refundAudit
+	if err := json.Unmarshal(rec.After, &after); err != nil {
+		t.Fatalf("解析稽核 after: %v", err)
+	}
+	if after.SelectionPublicID != "S-1" || after.ItemName != "禁用奇術" ||
+		after.RefundedBP != 12 || after.Remaining != 14 {
+		t.Fatalf("稽核 after 不足以還原這筆退點: %s", rec.After)
+	}
+
+	// 沒有公告:封盤前的讓武內容只有施加者與裁判看得到。
+	if len(f.db.events) != 0 {
+		t.Fatalf("代退不該發任何公告: %+v", f.db.events)
+	}
+}
+
+func TestRefundSelectionGates(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("封盤後拒絕", func(t *testing.T) {
+		f := twoSelections(t)
+		f.db.matches[10].status = StatusLocked
+		_, err := f.svc.RefundSelection(ctx, RefundSelectionParams{
+			SelectionPublicID: "S-1", ActorUserID: judgeID, Reason: "改變主意",
+		})
+		if !errors.Is(err, handicap.ErrHandicapLocked) {
+			t.Fatalf("封盤後必須拒絕,實際 %v", err)
+		}
+		if f.db.budgets[10].Spent != 14 {
+			t.Fatalf("被擋下來卻退了 BP: spent=%d", f.db.budgets[10].Spent)
+		}
+		if len(f.db.audits) != 0 {
+			t.Fatal("被擋下來卻留了稽核紀錄")
+		}
+	})
+
+	t.Run("不存在的選擇", func(t *testing.T) {
+		f := twoSelections(t)
+		_, err := f.svc.RefundSelection(ctx, RefundSelectionParams{
+			SelectionPublicID: "S-NOPE", ActorUserID: judgeID, Reason: "退",
+		})
+		if !errors.Is(err, handicap.ErrSelectionNotFound) {
+			t.Fatalf("err = %v", err)
+		}
+	})
+
+	t.Run("沒寫理由", func(t *testing.T) {
+		f := twoSelections(t)
+		_, err := f.svc.RefundSelection(ctx, RefundSelectionParams{
+			SelectionPublicID: "S-1", ActorUserID: judgeID, Reason: "   ",
+		})
+		if !errors.Is(err, ErrInvalidRequest) {
+			t.Fatalf("err = %v", err)
+		}
+		if f.db.budgets[10].Spent != 14 {
+			t.Fatal("沒寫理由卻退了 BP")
+		}
+	})
+
+	t.Run("沒有裁判身分", func(t *testing.T) {
+		f := twoSelections(t)
+		_, err := f.svc.RefundSelection(ctx, RefundSelectionParams{
+			SelectionPublicID: "S-1", Reason: "退",
+		})
+		if !errors.Is(err, tournament.ErrActorRequired) {
+			t.Fatalf("err = %v", err)
+		}
+	})
+
+	t.Run("重複退不會退兩次", func(t *testing.T) {
+		f := twoSelections(t)
+		p := RefundSelectionParams{
+			SelectionPublicID: "S-1", ActorUserID: judgeID, Reason: "依項目規則返還",
+		}
+		if _, err := f.svc.RefundSelection(ctx, p); err != nil {
+			t.Fatalf("第一次應成功: %v", err)
+		}
+		_, err := f.svc.RefundSelection(ctx, p)
+		if !errors.Is(err, handicap.ErrSelectionAlreadyVoided) {
+			t.Fatalf("err = %v", err)
+		}
+		if f.db.budgets[10].Spent != 2 {
+			t.Fatalf("退了兩次: spent=%d,只該退一次(12 BP)", f.db.budgets[10].Spent)
+		}
+		if len(f.db.audits) != 1 {
+			t.Fatalf("第二次被擋下來卻留了稽核: %d 筆", len(f.db.audits))
+		}
+	})
+}
+
+// 稽核寫不進去時,退點必須一起消失。
+//
+// 「退了點但沒記上是誰退的」是這支 RPC 最不能出現的狀態:BP 對不上是小事,
+// 一筆查不到來源的更動會直接變成選手不服氣時無法回答的問題。
+func TestRefundSelectionRollsBackWithAudit(t *testing.T) {
+	f := twoSelections(t)
+	// 代退不發 outbox 事件,所以注入點選在稽核本身 —— 那正是要驗的那一步。
+	f.db.failAudit = true
+
+	_, err := f.svc.RefundSelection(context.Background(), RefundSelectionParams{
+		SelectionPublicID: "S-1", ActorUserID: judgeID, Reason: "依項目規則返還",
+	})
+	if err == nil {
+		t.Fatal("稽核失敗卻回成功")
+	}
+	if f.db.budgets[10].Spent != 14 {
+		t.Fatalf("稽核失敗但 BP 退了:spent=%d,rollback 沒有發生", f.db.budgets[10].Spent)
+	}
+	if f.db.selections[10][0].Voided {
+		t.Fatal("稽核失敗但選擇被標成 voided,rollback 沒有發生")
+	}
+}
+
 // ── 開打 ────────────────────────────────────────────────────────
 
+// StartMatch = 開始第一回合:場次進 live、回合列 1 建好、盤口關掉、兩則事件。
 func TestStartMatch(t *testing.T) {
 	ctx := context.Background()
 	f := fourPlayers(t)
-	f.db.matches[10].status = StatusLocked
+	f.runToLocked(t, "M-R1S0")
 
 	m, err := f.svc.StartMatch(ctx, StartMatchParams{MatchPublicID: "M-R1S0", ActorUserID: judgeID})
 	if err != nil {
@@ -351,20 +556,73 @@ func TestStartMatch(t *testing.T) {
 	if m.Status != StatusLive || m.StartedAt == nil {
 		t.Fatalf("應為 live + started_at: %+v", m)
 	}
-	if ev := f.lastEvent(t); ev.Topic != TopicMatchStarted {
-		t.Fatalf("topic = %s", ev.Topic)
+	if got := len(f.db.rounds[10]); got != 1 {
+		t.Fatalf("開打即第一回合,回合列應為 1,得到 %d", got)
 	}
+	if n := f.db.openMarketCount(10); n != 0 {
+		t.Fatalf("第一回合開始應關掉全部盤口,還有 %d 個開著", n)
+	}
+	evs := f.eventsByTopic(TopicMatchStarted)
+	if len(evs) != 1 {
+		t.Fatalf("開打事件 = %d 則", len(evs))
+	}
+	if len(f.eventsByTopic(TopicRoundStarted)) != 1 {
+		t.Fatal("第一回合開始要推回合事件")
+	}
+	assertCallOrder(t, f.db.calls, "MarkLive(M-R1S0)", "CloseMarkets(M-R1S0)", "StartRound(M-R1S0,1)")
 }
 
 func TestStartMatchRequiresLocked(t *testing.T) {
 	ctx := context.Background()
-	for _, st := range []Status{StatusPending, StatusReady, StatusLive} {
+	for _, st := range []Status{StatusPending, StatusReady} {
 		f := fourPlayers(t)
 		f.db.matches[10].status = st
 		_, err := f.svc.StartMatch(ctx, StartMatchParams{MatchPublicID: "M-R1S0", ActorUserID: judgeID})
 		if !errors.Is(err, ErrNotLocked) {
 			t.Fatalf("status=%s 時 err = %v,期望 ErrNotLocked", st, err)
 		}
+		if len(f.db.rounds[10]) != 0 {
+			t.Fatalf("status=%s 被擋下來卻建了回合列", st)
+		}
+	}
+}
+
+// 封盤了但還沒做設定確認 → 應用層先擋(ErrSetupNotConfirmed),什麼都不寫。
+func TestStartRoundRequiresSetupConfirmed(t *testing.T) {
+	ctx := context.Background()
+	f := fourPlayers(t)
+	if _, err := f.svc.OpenHandicap(ctx, OpenHandicapParams{MatchPublicID: "M-R1S0", ActorUserID: judgeID}); err != nil {
+		t.Fatalf("開盤: %v", err)
+	}
+	if _, err := f.svc.LockHandicap(ctx, LockHandicapParams{MatchPublicID: "M-R1S0", Confirm: true, ActorUserID: judgeID}); err != nil {
+		t.Fatalf("封盤: %v", err)
+	}
+	f.db.calls = nil
+
+	_, err := f.svc.StartRound(ctx, "M-R1S0", judgeID)
+	if !errors.Is(err, ErrSetupNotConfirmed) {
+		t.Fatalf("err = %v,期望 ErrSetupNotConfirmed", err)
+	}
+	m := f.db.matches[10]
+	switch {
+	case m.status != StatusLocked || m.startedAt != nil:
+		t.Fatalf("被擋下來卻開打了: %+v", m)
+	case len(f.db.rounds[10]) != 0:
+		t.Fatal("被擋下來卻建了回合列")
+	case f.db.openMarketCount(10) == 0:
+		t.Fatal("被擋下來卻關了盤口")
+	}
+	// 應用層的閘門在任何寫入之前:MarkLive / CloseMarkets / StartRound 一個都不該被叫到
+	// (假物件在守門前就記下呼叫,所以「靠 DB 擋下來」在這裡會被抓到)。
+	for _, c := range f.db.calls {
+		if c != "LockMatch(M-R1S0)" {
+			t.Fatalf("被擋下來卻有寫入呼叫: %v", f.db.calls)
+		}
+	}
+	// 同一道守門在 DB 側(MarkMatchLive 的 WHERE + CHECK):直接跳過應用層也寫不進去。
+	_, err = f.db.MarkLive(ctx, fakeTx{}, LiveWrite{MatchID: 10, ActorUserID: judgeID})
+	if !errors.Is(err, ErrSetupNotConfirmed) {
+		t.Fatalf("繞過應用層直接 MarkLive 應被 DB 側擋下,得到 %v", err)
 	}
 }
 

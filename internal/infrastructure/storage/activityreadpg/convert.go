@@ -27,6 +27,7 @@ type matchRow struct {
 	TournamentID     int64
 	Round            int32
 	Slot             int32
+	Kind             string
 	Status           string
 	ResultKind       string
 	HandicapOpen     bool
@@ -35,6 +36,8 @@ type matchRow struct {
 	StartedAt        *time.Time
 	FinishedAt       *time.Time
 	WinnerPlayerID   *int64
+	SetupConfirmedAt *time.Time
+	SetupConfirmedBy *int64
 	P1PlayerID       *int64
 	P1PublicID       *string
 	P1FencerID       *int64
@@ -73,6 +76,7 @@ func toMatch(r matchRow) match.Match {
 		TournamentID:     r.TournamentID,
 		Round:            int(r.Round),
 		Slot:             int(r.Slot),
+		Kind:             match.MatchKind(r.Kind),
 		Status:           match.Status(r.Status),
 		ResultKind:       match.ResultKind(r.ResultKind),
 		HandicapOpen:     r.HandicapOpen,
@@ -81,6 +85,8 @@ func toMatch(r matchRow) match.Match {
 		StartedAt:        r.StartedAt,
 		FinishedAt:       r.FinishedAt,
 		WinnerPlayerID:   deref(r.WinnerPlayerID),
+		SetupConfirmedAt: r.SetupConfirmedAt,
+		SetupConfirmedBy: deref(r.SetupConfirmedBy),
 		P1: side(r.TournamentID, r.P1PlayerID, r.P1PublicID,
 			r.P1FencerID, r.P1DisplayName, r.P1RankLevel, r.P1Status),
 		P2: side(r.TournamentID, r.P2PlayerID, r.P2PublicID,
@@ -106,6 +112,20 @@ func side(tournamentID int64, id *int64, publicID *string,
 		DisplayName:  deref(displayName),
 		Rank:         bp.Rank(deref(rank)),
 		Status:       tournament.PlayerStatus(deref(status)),
+	}
+}
+
+// toRound 把 match_rounds 的一列翻成領域物件。
+//
+// WinnerPublicID 留空:批次撈回合時手上沒有場次,而那支 query 不 JOIN 選手。
+// 呼叫端拿到場次後用 match.Match.ResolveRoundWinners 補 —— 翻譯只有一個家。
+// matchpg 有一份同樣的三行,理由與檔頭的 toMatch 相同。
+func toRound(r db.ActivityMatchRound) match.Round {
+	return match.Round{
+		RoundNo:        int(r.RoundNo),
+		StartedAt:      r.StartedAt,
+		FinishedAt:     r.FinishedAt,
+		WinnerPlayerID: deref(r.WinnerPlayerID),
 	}
 }
 

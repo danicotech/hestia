@@ -25,6 +25,7 @@ type matchRow struct {
 	TournamentID     int64
 	Round            int32
 	Slot             int32
+	Kind             string
 	Status           string
 	ResultKind       string
 	HandicapOpen     bool
@@ -33,6 +34,8 @@ type matchRow struct {
 	StartedAt        *time.Time
 	FinishedAt       *time.Time
 	WinnerPlayerID   *int64
+	SetupConfirmedAt *time.Time
+	SetupConfirmedBy *int64
 	P1PlayerID       *int64
 	P1PublicID       *string
 	P1FencerID       *int64
@@ -58,6 +61,9 @@ var (
 	_ = func(r db.MarkMatchFinishedRow) matchRow { return matchRow(r) }
 	_ = func(r db.SetMatchStreamURLRow) matchRow { return matchRow(r) }
 	_ = func(r db.SeatMatchPlayerRow) matchRow { return matchRow(r) }
+	_ = func(r db.ConfirmMatchSetupRow) matchRow { return matchRow(r) }
+	_ = func(r db.InsertThirdPlaceMatchRow) matchRow { return matchRow(r) }
+	_ = func(r db.FindThirdPlaceMatchRow) matchRow { return matchRow(r) }
 )
 
 // playerRow 同理,對應 LockPlayerForJudge 與 SetTournamentPlayerStatus。
@@ -88,6 +94,7 @@ func toMatch(r matchRow) match.Match {
 		TournamentID:     r.TournamentID,
 		Round:            int(r.Round),
 		Slot:             int(r.Slot),
+		Kind:             match.MatchKind(r.Kind),
 		Status:           match.Status(r.Status),
 		ResultKind:       match.ResultKind(r.ResultKind),
 		HandicapOpen:     r.HandicapOpen,
@@ -96,6 +103,8 @@ func toMatch(r matchRow) match.Match {
 		StartedAt:        r.StartedAt,
 		FinishedAt:       r.FinishedAt,
 		WinnerPlayerID:   deref(r.WinnerPlayerID),
+		SetupConfirmedAt: r.SetupConfirmedAt,
+		SetupConfirmedBy: deref(r.SetupConfirmedBy),
 		P1: side(r.TournamentID, r.P1PlayerID, r.P1PublicID,
 			r.P1FencerID, r.P1DisplayName, r.P1RankLevel, r.P1Status),
 		P2: side(r.TournamentID, r.P2PlayerID, r.P2PublicID,
@@ -136,6 +145,65 @@ func toPlayer(r playerRow) match.Player {
 		Rank:         bp.Rank(deref(r.RankLevel)),
 		Status:       tournament.PlayerStatus(r.Status),
 	}
+}
+
+// toRound 把 match_rounds 的一列翻成領域物件。
+//
+// WinnerPublicID 刻意留空:那支 query 不 JOIN 選手,而翻譯需要的雙方就在場次上
+// (match.Match.ResolveRoundWinners)。在這裡多 JOIN 一次只是為了同一個值繞路。
+func toRound(r db.ActivityMatchRound) match.Round {
+	return match.Round{
+		RoundNo:        int(r.RoundNo),
+		StartedAt:      r.StartedAt,
+		FinishedAt:     r.FinishedAt,
+		WinnerPlayerID: deref(r.WinnerPlayerID),
+	}
+}
+
+// violationRow 是 ListMatchViolations 與 ListPlayerViolations 共同的前綴形狀。
+//
+// 後者多帶三個 match 欄位,所以不能整個轉換;這裡只列兩支都有的部分,
+// 由呼叫端逐欄搬 —— 這份對應只有一個家(toViolation),兩支 query 共用。
+type violationRow struct {
+	ID                int64
+	PublicID          string
+	MatchID           int64
+	RoundNo           *int32
+	PlayerID          int64
+	ItemID            *int64
+	Ruling            string
+	Note              string
+	RecordedBy        int64
+	CreatedAt         time.Time
+	PlayerPublicID    string
+	PlayerDisplayName string
+	ItemPublicID      *string
+	ItemKey           *string
+	ItemName          *string
+}
+
+var _ = func(r db.ListMatchViolationsRow) violationRow { return violationRow(r) }
+
+// toViolation 把一列翻成領域物件。matchPublicID 由呼叫端帶(那支 query 只有 match_id)。
+func toViolation(r violationRow, matchPublicID string) match.Violation {
+	v := match.Violation{
+		PublicID:          r.PublicID,
+		MatchPublicID:     matchPublicID,
+		PlayerPublicID:    r.PlayerPublicID,
+		PlayerDisplayName: r.PlayerDisplayName,
+		ItemPublicID:      deref(r.ItemPublicID),
+		ItemKey:           deref(r.ItemKey),
+		ItemName:          deref(r.ItemName),
+		Ruling:            match.Ruling(r.Ruling),
+		Note:              r.Note,
+		RecordedBy:        r.RecordedBy,
+		CreatedAt:         r.CreatedAt,
+	}
+	if r.RoundNo != nil {
+		n := int(*r.RoundNo)
+		v.RoundNo = &n
+	}
+	return v
 }
 
 // deref 取指標值,nil 即型別零值。

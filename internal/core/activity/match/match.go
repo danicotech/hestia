@@ -27,6 +27,15 @@
 // 三者都要求 confirm = true 作為二次確認(judge.proto 的設計要求)。
 // 誤觸的代價由人承擔,不由系統吞掉 —— 派彩一旦發出去就很難收回。
 //
+// # 多回合制(2026-09-13 增補,schemas/20)
+//
+// 一場比賽是 best_of 個回合(config.format),整場勝者 = 先拿到 ⌈best_of/2⌉ 勝的一方。
+// 裁判動線因此多了「一場一次」的設定確認(ReviewSetup / ConfirmSetup)與
+// 「每回合一次」的 StartRound / FinishRound;ReportResult 只在 best_of = 1 時仍可用,
+// 而且走的是同一條回合路徑(開始第 1 回合 → 以該勝者結束它)。
+// 整場勝者是回合推導的衍生值:寫入前重算核對,不符即 ErrRoundsInconsistent。
+// 三條紀律各有應用層與 DB 層一道:封盤不可逆、未確認不得開打、整場勝者 = 回合推導。
+//
 // # 事件不是附加功能
 //
 // 使用者要的 Discord 公告有三類源自這條生命週期(開盤提醒、封盤公示、賽果晉級)。
@@ -39,9 +48,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/danicotech/hestia/internal/core/activity/bp"
+	"github.com/danicotech/hestia/internal/core/activity/handicap"
 	"github.com/danicotech/hestia/internal/core/activity/tournament"
 )
 
@@ -82,10 +93,21 @@ const (
 const (
 	ActionOpenHandicap = "match.open_handicap"
 	ActionLockHandicap = "match.lock_handicap"
-	ActionStartMatch   = "match.start"
-	ActionReportResult = "match.report_result"
-	ActionSetStreamURL = "match.set_stream_url"
-	ActionWithdraw     = "player.withdraw"
+	// ActionRefundSelection 是裁判代退一筆讓武選擇(BP 退回該場預算)。
+	// 與 lock 同樣走 RecordJudgeAction,理由見 JudgeAction 的註解。
+	ActionRefundSelection = "match.refund_selection"
+	ActionStartMatch      = "match.start"
+	ActionReportResult    = "match.report_result"
+	ActionSetStreamURL    = "match.set_stream_url"
+	ActionWithdraw        = "player.withdraw"
+	// ActionConfirmSetup 開賽前設定確認(schemas/20 裁判動線,grill Q1/Q9)。
+	ActionConfirmSetup = "match.confirm_setup"
+	// ActionStartRound / ActionFinishRound 是逐回合的兩個時刻(match_rounds 建列 / 填勝者)。
+	ActionStartRound  = "match.start_round"
+	ActionFinishRound = "match.finish_round"
+	// ActionRecordViolation 是裁判記了一筆違規(schemas/27)。違規者本人不進稽核表
+	// (選手不一定有平台帳號),這一筆記的是「裁判做了記錄」這個動作。
+	ActionRecordViolation = "match.record_violation"
 )
 
 // AuditTargetMatch / AuditTargetPlayer 是 admin_audit_logs.target_type 的值。
@@ -122,28 +144,210 @@ type Player struct {
 // Seated 回報這一側是否已經確定。
 func (p Player) Seated() bool { return p.ID != 0 }
 
+// MatchKind 是場次在賽程裡的身分,字面值即 matches.kind 的 CHECK 值域。
+type MatchKind string
+
+const (
+	// KindBracket 晉級樹上的一場:勝者往下一輪走。
+	KindBracket MatchKind = "bracket"
+	// KindThirdPlace 季軍戰:準決賽兩位敗者加打,**勝者不晉級**。
+	// round 記為決賽那一輪、slot 另給(bracket.ThirdPlaceSlot),其餘流程與普通場次完全相同。
+	KindThirdPlace MatchKind = "third_place"
+)
+
 // Match 是一場比賽的完整狀態。
 type Match struct {
-	ID               int64
-	PublicID         string
-	TournamentID     int64
-	Round            int
-	Slot             int
+	ID           int64
+	PublicID     string
+	TournamentID int64
+	Round        int
+	Slot         int
+	// Kind 空值視同 KindBracket(adapter 一律填;fake 與舊資料可能留空)。
+	Kind             MatchKind
 	Status           Status
 	ResultKind       ResultKind
 	HandicapOpen     bool
 	HandicapLockedAt *time.Time
 	StreamURL        string
-	StartedAt        *time.Time
-	FinishedAt       *time.Time
+	// StartedAt = 第一回合的正式決鬥開始。這一刻同時關下注、啟動計時。
+	StartedAt  *time.Time
+	FinishedAt *time.Time
 	// WinnerPlayerID 0 = 尚未分出勝負。
+	//
+	// 多回合制下它是**衍生值但仍存**:等於 match_rounds 裡先拿到 WinsNeeded 勝的
+	// 那一方。每次寫入前由 service 重算核對(ErrRoundsInconsistent),
+	// 與 match_budgets.spent 同一套紀律。存它是因為建樹晉級與 FK 都要它。
 	WinnerPlayerID int64
-	P1             Player
-	P2             Player
+	// SetupConfirmedAt 是開賽前設定確認的時刻;nil = 還沒確認,**不能開打**。
+	// DB 側另有 CHECK (started_at IS NULL OR setup_confirmed_at IS NOT NULL) 作最後一道。
+	SetupConfirmedAt *time.Time
+	// SetupConfirmedBy 是確認的裁判(platform.users.id,弱參照);0 = 尚未確認。
+	SetupConfirmedBy int64
+	P1               Player
+	P2               Player
 }
 
 // BothSeated 回報雙方是否都已確定。開盤的前提。
 func (m Match) BothSeated() bool { return m.P1.Seated() && m.P2.Seated() }
+
+// IsThirdPlace 回報這是不是季軍戰。
+func (m Match) IsThirdPlace() bool { return m.Kind == KindThirdPlace }
+
+// PlayerByID 回傳場上 id 對應的一方;不是場上兩人之一時回零值。
+func (m Match) PlayerByID(playerID int64) Player {
+	if playerID == 0 {
+		return Player{}
+	}
+	switch playerID {
+	case m.P1.ID:
+		return m.P1
+	case m.P2.ID:
+		return m.P2
+	default:
+		return Player{}
+	}
+}
+
+// PlayerByPublicID 回傳場上 public_id 對應的一方;不是場上兩人之一時回零值。
+func (m Match) PlayerByPublicID(publicID string) Player {
+	if publicID == "" {
+		return Player{}
+	}
+	switch publicID {
+	case m.P1.PublicID:
+		return m.P1
+	case m.P2.PublicID:
+		return m.P2
+	default:
+		return Player{}
+	}
+}
+
+// ResolveRoundWinners 依場上雙方把每回合的 WinnerPlayerID 翻成 public_id(就地修改)。
+//
+// 回合列本身只存 winner_player_id(ListMatchRounds 不 JOIN 選手),而對外只能出現
+// public_id。翻譯需要的資料就在 Match 上,所以由它來做 —— 讀取側(activityreadpg)
+// 批次撈回合時手上沒有場次,回傳的 Round 其 WinnerPublicID 為空,呼叫端拿到
+// 場次後用這支補齊。
+func (m Match) ResolveRoundWinners(rounds []Round) {
+	for i := range rounds {
+		rounds[i].WinnerPublicID = m.PlayerByID(rounds[i].WinnerPlayerID).PublicID
+	}
+}
+
+// ── 回合 ────────────────────────────────────────────────────────
+
+// Round 是 activity.match_rounds 的一列:一回合的起訖與勝者。
+//
+// 回合列在裁判按「正式決鬥開始」時建,不預建 —— 所以「還沒開始的回合」= 沒有列,
+// StartedAt 建列即有值。FinishedAt 與 WinnerPlayerID 同生共死(DB CHECK)。
+type Round struct {
+	RoundNo    int
+	StartedAt  time.Time
+	FinishedAt *time.Time
+	// WinnerPlayerID 0 = 進行中。
+	WinnerPlayerID int64
+	// WinnerPublicID 是 WinnerPlayerID 的對外形式,由 Match.ResolveRoundWinners 填。
+	WinnerPublicID string
+}
+
+// Finished 回報這一回合是否已經結束。
+func (r Round) Finished() bool { return r.FinishedAt != nil }
+
+// Score 是一場比賽到目前為止的回合比數。**衍生值**,由回合列數出來,不存。
+type Score struct {
+	P1Wins int
+	P2Wins int
+}
+
+// ScoreOf 數出雙方各拿幾勝。不是場上兩人的勝者(資料異常)不計入任何一方。
+func ScoreOf(m Match, rounds []Round) Score {
+	var s Score
+	for _, r := range rounds {
+		if r.WinnerPlayerID == 0 {
+			continue
+		}
+		switch r.WinnerPlayerID {
+		case m.P1.ID:
+			s.P1Wins++
+		case m.P2.ID:
+			s.P2Wins++
+		}
+	}
+	return s
+}
+
+// String 是公告用的「2:1」形式(P1 在前)。
+func (s Score) String() string { return fmt.Sprintf("%d:%d", s.P1Wins, s.P2Wins) }
+
+// DecidedWinner 依比數推導整場勝者:先拿到 winsNeeded 勝的一方。
+//
+// 0 = 尚未分出勝負。兩方同時達標是資料異常(回合列被動過),同樣回 0 ——
+// 呼叫端接著會撞上 ErrRoundsInconsistent,那正是要的。
+func (s Score) DecidedWinner(m Match, winsNeeded int) int64 {
+	if winsNeeded <= 0 {
+		return 0
+	}
+	p1, p2 := s.P1Wins >= winsNeeded, s.P2Wins >= winsNeeded
+	switch {
+	case p1 && !p2:
+		return m.P1.ID
+	case p2 && !p1:
+		return m.P2.ID
+	default:
+		return 0
+	}
+}
+
+// ── 違規(schemas/27)────────────────────────────────────────────
+
+// Ruling 是裁判對一筆違規的判法,字面值即 match_violations.ruling 的 CHECK 值域。
+//
+// **只是紀錄,不是觸發器**:判該回合 = 裁判把該回合勝者填成對方(FinishRound),
+// 判整場 = 走正常的回合路徑。這個值唯一的程式用途是賽果公告要不要帶上它。
+type Ruling string
+
+const (
+	RulingWarning   Ruling = "warning"
+	RulingRoundLoss Ruling = "round_loss"
+	RulingMatchLoss Ruling = "match_loss"
+	RulingNone      Ruling = "none"
+)
+
+// Valid 回報是否為合法值。
+func (r Ruling) Valid() bool {
+	switch r {
+	case RulingWarning, RulingRoundLoss, RulingMatchLoss, RulingNone:
+		return true
+	default:
+		return false
+	}
+}
+
+// Announced 回報這筆判法要不要寫進賽果公告(grill Q14:只有判負的才帶原因)。
+func (r Ruling) Announced() bool { return r == RulingRoundLoss || r == RulingMatchLoss }
+
+// Violation 是 activity.match_violations 的一列,連同顯示用的快照。
+//
+// 只有 public_id 對外;內部 id 一個都不帶(鐵則 5)。
+type Violation struct {
+	PublicID      string
+	MatchPublicID string
+	// RoundNo nil = 開賽前(例:設定確認時發現沒改到)。
+	RoundNo *int
+	// 違規者,可以是任一方(grill Q6)。
+	PlayerPublicID    string
+	PlayerDisplayName string
+	// 違反哪一項;全部為空 = 不對應特定項目(違反通則)。
+	ItemPublicID string
+	ItemKey      string
+	ItemName     string
+	Ruling       Ruling
+	Note         string
+	// RecordedBy 是裁判(platform.users.id)。
+	RecordedBy int64
+	CreatedAt  time.Time
+}
 
 // Opponent 回傳 playerID 在本場的對手;找不到或對手未定時回零值。
 func (m Match) Opponent(playerID int64) Player {
@@ -215,6 +419,33 @@ var (
 	// 這是資料完整性失效(對戰表被刪了一半),不是使用者錯誤。
 	// 必須整筆失敗:繼續下去的後果是勝者從對戰表上消失,而且沒有人會發現。
 	ErrAdvanceTargetMissing = errors.New("晉級目標場次不存在")
+
+	// ErrSetupNotConfirmed 表示還沒做開賽前設定確認就要開打(第一回合)。
+	// 應用層先擋、給得出人話;matches_started_requires_setup_check 是最後一道。
+	ErrSetupNotConfirmed = errors.New("開賽前設定尚未確認,不能開打")
+	// ErrSetupAlreadyConfirmed 表示重複確認。第二次會蓋掉第一次的時間與人,所以要出聲。
+	ErrSetupAlreadyConfirmed = errors.New("開賽前設定已經確認過")
+	// ErrMatchDecided 表示回合結果已經分出整場勝者,不能再開新回合。
+	ErrMatchDecided = errors.New("此場次勝負已由回合結果決定")
+	// ErrRoundInProgress 表示上一回合還沒填勝者,不能開始下一回合(或同一回合已經開始過)。
+	ErrRoundInProgress = errors.New("上一回合尚未結束")
+	// ErrRoundNotFound 表示指定的回合不存在(還沒開始)。
+	ErrRoundNotFound = errors.New("回合不存在")
+	// ErrRoundAlreadyFinished 表示這一回合已經填過勝者。
+	// 回合結果會結算單回合盤口,填第二次等於派彩兩次,必須失敗。
+	ErrRoundAlreadyFinished = errors.New("此回合已經結束")
+	// ErrRoundsInconsistent 表示要寫入的整場勝者與回合推導的不一致,或回合列與場次狀態對不上。
+	//
+	// 這是資料完整性失效,不是使用者錯誤。整場勝者是衍生值,寫入前重算核對
+	// (與 match_budgets.spent 同一套紀律);不符就整筆失敗,絕不寫一個推導不出來的勝者。
+	ErrRoundsInconsistent = errors.New("回合紀錄與場次勝負不一致")
+	// ErrMultiRoundMatch 表示這屆是多回合制(best_of > 1),整場勝負要由逐回合結果推導,
+	// 不能一次判定 —— 裁判要用 FinishRound。
+	ErrMultiRoundMatch = errors.New("多回合制的場次要逐回合判定")
+	// ErrPlayerNotInMatch 表示指定的選手不是場上兩人之一(違規紀錄)。
+	ErrPlayerNotInMatch = errors.New("選手不是本場的選手")
+	// ErrInvalidRuling 表示判法不在四個固定值內。
+	ErrInvalidRuling = errors.New("違規判法不合法")
 )
 
 // ── Repository port ────────────────────────────────────────────
@@ -313,12 +544,74 @@ type FencerRecordWrite struct {
 	LossesDelta int32
 }
 
+// SetupConfirmWrite 是開賽前設定確認的寫入參數:setup_confirmed_at = now()、
+// setup_confirmed_by = 裁判。要求 status = locked 且尚未確認過(同一句 UPDATE 守)。
+//
+// Checklist 是裁判按下確認時看到的那份清單,進稽核的 after:清單是推導值,
+// 不另存,而「確認時清單長什麼樣」正是日後爭議時要查的東西。
+type SetupConfirmWrite struct {
+	MatchID     int64
+	ActorUserID int64
+	Checklist   []handicap.ChecklistEntry
+	Reason      string
+}
+
+// RoundStartWrite 是「正式決鬥開始」:建一列 match_rounds,started_at 由 DB 的 now() 給。
+//
+// RoundNo 由 service 依既有回合數算出(n+1);UNIQUE (match_id, round_no) 是防併發的第二道。
+type RoundStartWrite struct {
+	MatchID     int64
+	RoundNo     int
+	ActorUserID int64
+	Reason      string
+}
+
+// RoundFinishWrite 是填該回合勝者。finished_at IS NULL 是「一回合只結束一次」的 DB 側保證。
+type RoundFinishWrite struct {
+	MatchID        int64
+	RoundNo        int
+	WinnerPlayerID int64
+	ActorUserID    int64
+	Reason         string
+}
+
+// ThirdPlaceWrite 是建季軍戰:kind = third_place、雙方 = 兩位準決賽敗者、status pending。
+//
+// 刻意不附 ActorUserID:季軍戰是準決賽判定的**後果**,理由已經在那筆判定的稽核裡
+// (與 SeatWrite 同一個判斷)。public_id 由 adapter 產生。
+type ThirdPlaceWrite struct {
+	TournamentID int64
+	Round        int
+	Slot         int
+	P1PlayerID   int64
+	P2PlayerID   int64
+}
+
+// ViolationWrite 是記一筆違規。
+//
+// ItemPublicID 為空 = 不對應特定項目;非空時 adapter 在本屆內找項目,查無回
+// handicap.ErrItemNotFound(那句話的權威在讓武套件)。
+type ViolationWrite struct {
+	MatchID  int64
+	RoundNo  *int
+	PlayerID int64
+	// ItemPublicID 是讓武項目的 public_id(對外只認這個);空 = 違反通則。
+	ItemPublicID string
+	Ruling       Ruling
+	Note         string
+	ActorUserID  int64
+}
+
 // JudgeAction 是一筆稽核紀錄。
 //
-// **只有封盤走這裡**。封盤對 matches 的那句 UPDATE 屬於 handicap 套件
-// (matches 的封盤寫入只能有一個權威),所以本套件在那個動作上沒有任何
-// 自己的 UPDATE 可以順手掛上稽核。其餘五個動作的稽核都由各自的寫入方法
-// 在同一個 tx 裡寫,不經這裡 —— 這個方法存在不代表可以改用它。
+// **只有封盤與代退讓武走這裡**,而且是同一個理由:那兩個動作對資料庫的
+// 寫入(matches 的封盤 UPDATE、handicap_selections 標 voided + match_budgets
+// 改 spent)全部屬於 handicap 套件 —— 那些 SQL 只能有一個權威 —— 所以本套件
+// 在這兩個動作上沒有任何自己的 UPDATE 可以順手掛上稽核。
+//
+// 其餘動作的稽核都由各自的寫入方法在同一個 tx 裡寫,不經這裡。
+// 這個方法存在不代表可以改用它:有自己的 UPDATE 就掛在那句 SQL 的鄰居上,
+// 分兩步寫等於讓「資料改了但稽核沒記上」變成一個能真實發生的狀態。
 type JudgeAction struct {
 	ActorUserID int64
 	Action      string
@@ -376,6 +669,30 @@ type Repository[TX any] interface {
 	SetPlayerStatus(ctx context.Context, tx TX, w PlayerStatusWrite) (*Player, error)
 	// BumpFencerRecord 增量更新跨屆戰績。
 	BumpFencerRecord(ctx context.Context, tx TX, w FencerRecordWrite) error
+
+	// ConfirmSetup 開賽前設定確認,回傳更新後的場次,並寫稽核。
+	// 0 列時重讀分辨:ErrMatchNotFound / ErrNotLocked / ErrSetupAlreadyConfirmed。
+	ConfirmSetup(ctx context.Context, tx TX, w SetupConfirmWrite) (*Match, error)
+
+	// ListRounds 讀一場的全部回合,依 round_no 遞增。無鎖:寫入路徑已持有 matches 列鎖。
+	// 回傳的 Round 只帶 WinnerPlayerID;WinnerPublicID 由呼叫端用 Match.ResolveRoundWinners 補
+	// (那一支 query 不 JOIN 選手,翻譯需要的資料在場次上)。
+	ListRounds(ctx context.Context, tx TX, matchID int64) ([]Round, error)
+	// StartRound 建一列回合,回傳它,並寫稽核。同一回合重複建列回 ErrRoundInProgress。
+	StartRound(ctx context.Context, tx TX, w RoundStartWrite) (*Round, error)
+	// FinishRound 填該回合勝者,回傳更新後的回合,並寫稽核。
+	// 0 列時重讀分辨:ErrRoundNotFound / ErrRoundAlreadyFinished。
+	FinishRound(ctx context.Context, tx TX, w RoundFinishWrite) (*Round, error)
+
+	// InsertThirdPlaceMatch 建季軍戰,回傳新場次。**不寫稽核**(判定勝負的後果)。
+	InsertThirdPlaceMatch(ctx context.Context, tx TX, w ThirdPlaceWrite) (*Match, error)
+	// FindThirdPlaceMatch 讀本屆的季軍戰;沒有時回 (nil, nil) —— 那不是錯誤。
+	FindThirdPlaceMatch(ctx context.Context, tx TX, tournamentID int64) (*Match, error)
+
+	// RecordViolation 記一筆違規並寫稽核。**不觸發任何後果**(schemas/27)。
+	RecordViolation(ctx context.Context, tx TX, w ViolationWrite) (*Violation, error)
+	// ListViolations 讀一場的全部違規,依發生順序。
+	ListViolations(ctx context.Context, tx TX, matchID int64) ([]Violation, error)
 
 	// RecordJudgeAction 寫一筆 admin_audit_logs,見 JudgeAction 的註解。
 	RecordJudgeAction(ctx context.Context, tx TX, a JudgeAction) error

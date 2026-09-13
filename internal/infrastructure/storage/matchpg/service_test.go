@@ -77,11 +77,45 @@ func TestStateGates(t *testing.T) {
 		t.Fatalf("未封盤開打應回 ErrNotLocked,得到 %v", err)
 	}
 
-	// 封盤(走 handicap 的那一支 UPDATE)後才進得了 live
+	// 封盤(走 handicap 的那一支 UPDATE)後仍進不了 live:還差開賽前設定確認。
+	// MarkMatchLive 的 WHERE 多了 setup_confirmed_at IS NOT NULL,0 列要歸因成「未確認」。
 	if _, err := f.svc.LockHandicap(ctx, match.LockHandicapParams{
 		MatchPublicID: m.publicID, Confirm: true, ActorUserID: f.judge, Reason: "封盤",
 	}); err != nil {
 		t.Fatalf("封盤: %v", err)
+	}
+	err = f.repo.InTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if _, err := f.repo.LockMatch(ctx, tx, m.publicID); err != nil {
+			return err
+		}
+		_, err := f.repo.MarkLive(ctx, tx, match.LiveWrite{MatchID: m.id, ActorUserID: f.judge})
+		return err
+	})
+	if !errors.Is(err, match.ErrSetupNotConfirmed) {
+		t.Fatalf("封盤但未確認就開打應回 ErrSetupNotConfirmed,得到 %v", err)
+	}
+	if err := f.repo.InTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		if _, err := f.repo.LockMatch(ctx, tx, m.publicID); err != nil {
+			return err
+		}
+		got, err := f.repo.ConfirmSetup(ctx, tx, match.SetupConfirmWrite{MatchID: m.id, ActorUserID: f.judge})
+		if err != nil {
+			return err
+		}
+		if got.SetupConfirmedAt == nil || got.SetupConfirmedBy != f.judge || got.Status != match.StatusLocked {
+			t.Fatalf("設定確認後 %+v", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("設定確認: %v", err)
+	}
+	// 重複確認 → ErrSetupAlreadyConfirmed(第二次會蓋掉第一次的時間與人)
+	err = f.repo.InTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := f.repo.ConfirmSetup(ctx, tx, match.SetupConfirmWrite{MatchID: m.id, ActorUserID: f.judge})
+		return err
+	})
+	if !errors.Is(err, match.ErrSetupAlreadyConfirmed) {
+		t.Fatalf("重複確認應回 ErrSetupAlreadyConfirmed,得到 %v", err)
 	}
 	if err := f.repo.InTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		if _, err := f.repo.LockMatch(ctx, tx, m.publicID); err != nil {
@@ -421,6 +455,84 @@ func TestAdvanceChain(t *testing.T) {
 	}
 }
 
+// ── 裁判代退讓武 ────────────────────────────────────────────────
+
+// TestRefundSelectionWritesAudit 驗證代退的稽核紀錄真的落進
+// platform.admin_audit_logs,而且 actor_user_id 指向一位真的使用者。
+//
+// 這一條只有真 Postgres 答得出來:actor_user_id 是 NOT NULL + FK,
+// core 的假物件收下任何 int64 都不會出聲,而寫不進去的症狀是整筆退點被 rollback
+// ——「BP 沒退成功」而不是「稽核漏了」,查起來會指向完全錯的方向。
+func TestRefundSelectionWritesAudit(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	a, b := f.player("甲", 1), f.player("乙", 2)
+	m := f.match(1, 0, a.id, b.id, match.StatusReady)
+	f.hcap.refundMatchID, f.hcap.refundMatchRef = m.id, m.publicID
+	f.hcap.refundPlayerID, f.hcap.refundPlayerRef = a.id, a.publicID
+
+	res, err := f.svc.RefundSelection(ctx, match.RefundSelectionParams{
+		SelectionPublicID: "01SELECTION",
+		ActorUserID:       f.judge,
+		Reason:            "同時買了禁用奇術,依項目規則返還",
+	})
+	if err != nil {
+		t.Fatalf("代退: %v", err)
+	}
+	if res.MatchPublicID != m.publicID || res.Selection.ItemName != "禁用任意奇術" {
+		t.Fatalf("回傳不完整: %+v", res)
+	}
+
+	audits := f.audits()
+	if len(audits) != 1 {
+		t.Fatalf("稽核筆數 = %d,想要 1", len(audits))
+	}
+	rec := audits[0]
+	if rec.Action != match.ActionRefundSelection {
+		t.Fatalf("action = %q", rec.Action)
+	}
+	if rec.TargetType != "activity.match" || rec.TargetID != m.id {
+		t.Fatalf("target 不對: %+v", rec)
+	}
+	if rec.Reason == "" {
+		t.Fatal("理由沒有寫進稽核 —— 那是這個動作唯一的解釋")
+	}
+	// after 要足以還原這筆退點,否則稽核只證明「有人動過」而答不出動了什麼。
+	for _, k := range []string{"selection_public_id", "item_name", "refunded_bp", "remaining"} {
+		if _, ok := rec.After[k]; !ok {
+			t.Fatalf("稽核 after 缺 %s: %+v", k, rec.After)
+		}
+	}
+	if rec.After["refunded_bp"] != float64(3) {
+		t.Fatalf("after.refunded_bp = %v,想要 3", rec.After["refunded_bp"])
+	}
+
+	// 代退不發公告:封盤前的讓武內容只有施加者與裁判看得到。
+	if len(f.topics()) != 0 {
+		t.Fatalf("代退不該發任何事件: %v", f.topics())
+	}
+}
+
+// 退點失敗時,稽核不能留下 —— 一筆記著「退了」但其實沒退的紀錄,
+// 比沒有紀錄更糟:它會讓事後對帳的人相信一件沒發生的事。
+func TestRefundSelectionFailureLeavesNoAudit(t *testing.T) {
+	f := newFixture(t)
+	a, b := f.player("甲", 1), f.player("乙", 2)
+	m := f.match(1, 0, a.id, b.id, match.StatusReady)
+	f.hcap.refundMatchID, f.hcap.refundMatchRef = m.id, m.publicID
+	f.hcap.failRefund = handicap.ErrHandicapLocked
+
+	_, err := f.svc.RefundSelection(context.Background(), match.RefundSelectionParams{
+		SelectionPublicID: "01SELECTION", ActorUserID: f.judge, Reason: "退",
+	})
+	if !errors.Is(err, handicap.ErrHandicapLocked) {
+		t.Fatalf("err = %v,want handicap.ErrHandicapLocked", err)
+	}
+	if got := f.audits(); len(got) != 0 {
+		t.Fatalf("失敗的代退留下了 %d 筆稽核", len(got))
+	}
+}
+
 // ── 稽核與事件 ──────────────────────────────────────────────────
 
 // TestAuditAndOutbox 驗證「該寫的寫了、不該寫的沒寫」。
@@ -447,9 +559,13 @@ func TestAuditAndOutbox(t *testing.T) {
 		t.Fatalf("判定: %v", err)
 	}
 
+	// 單場定勝負的 ReportResult 走回合路徑:開打 = 第 1 回合開始(兩筆),
+	// 判定 = 結束第 1 回合 + 寫整場勝者(兩筆)。
 	want := []string{
-		match.ActionOpenHandicap, match.ActionLockHandicap, match.ActionStartMatch,
-		match.ActionSetStreamURL, match.ActionReportResult,
+		match.ActionOpenHandicap, match.ActionLockHandicap, match.ActionConfirmSetup,
+		match.ActionStartMatch, match.ActionStartRound,
+		match.ActionSetStreamURL,
+		match.ActionFinishRound, match.ActionReportResult,
 	}
 	got := f.auditActions()
 	if len(got) != len(want) {
@@ -463,6 +579,10 @@ func TestAuditAndOutbox(t *testing.T) {
 	// 晉級(SeatPlayer)與戰績(BumpFencerRecord)是判定勝負的後果,不另記一筆
 	if n := count(got, match.ActionReportResult); n != 1 {
 		t.Fatalf("判定勝負應只留一筆稽核,得到 %d", n)
+	}
+	// 回合列真的在:單場定勝負也走同一條路徑。
+	if rs := f.rounds(m.id); len(rs) != 1 || rs[0].Winner != a.id || rs[0].FinishedAt == nil {
+		t.Fatalf("單場定勝負也要有第 1 回合的列:%+v", rs)
 	}
 
 	audits := f.audits()
@@ -487,9 +607,10 @@ func TestAuditAndOutbox(t *testing.T) {
 			t.Fatalf("缺公告 %s:%v", want, topics)
 		}
 	}
-	// 設直播連結刻意不發公告(連結會改、會補,每改一次就廣播等於洗頻)
+	// 設直播連結刻意不發公告(連結會改、會補,每改一次就廣播等於洗頻);
+	// 回合的兩則只推即時戰況、不進 outbox(沒有人認領)。
 	if len(topics) != 4 {
-		t.Fatalf("公告數不對(設直播不該發):%v", topics)
+		t.Fatalf("公告數不對(設直播與回合都不該進 outbox):%v", topics)
 	}
 
 	for _, e := range f.events() {

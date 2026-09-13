@@ -71,6 +71,23 @@ func (h *Handicaps) LockInTx(ctx context.Context, tx pgx.Tx, matchPublicID strin
 	return h.service(tx).Lock(ctx, matchPublicID)
 }
 
+// RefundSelectionInTx 裁判代退一筆讓武選擇,退點落在呼叫端的 tx 裡 ——
+// 與 match 寫的那筆稽核紀錄同生共死。
+//
+// 錯誤(handicap.ErrHandicapLocked、ErrSelectionAlreadyVoided、
+// ErrSelectionNotFound)原樣上拋:語意在讓武套件已經定義過。
+func (h *Handicaps) RefundSelectionInTx(
+	ctx context.Context, tx pgx.Tx, selectionPublicID string,
+) (*handicap.RefundResult, error) {
+	return h.service(tx).RefundSelection(ctx, selectionPublicID)
+}
+
+// RefereeViewInTx 是裁判端的讓武檢視(不套用封盤前的揭露限制),唯讀。
+// 設定確認清單由 match 從回傳值推導(MatchHandicaps.Checklist),這裡不另算。
+func (h *Handicaps) RefereeViewInTx(ctx context.Context, tx pgx.Tx, matchPublicID string) (*handicap.MatchHandicaps, error) {
+	return h.service(tx).RefereeMatchHandicaps(ctx, matchPublicID)
+}
+
 // service 為這一個 tx 現做一個 handicap.Service。
 //
 // 每次現做而不是快取:Service 本身只有 repo 與時鐘兩個欄位,建構成本等於一次

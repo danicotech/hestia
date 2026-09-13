@@ -2,15 +2,20 @@ package match
 
 import (
 	"encoding/json"
+	"time"
 
 	"github.com/danicotech/hestia/internal/core/activity/bp"
 	"github.com/danicotech/hestia/internal/core/activity/bracket"
 	"github.com/danicotech/hestia/internal/core/activity/handicap"
-	"github.com/danicotech/hestia/internal/core/activity/tournament"
+	"github.com/danicotech/hestia/internal/core/activity/rules"
 )
 
 // outbox topic。五則公告裡有三則(開盤、封盤、賽果)是使用者點名要的,
 // 所以它們不是「順便發的通知」,而是這條生命週期的產出之一。
+//
+// 回合的兩則(TopicRoundStarted / TopicRoundFinished)**只推即時戰況、不進 outbox**
+// (Event.Announced 回 false):沒有任何消費者要貼它 —— 使用者要的公告是賽果與
+// 晉級,回合比數寫在賽果那則裡;而進了 outbox 沒人認領的事件會退避到 failed。
 const (
 	// TopicHandicapOpened 開盤提醒。低段位者這時才拿到 BP,公告要提醒他
 	// 「你有 N BP 還沒花」—— 沒有這則,BP 常常放到封盤都沒動。
@@ -26,7 +31,25 @@ const (
 	// TopicChampion 冠軍。決賽判定時額外發一則 —— 冠軍是一屆賽事的結論,
 	// 讓它混在某一場的賽果公告裡會被滑過去。
 	TopicChampion = "tournament.champion"
+	// TopicRoundStarted 一回合的正式決鬥開始(計時起點)。只推即時戰況。
+	TopicRoundStarted = "match.round_started"
+	// TopicRoundFinished 一回合結束、比數更新。只推即時戰況。
+	// 整場因此定案時,TopicMatchFinished 會在同一個 tx 裡緊接著發。
+	TopicRoundFinished = "match.round_finished"
 )
+
+// Announced 回報這則事件要不要進 outbox(對外公告)。
+//
+// 回合事件只推即時戰況:它們在 AppendEvents 裡一樣經 NOTIFY 送出(與領域變更同 tx),
+// 但不寫 outbox_events —— 那張表上每一列都要有人認領,而回合沒有公告可貼。
+func (e Event) Announced() bool {
+	switch e.Topic {
+	case TopicRoundStarted, TopicRoundFinished:
+		return false
+	default:
+		return true
+	}
+}
 
 // SideInfo 是公告裡「一位選手」要顯示的全部欄位。
 //
@@ -72,14 +95,58 @@ type HandicapInfo struct {
 	Items     []HandicapItemInfo `json:"items"`
 }
 
+// ScoreInfo 是公告裡的回合比數(例「2:1」)。
+//
+// 只在多回合制或有回合紀錄時出現;不戰而勝沒有回合,這一塊是 nil。
+type ScoreInfo struct {
+	P1Wins int `json:"p1_wins"`
+	P2Wins int `json:"p2_wins"`
+	// Text 是「2:1」的字面(P1 在前),renderer 直接貼。
+	Text string `json:"text"`
+	// WinsNeeded 是本屆的獲勝門檻(⌈best_of/2⌉),公告寫得出「三局兩勝」。
+	WinsNeeded int `json:"wins_needed"`
+}
+
+// ViolationInfo 是賽果公告裡的一筆判負原因(grill Q14)。
+//
+// 只有 ruling ∈ {round_loss, match_loss} 的違規會進公告;警告與不判的不揭露。
+// 違規本身**不單發公告**。
+type ViolationInfo struct {
+	PlayerPublicID string `json:"player_public_id"`
+	DisplayName    string `json:"display_name"`
+	// RoundNo 0 = 開賽前。
+	RoundNo int    `json:"round_no,omitempty"`
+	Ruling  Ruling `json:"ruling"`
+	// ItemName 是違反的讓武項目名稱;空 = 違反通則。
+	ItemName string `json:"item_name,omitempty"`
+	Note     string `json:"note"`
+}
+
+// RoundInfo 是回合區塊:一回合的起訖與到目前為止的比數。
+//
+// 計時器是衍生值:前端算 now() − StartedAt,伺服器只給起始時間。
+type RoundInfo struct {
+	RoundNo    int        `json:"round_no"`
+	StartedAt  time.Time  `json:"started_at"`
+	FinishedAt *time.Time `json:"finished_at,omitempty"`
+	Winner     *SideInfo  `json:"winner,omitempty"`
+	Score      ScoreInfo  `json:"score"`
+}
+
 // ResultInfo 是賽果區塊。
 type ResultInfo struct {
 	Kind   ResultKind `json:"kind"`
 	Winner *SideInfo  `json:"winner,omitempty"`
 	Loser  *SideInfo  `json:"loser,omitempty"`
-	// NextMatchPublicID 是勝者晉級到的場次;空 = 這是決賽。
+	// Score 是回合比數;不戰而勝為 nil。
+	Score *ScoreInfo `json:"score,omitempty"`
+	// Violations 是判負原因(只含 round_loss / match_loss),沒有就是空。
+	Violations []ViolationInfo `json:"violations,omitempty"`
+	// NextMatchPublicID 是勝者晉級到的場次;空 = 這是決賽或季軍戰。
 	NextMatchPublicID string `json:"next_match_public_id,omitempty"`
 	NextRoundLabel    string `json:"next_round_label,omitempty"`
+	// ThirdPlaceMatchPublicID 非空 = 這場準決賽判定後季軍戰成形了。
+	ThirdPlaceMatchPublicID string `json:"third_place_match_public_id,omitempty"`
 	// SettledBetCount / VoidedBetCount 是本場影響的注單數。
 	// 公告寫得出「本場結算 12 張注單」,觀眾才知道派彩確實發生了。
 	SettledBetCount int `json:"settled_bet_count,omitempty"`
@@ -99,14 +166,18 @@ type MatchEvent struct {
 	Slot           int    `json:"slot"`
 	// RoundLabel 是「八強」「決賽」這類顯示名,由伺服器算 ——
 	// 同一個 round 編號在 8 人賽是四強、在 32 人賽是三十二強,前端沒有足夠資訊判斷。
-	RoundLabel string        `json:"round_label"`
-	IsFinal    bool          `json:"is_final"`
-	Status     Status        `json:"status"`
-	StreamURL  string        `json:"stream_url,omitempty"`
-	P1         *SideInfo     `json:"p1,omitempty"`
-	P2         *SideInfo     `json:"p2,omitempty"`
-	Handicap   *HandicapInfo `json:"handicap,omitempty"`
-	Result     *ResultInfo   `json:"result,omitempty"`
+	RoundLabel string `json:"round_label"`
+	IsFinal    bool   `json:"is_final"`
+	// Kind 讓 renderer 分得出季軍戰(它的 round 與決賽同一輪,RoundLabel 會是「決賽」)。
+	Kind      MatchKind     `json:"kind"`
+	Status    Status        `json:"status"`
+	StreamURL string        `json:"stream_url,omitempty"`
+	P1        *SideInfo     `json:"p1,omitempty"`
+	P2        *SideInfo     `json:"p2,omitempty"`
+	Handicap  *HandicapInfo `json:"handicap,omitempty"`
+	// CurrentRound 在回合事件裡非 nil:剛開始或剛結束的那一回合。
+	CurrentRound *RoundInfo  `json:"current_round,omitempty"`
+	Result       *ResultInfo `json:"result,omitempty"`
 }
 
 // ChampionEvent 是冠軍公告。
@@ -125,18 +196,27 @@ type ChampionEvent struct {
 // 必須描述同一個快照,分開查就有機會描述到兩個。
 type eventCtx struct {
 	t   *Tournament
-	cfg tournament.Config
+	cfg rules.Config
 	b   *bracket.Bracket
 }
 
 // newEventCtx 解析賽事設定並還原對戰表形狀。
 //
-// ParseConfig 的錯誤刻意不上拋:它保證回傳的設定每個欄位都補過預設值,
+// rules.Parse 的錯誤刻意不上拋:它保證回傳的設定每個欄位都補過預設值,
 // 而「config 裡某個段位名稱打錯字」不該讓一場已經打完的比賽無法判定勝負。
 // 壞掉的設定會在讀賽事的路徑上被看見,不需要在這裡再擋一次。
 func newEventCtx(t *Tournament) eventCtx {
-	cfg, _ := tournament.ParseConfig(t.ConfigRaw)
+	cfg, _ := rules.Parse(t.ConfigRaw)
 	return eventCtx{t: t, cfg: cfg, b: bracketOf(t.TotalRounds)}
+}
+
+// winsNeeded 是本屆整場勝者要先拿到幾勝(⌈best_of/2⌉)。權威在 rules,這裡只轉手。
+func (e eventCtx) winsNeeded() int { return e.cfg.WinsNeeded() }
+
+// isFinal 回報這一場是不是決賽:決賽那一輪的**晉級樹**場次。
+// 季軍戰的 round 與決賽相同,但它不是決賽 —— 沒有冠軍。
+func (e eventCtx) isFinal(m *Match) bool {
+	return m.Round == e.t.TotalRounds && !m.IsThirdPlace()
 }
 
 // bracketOf 依總輪數還原一張「只有形狀」的對戰表。
@@ -162,7 +242,7 @@ func (e eventCtx) side(p Player) *SideInfo {
 		DisplayName:    p.DisplayName,
 		RankLevel:      p.Rank,
 	}
-	if ri, ok := e.cfg.Rank(p.Rank); ok {
+	if ri, ok := e.cfg.Rank(int(p.Rank)); ok {
 		s.RankName, s.RankTitle = ri.Name, ri.Title
 	}
 	return s
@@ -170,6 +250,10 @@ func (e eventCtx) side(p Player) *SideInfo {
 
 // base 組出四則公告共用的部分。
 func (e eventCtx) base(m *Match) MatchEvent {
+	kind := m.Kind
+	if kind == "" {
+		kind = KindBracket
+	}
 	return MatchEvent{
 		TournamentSlug: e.t.Slug,
 		TournamentName: e.t.Name,
@@ -177,12 +261,54 @@ func (e eventCtx) base(m *Match) MatchEvent {
 		Round:          m.Round,
 		Slot:           m.Slot,
 		RoundLabel:     e.b.RoundLabel(m.Round),
-		IsFinal:        m.Round == e.t.TotalRounds,
+		IsFinal:        e.isFinal(m),
+		Kind:           kind,
 		Status:         m.Status,
 		StreamURL:      m.StreamURL,
 		P1:             e.side(m.P1),
 		P2:             e.side(m.P2),
 	}
+}
+
+// scoreInfo 把比數翻成公告用的區塊。
+func (e eventCtx) scoreInfo(s Score) ScoreInfo {
+	return ScoreInfo{P1Wins: s.P1Wins, P2Wins: s.P2Wins, Text: s.String(), WinsNeeded: e.winsNeeded()}
+}
+
+// roundInfo 是回合區塊:那一回合本身,加上到目前為止(含它)的比數。
+func (e eventCtx) roundInfo(m *Match, r Round, rounds []Round) *RoundInfo {
+	info := &RoundInfo{
+		RoundNo:    r.RoundNo,
+		StartedAt:  r.StartedAt,
+		FinishedAt: r.FinishedAt,
+		Score:      e.scoreInfo(ScoreOf(*m, rounds)),
+	}
+	if r.WinnerPlayerID != 0 {
+		info.Winner = e.side(m.PlayerByID(r.WinnerPlayerID))
+	}
+	return info
+}
+
+// violationInfos 挑出要進賽果公告的違規(只有判負的,grill Q14)。
+func violationInfos(vs []Violation) []ViolationInfo {
+	var out []ViolationInfo
+	for _, v := range vs {
+		if !v.Ruling.Announced() {
+			continue
+		}
+		info := ViolationInfo{
+			PlayerPublicID: v.PlayerPublicID,
+			DisplayName:    v.PlayerDisplayName,
+			Ruling:         v.Ruling,
+			ItemName:       v.ItemName,
+			Note:           v.Note,
+		}
+		if v.RoundNo != nil {
+			info.RoundNo = *v.RoundNo
+		}
+		out = append(out, info)
+	}
+	return out
 }
 
 // budgetInfo 是開盤時的讓武區塊:只有預算,還沒有任何選擇。

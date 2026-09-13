@@ -70,6 +70,7 @@ type activityReaderPort interface {
 	ListMatches(ctx context.Context, tournamentID int64) ([]match.Match, error)
 	MatchByPublicID(ctx context.Context, matchPublicID string) (match.Match, error)
 	CurrentMatchOfPlayer(ctx context.Context, playerID int64) (*match.Match, error)
+	RoundsByMatches(ctx context.Context, matchIDs []int64) (map[int64][]match.Round, error)
 	Fencers(ctx context.Context, fencerIDs []int64) (map[int64]signup.Fencer, error)
 }
 
@@ -191,6 +192,30 @@ func (s *Service) CurrentMatchOfPlayer(ctx context.Context, playerID int64) (*ma
 	}
 	m := toMatch(matchRow(row))
 	return &m, nil
+}
+
+// RoundsByMatches 批次取多場的回合(對戰表要顯示比分),鍵是場次內部 id。
+//
+// 沒有回合的場次不出現在 map 裡(對戰表上絕大多數場次都還沒開打,為它們各放一個
+// 空切片只是多配置);查得到的每一場,回合依 round_no 遞增。
+// 空輸入直接回空 map,不往資料庫走一趟。
+//
+// 回傳的 Round 其 WinnerPublicID 為空:這裡只有 id,沒有場次。呼叫端手上有
+// ListMatches 的結果,用 match.Match.ResolveRoundWinners 補齊 —— 比數本身
+// (match.ScoreOf)只看 WinnerPlayerID,不需要先補。
+func (s *Service) RoundsByMatches(ctx context.Context, matchIDs []int64) (map[int64][]match.Round, error) {
+	out := map[int64][]match.Round{}
+	if len(matchIDs) == 0 {
+		return out, nil
+	}
+	rows, err := s.q.ListMatchRoundsByMatches(ctx, matchIDs)
+	if err != nil {
+		return nil, fmt.Errorf("讀 %d 場的回合: %w", len(matchIDs), err)
+	}
+	for _, r := range rows {
+		out[r.MatchID] = append(out[r.MatchID], toRound(r))
+	}
+	return out, nil
 }
 
 // ── 跨屆檔案 ──────────────────────────────────────────────────

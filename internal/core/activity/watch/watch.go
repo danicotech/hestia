@@ -75,6 +75,9 @@ const (
 	KindPhase Kind = "phase"
 	// KindChampion 冠軍產生。
 	KindChampion Kind = "champion"
+	// KindRound 一回合開始或結束(多回合制,schemas/20):計時起點與比數都從這一則來。
+	// 參照場次 public_id;收端讀 ListMatchRounds 取全部回合(見 Update.Rounds)。
+	KindRound Kind = "round"
 )
 
 // Envelope 是跨交易飛的那個小信封。
@@ -92,7 +95,7 @@ type Envelope struct {
 	Tournament string `json:"t"`
 	// Kind 是變化種類。
 	Kind Kind `json:"k"`
-	// Ref 是參照 id:場次的 public_id(match / handicap_locked / odds / champion),
+	// Ref 是參照 id:場次的 public_id(match / handicap_locked / odds / champion / round),
 	// 或空字串(phase —— 賽事本身已經由 Tournament 指定)。
 	Ref string `json:"r"`
 }
@@ -150,17 +153,22 @@ type eventRef struct {
 
 // topicKinds 是 outbox topic → 推播種類的**唯一**對照表。
 //
-// 為什麼跟著 topic 走而不是另外在 adapter 裡判斷:這五個 topic 就是
+// 為什麼跟著 topic 走而不是另外在 adapter 裡判斷:這七個 topic 就是
 // 「一場比賽的生命週期會對外講的全部的話」(match/events.go),推播要送的
 // 也正是同一組時刻。分成兩份判斷,漏的那一則不會有任何錯誤訊息 ——
 // 只會是「那個變化在畫面上不會即時出現」,而那要等到活動當天才有人發現。
 // 有一支測試釘住「每個 match.Topic* 都在這張表裡」。
+//
+// 回合的兩則不進 outbox(match.Event.Announced 回 false),但一樣經這張表送 NOTIFY:
+// 推播是它們存在的唯一理由。
 var topicKinds = map[string]Kind{
 	match.TopicHandicapOpened: KindMatch,
 	match.TopicHandicapLocked: KindHandicapLocked,
 	match.TopicMatchStarted:   KindMatch,
 	match.TopicMatchFinished:  KindMatch,
 	match.TopicChampion:       KindChampion,
+	match.TopicRoundStarted:   KindRound,
+	match.TopicRoundFinished:  KindRound,
 }
 
 // EnvelopeForEvent 從一則 outbox 事件推出信封。
@@ -201,12 +209,21 @@ type Champion struct {
 	RunnerUpDisplayName string
 }
 
+// MatchRounds 是一場比賽的全部回合,回合推播的內容。
+//
+// 帶 MatchPublicID 是因為 Round 本身不指名場次,而訂閱者要知道比數是誰的。
+// Rounds 的 WinnerPublicID 由收端讀場次後以 Match.ResolveRoundWinners 填好再送。
+type MatchRounds struct {
+	MatchPublicID string
+	Rounds        []match.Round
+}
+
 // Update 是送給訂閱者的一則變化。
 //
 // 一則只填一個欄位,由 Kind 指明是哪一個 —— 這裡不用 interface 也不用
 // 各自一個型別,是因為它會被扇出到成百上千個 channel,型別斷言與額外配置
 // 在那條路徑上沒有價值;而「填了哪一個」由 Kind 一個欄位回答,
-// 讀的人不必去比對五個指標。
+// 讀的人不必去比對六個指標。
 //
 // 型別全部沿用既有的 core 檢視(match.Match / handicap.MatchHandicaps /
 // betting.MatchOdds):對戰表頁查詢回的與推播送的是同一個東西,
@@ -218,7 +235,8 @@ type Update struct {
 	// EmittedAt 是伺服器組出這則變化的時刻。
 	EmittedAt time.Time
 
-	// Match 在 Kind == KindMatch 時非 nil。
+	// Match 在 Kind == KindMatch 與 KindRound 時非 nil。回合推播也帶場次:
+	// 訂閱者要用場上兩人把回合勝者對回 public_id,而且比數的意義依附在場次上。
 	Match *match.Match
 	// Handicaps 在 Kind == KindHandicapLocked 時非 nil。
 	Handicaps *handicap.MatchHandicaps
@@ -229,4 +247,9 @@ type Update struct {
 	Phase tournament.Phase
 	// Champion 在 Kind == KindChampion 時非 nil。
 	Champion *Champion
+	// Rounds 在 Kind == KindRound 時非 nil;KindMatch 也帶(場次定案那一則要帶最終比數)。
+	// 該場全部回合(含剛開始的那一回合)。
+	// 送整份而不是只送變動的那一回合:比數是衍生值,收端拿到全部回合才數得出來,
+	// 而且漏掉一則推播不會讓畫面上的比數永遠差一。
+	Rounds *MatchRounds
 }

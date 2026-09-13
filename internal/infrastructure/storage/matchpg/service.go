@@ -214,12 +214,15 @@ func (s *Service) MarkReady(ctx context.Context, tx pgx.Tx, w match.ReadyWrite) 
 }
 
 // MarkLive 開打:locked → live、started_at = now(),並寫稽核。
+//
+// 守門有兩道(status = locked、setup_confirmed_at IS NOT NULL),0 列要重讀分辨:
+// 「還沒封盤」與「還沒做設定確認」對裁判是兩個不同的下一步。
 func (s *Service) MarkLive(ctx context.Context, tx pgx.Tx, w match.LiveWrite) (*match.Match, error) {
 	q := s.q.WithTx(tx)
 	row, err := q.MarkMatchLive(ctx, w.MatchID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, s.attribute(ctx, q, w.MatchID, match.ErrNotLocked)
+			return nil, s.attributeLive(ctx, q, w.MatchID)
 		}
 		return nil, fmt.Errorf("開打 match=%d: %w", w.MatchID, err)
 	}
@@ -349,8 +352,8 @@ func (s *Service) BumpFencerRecord(ctx context.Context, tx pgx.Tx, w match.Fence
 	return nil
 }
 
-// RecordJudgeAction 寫一筆 admin_audit_logs。**只有封盤走這裡**:封盤對 matches
-// 的 UPDATE 屬於 handicap 套件,本套件在那個動作上沒有自己的寫入可以順手掛稽核。
+// RecordJudgeAction 寫一筆 admin_audit_logs。哪些動作走這裡、為什麼,
+// 寫在 match.JudgeAction 的說明裡 —— 那是那段解釋的家。
 func (s *Service) RecordJudgeAction(ctx context.Context, tx pgx.Tx, a match.JudgeAction) error {
 	var targetType *string
 	if a.TargetType != "" {
@@ -385,11 +388,15 @@ func (s *Service) AppendEvents(ctx context.Context, tx pgx.Tx, events []match.Ev
 	}
 	q := s.q.WithTx(tx)
 	for _, e := range events {
-		if _, err := q.InsertOutboxEvent(ctx, db.InsertOutboxEventParams{
-			Topic:   e.Topic,
-			Payload: e.Payload,
-		}); err != nil {
-			return fmt.Errorf("寫 outbox topic=%s: %w", e.Topic, err)
+		// 回合事件只推即時戰況(match.Event.Announced):outbox 上每一列都要有人認領,
+		// 而回合沒有公告可貼 —— 沒人認領的列會退避到 failed。
+		if e.Announced() {
+			if _, err := q.InsertOutboxEvent(ctx, db.InsertOutboxEventParams{
+				Topic:   e.Topic,
+				Payload: e.Payload,
+			}); err != nil {
+				return fmt.Errorf("寫 outbox topic=%s: %w", e.Topic, err)
+			}
 		}
 		if err := s.notifyWatch(ctx, q, e); err != nil {
 			return err
@@ -433,6 +440,7 @@ type matchAudit struct {
 	MatchPublicID        string           `json:"match_public_id"`
 	Round                int              `json:"round"`
 	Slot                 int              `json:"slot"`
+	Kind                 match.MatchKind  `json:"kind"`
 	Status               match.Status     `json:"status"`
 	HandicapOpen         bool             `json:"handicap_open"`
 	ResultKind           match.ResultKind `json:"result_kind,omitempty"`
@@ -449,14 +457,13 @@ type playerAudit struct {
 	Status         tournament.PlayerStatus `json:"status"`
 }
 
-// auditMatch 在同一個 tx 裡替一個場次動作寫稽核。
-func (s *Service) auditMatch(ctx context.Context, q *db.Queries,
-	actorUserID int64, action string, m match.Match, reason string,
-) error {
+// snapshot 組出場次的稽核快照。
+func snapshot(m match.Match) matchAudit {
 	a := matchAudit{
 		MatchPublicID: m.PublicID,
 		Round:         m.Round,
 		Slot:          m.Slot,
+		Kind:          m.Kind,
 		Status:        m.Status,
 		HandicapOpen:  m.HandicapOpen,
 		StartedAt:     m.StartedAt,
@@ -466,28 +473,36 @@ func (s *Service) auditMatch(ctx context.Context, q *db.Queries,
 	if m.WinnerPlayerID != 0 {
 		a.ResultKind = m.ResultKind
 		// 記 public_id 而不是內部 id:稽核是給人查的,對外也只認 public_id。
-		switch m.WinnerPlayerID {
-		case m.P1.ID:
-			a.WinnerPlayerPublicID = m.P1.PublicID
-		case m.P2.ID:
-			a.WinnerPlayerPublicID = m.P2.PublicID
-		}
+		a.WinnerPlayerPublicID = m.PlayerByID(m.WinnerPlayerID).PublicID
 	}
-	after, err := json.Marshal(a)
+	return a
+}
+
+// auditMatch 在同一個 tx 裡替一個場次動作寫稽核。
+func (s *Service) auditMatch(ctx context.Context, q *db.Queries,
+	actorUserID int64, action string, m match.Match, reason string,
+) error {
+	after, err := json.Marshal(snapshot(m))
 	if err != nil {
 		return fmt.Errorf("組稽核內容 match=%s: %w", m.PublicID, err)
 	}
-	if _, err := q.InsertAdminAudit(ctx, db.InsertAdminAuditParams{
-		ActorUserID: actorUserID,
-		Action:      action,
-		TargetType:  ptr(match.AuditTargetMatch),
-		TargetID:    ptr(m.ID),
-		After:       after,
-		Reason:      reason,
-	}); err != nil {
-		return fmt.Errorf("寫稽核紀錄 match=%s action=%s: %w", m.PublicID, action, err)
+	return s.insertAudit(ctx, q, actorUserID, action, m.ID, after, reason)
+}
+
+// attributeLive 把 MarkMatchLive 的 0 列翻成正確的錯誤:
+// 查無 / 還沒封盤 / 封盤了但還沒做設定確認。
+func (s *Service) attributeLive(ctx context.Context, q *db.Queries, matchID int64) error {
+	row, err := q.GetMatchForJudgeByID(ctx, matchID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("match id=%d: %w", matchID, activityerr.ErrMatchNotFound)
+		}
+		return fmt.Errorf("重讀場次 id=%d: %w", matchID, err)
 	}
-	return nil
+	if row.Status == string(match.StatusLocked) && row.SetupConfirmedAt == nil {
+		return fmt.Errorf("match=%s: %w", row.PublicID, match.ErrSetupNotConfirmed)
+	}
+	return fmt.Errorf("match=%s status=%s: %w", row.PublicID, row.Status, match.ErrNotLocked)
 }
 
 // attribute 把「狀態轉移影響 0 列」翻成正確的錯誤。
