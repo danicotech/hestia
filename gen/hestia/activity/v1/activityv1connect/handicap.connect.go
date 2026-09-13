@@ -15,7 +15,9 @@
 // 動平台代幣的 RPC 一律要帶 idempotency_key(平台鐵則)。這裡**刻意沒有**,
 // 因為 BP 不是代幣:每輪依段位差重發、該場有效、賽後作廢、不可交易。
 // 重複扣一次 BP 的後果是使用者看到餘額不對,不是對不上帳 ——
-// 前者可以由裁判在封盤前退掉,後者無法事後修復。
+// 前者可以由選手自己在封盤前退掉(VoidSelection 只認選擇的本人;
+// 裁判代退走 JudgeService.RefundSelection,那條路要裁判權限並進稽核紀錄),
+// 後者無法事後修復。
 //
 // 真正動錢的是 betting.proto 與 judge.proto 的發獎,那兩處才有冪等鍵。
 //
@@ -24,6 +26,10 @@
 // 封盤前:只有施加者本人看得到自己買了什麼。
 // 封盤後:雙方與觀眾全部看得到,並自動發一則 Discord 公告。
 // 這條界線由伺服器守,不是前端隱藏。
+//
+// 本服務沒有例外。裁判要在封盤前看內容(場上規則要他看)走的是
+// JudgeService.ReviewHandicap —— 那是另一支需要裁判權限的 RPC,
+// 不是在這裡多一個參數。
 package activityv1connect
 
 import (
@@ -69,6 +75,9 @@ const (
 	// HandicapServiceGetMatchHandicapsProcedure is the fully-qualified name of the HandicapService's
 	// GetMatchHandicaps RPC.
 	HandicapServiceGetMatchHandicapsProcedure = "/hestia.activity.v1.HandicapService/GetMatchHandicaps"
+	// HandicapServiceListMyViolationsProcedure is the fully-qualified name of the HandicapService's
+	// ListMyViolations RPC.
+	HandicapServiceListMyViolationsProcedure = "/hestia.activity.v1.HandicapService/ListMyViolations"
 )
 
 // HandicapServiceClient is a client for the hestia.activity.v1.HandicapService service.
@@ -83,6 +92,9 @@ type HandicapServiceClient interface {
 	VoidSelection(context.Context, *connect.Request[v1.VoidSelectionRequest]) (*connect.Response[v1.VoidSelectionResponse], error)
 	// 取得某場的讓武全貌。封盤後匿名可讀;封盤前只回請求者自己的。
 	GetMatchHandicaps(context.Context, *connect.Request[v1.GetMatchHandicapsRequest]) (*connect.Response[v1.GetMatchHandicapsResponse], error)
+	// 列出我在某場被記的違規(schemas/27):被判負的人有權知道為什麼。
+	// 只回本人的 —— 對手的違規不在這裡,裁判端的 ListViolations 才看得到整場。
+	ListMyViolations(context.Context, *connect.Request[v1.ListMyViolationsRequest]) (*connect.Response[v1.ListMyViolationsResponse], error)
 }
 
 // NewHandicapServiceClient constructs a client for the hestia.activity.v1.HandicapService service.
@@ -126,6 +138,12 @@ func NewHandicapServiceClient(httpClient connect.HTTPClient, baseURL string, opt
 			connect.WithSchema(handicapServiceMethods.ByName("GetMatchHandicaps")),
 			connect.WithClientOptions(opts...),
 		),
+		listMyViolations: connect.NewClient[v1.ListMyViolationsRequest, v1.ListMyViolationsResponse](
+			httpClient,
+			baseURL+HandicapServiceListMyViolationsProcedure,
+			connect.WithSchema(handicapServiceMethods.ByName("ListMyViolations")),
+			connect.WithClientOptions(opts...),
+		),
 	}
 }
 
@@ -136,6 +154,7 @@ type handicapServiceClient struct {
 	_select           *connect.Client[v1.SelectRequest, v1.SelectResponse]
 	voidSelection     *connect.Client[v1.VoidSelectionRequest, v1.VoidSelectionResponse]
 	getMatchHandicaps *connect.Client[v1.GetMatchHandicapsRequest, v1.GetMatchHandicapsResponse]
+	listMyViolations  *connect.Client[v1.ListMyViolationsRequest, v1.ListMyViolationsResponse]
 }
 
 // ListItems calls hestia.activity.v1.HandicapService.ListItems.
@@ -163,6 +182,11 @@ func (c *handicapServiceClient) GetMatchHandicaps(ctx context.Context, req *conn
 	return c.getMatchHandicaps.CallUnary(ctx, req)
 }
 
+// ListMyViolations calls hestia.activity.v1.HandicapService.ListMyViolations.
+func (c *handicapServiceClient) ListMyViolations(ctx context.Context, req *connect.Request[v1.ListMyViolationsRequest]) (*connect.Response[v1.ListMyViolationsResponse], error) {
+	return c.listMyViolations.CallUnary(ctx, req)
+}
+
 // HandicapServiceHandler is an implementation of the hestia.activity.v1.HandicapService service.
 type HandicapServiceHandler interface {
 	// 列出本屆所有可購買的讓武項目(六大類)。
@@ -175,6 +199,9 @@ type HandicapServiceHandler interface {
 	VoidSelection(context.Context, *connect.Request[v1.VoidSelectionRequest]) (*connect.Response[v1.VoidSelectionResponse], error)
 	// 取得某場的讓武全貌。封盤後匿名可讀;封盤前只回請求者自己的。
 	GetMatchHandicaps(context.Context, *connect.Request[v1.GetMatchHandicapsRequest]) (*connect.Response[v1.GetMatchHandicapsResponse], error)
+	// 列出我在某場被記的違規(schemas/27):被判負的人有權知道為什麼。
+	// 只回本人的 —— 對手的違規不在這裡,裁判端的 ListViolations 才看得到整場。
+	ListMyViolations(context.Context, *connect.Request[v1.ListMyViolationsRequest]) (*connect.Response[v1.ListMyViolationsResponse], error)
 }
 
 // NewHandicapServiceHandler builds an HTTP handler from the service implementation. It returns the
@@ -214,6 +241,12 @@ func NewHandicapServiceHandler(svc HandicapServiceHandler, opts ...connect.Handl
 		connect.WithSchema(handicapServiceMethods.ByName("GetMatchHandicaps")),
 		connect.WithHandlerOptions(opts...),
 	)
+	handicapServiceListMyViolationsHandler := connect.NewUnaryHandler(
+		HandicapServiceListMyViolationsProcedure,
+		svc.ListMyViolations,
+		connect.WithSchema(handicapServiceMethods.ByName("ListMyViolations")),
+		connect.WithHandlerOptions(opts...),
+	)
 	return "/hestia.activity.v1.HandicapService/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case HandicapServiceListItemsProcedure:
@@ -226,6 +259,8 @@ func NewHandicapServiceHandler(svc HandicapServiceHandler, opts ...connect.Handl
 			handicapServiceVoidSelectionHandler.ServeHTTP(w, r)
 		case HandicapServiceGetMatchHandicapsProcedure:
 			handicapServiceGetMatchHandicapsHandler.ServeHTTP(w, r)
+		case HandicapServiceListMyViolationsProcedure:
+			handicapServiceListMyViolationsHandler.ServeHTTP(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -253,4 +288,8 @@ func (UnimplementedHandicapServiceHandler) VoidSelection(context.Context, *conne
 
 func (UnimplementedHandicapServiceHandler) GetMatchHandicaps(context.Context, *connect.Request[v1.GetMatchHandicapsRequest]) (*connect.Response[v1.GetMatchHandicapsResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("hestia.activity.v1.HandicapService.GetMatchHandicaps is not implemented"))
+}
+
+func (UnimplementedHandicapServiceHandler) ListMyViolations(context.Context, *connect.Request[v1.ListMyViolationsRequest]) (*connect.Response[v1.ListMyViolationsResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("hestia.activity.v1.HandicapService.ListMyViolations is not implemented"))
 }

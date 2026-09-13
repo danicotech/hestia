@@ -86,6 +86,27 @@ enum MatchResultKind {
   MATCH_RESULT_KIND_WALKOVER = 2;
 }
 
+// MatchKind 區分晉級樹上的一場與季軍戰。
+//
+// 季軍戰(schemas/20,grill Q15)不屬於晉級樹:準決賽兩位敗者加打一場,
+// 勝者不晉級。它是一場普通比賽 —— 讓武、下注、設定確認、違規那一整套完全適用。
+enum MatchKind {
+  MATCH_KIND_UNSPECIFIED = 0;
+  MATCH_KIND_BRACKET = 1;
+  MATCH_KIND_THIRD_PLACE = 2;
+}
+
+// ViolationRuling 是裁判對一筆違規的判決。**只是紀錄,不是觸發器**(schemas/27):
+// 判該回合 = 裁判把該回合勝者填成對方;判整場 = 走 FinishRound / ReportResult。
+// 固定值是為了讓賽果公告判斷得出「這一筆要不要寫進公告」(ROUND_LOSS / MATCH_LOSS 才寫)。
+enum ViolationRuling {
+  VIOLATION_RULING_UNSPECIFIED = 0;
+  VIOLATION_RULING_WARNING = 1;
+  VIOLATION_RULING_ROUND_LOSS = 2;
+  VIOLATION_RULING_MATCH_LOSS = 3;
+  VIOLATION_RULING_NONE = 4;
+}
+
 // PlayerStatus 是參賽者在本屆的狀態。
 enum PlayerStatus {
   PLAYER_STATUS_UNSPECIFIED = 0;
@@ -129,6 +150,11 @@ message Tournament {
   // 目前報名人數。人數不設上限,也不假設是 2 的冪次。
   int32 player_count = 6;
   google.protobuf.Timestamp created_at = 7;
+  // 幾局幾勝(config.format.best_of,schemas/28)。1 = 單場定勝負;第一屆是 3。
+  // 前端靠它算「還要贏幾回合」與比分盤的結果數,不要寫死 3。
+  int32 best_of = 8;
+  // 準決賽敗者是否加打季軍戰。
+  bool third_place_match = 9;
 }
 
 // RankInfo 是段位的顯示資料。名稱與境界描述存在 tournaments.config,
@@ -180,8 +206,51 @@ message Match {
   bool handicap_open = 9;
   // 直播連結;空 = 無。對戰表上標 LIVE 的場次可直接點進去。
   string stream_url = 10;
+  // = 第一回合的正式決鬥開始。這一刻同時關下注、啟動第一回合計時;前置過程在它之前。
   optional google.protobuf.Timestamp started_at = 11;
   optional google.protobuf.Timestamp finished_at = 12;
+  MatchKind kind = 13;
+  // 開賽前設定確認(schemas/20):裁判看完整張清單按一次「都確認了」。
+  // 空 = 還沒確認,**不能開打**(伺服器擋,DB 也擋)。
+  optional google.protobuf.Timestamp setup_confirmed_at = 14;
+  // 逐回合結果,依 round_no。回合列在裁判按「正式決鬥開始」時才建,
+  // 所以「還沒開始的回合」不在這裡。三局兩勝可能只有兩筆。
+  repeated MatchRound rounds = 15;
+  // 兩方目前的勝場數(從 rounds 算好給,避免前端各自算出不同答案)。
+  int32 p1_round_wins = 16;
+  int32 p2_round_wins = 17;
+}
+
+// MatchRound 是一個回合。
+//
+// 計時器是衍生值:前端算 now() − started_at,伺服器不存倒數狀態。直播頁與
+// 裁判頁看的是同一個 started_at,不會各算各的(grill Q4)。
+message MatchRound {
+  // 1 起算。
+  int32 round_no = 1;
+  // 正式決鬥開始 = 計時起點。前置過程(讓守關元、讓半血)在它之前,不計入。
+  google.protobuf.Timestamp started_at = 2;
+  optional google.protobuf.Timestamp finished_at = 3;
+  // 空 = 進行中。
+  string winner_player_public_id = 4;
+}
+
+// Violation 是一筆違規紀錄(schemas/27)。只記事實,不自動觸發任何後果。
+message Violation {
+  string public_id = 1;
+  string match_public_id = 2;
+  // 0 = 開賽前(例:設定確認時發現沒改到)。
+  int32 round_no = 3;
+  // 違規者。**可以是任一方**:「雙方使用 46 級武庫」買方自己也可能違規。
+  string player_public_id = 4;
+  string player_display_name = 5;
+  // 違反哪一項;空 = 不對應特定項目(違反通則)。
+  string item_public_id = 6;
+  string item_name = 7;
+  ViolationRuling ruling = 8;
+  // 裁判備註:發生了什麼、為什麼這樣判。必填。
+  string note = 9;
+  google.protobuf.Timestamp created_at = 10;
 }
 
 // BracketRound 是對戰表的一輪。
@@ -216,6 +285,14 @@ message HandicapItem {
   // 需要填寫指定內容的項目(如「指定對手武學」),前端要出一個輸入框。
   bool requires_target_note = 7;
   int32 sort_order = 8;
+  // 穩定識別,如 victory.survive_90s。改名不改 key(schemas/20)。
+  // 前端要對某一項做特別處理(例如計時提示)時用它,不要比對名稱文字。
+  string key = 9;
+  // 此項對施加方同樣生效(目前只有「雙方使用 46 級武庫武學裝備」)。
+  // 選購頁要醒目提示:買方自己也受限。
+  bool applies_to_both = 10;
+  // 「撐過 N 秒即獲勝」的 N;0 = 與時間無關。數字是資料,不是名稱裡的文字。
+  int64 seconds = 11;
 }
 
 // HandicapSelection 是一次已成立的讓武選擇。
@@ -233,6 +310,16 @@ message HandicapSelection {
   // 指定內容:「指定對手武學:XX」「互換的兩個按鍵:X 與 Y」。
   string target_note = 6;
   google.protobuf.Timestamp created_at = 7;
+  // 項目的穩定識別(同 HandicapItem.key)。
+  string item_key = 8;
+  // 系統抽選的結果(隨機武學抽到哪一個、方向鍵打亂成什麼)。
+  // 抽選在**封盤那一刻**做(grill Q13),所以封盤公示是完整的;封盤前恆為空。
+  string draw_result = 9;
+  // 同 HandicapItem.applies_to_both。
+  bool applies_to_both = 10;
+  // 裁判執行說明。**只在 JudgeService 的回應裡有值**(ReviewHandicap / LockHandicap);
+  // 選手端與觀眾端的任何路徑一律空字串。裁判封盤前審清單就要照著它退掉重疊的項目。
+  string referee_note = 11;
 }
 
 // BpBudget 是某人在某場的讓武預算。
@@ -265,5 +352,9 @@ message MatchHandicaps {
   // 受限方(高段位方)。
   string constrained_player_public_id = 5;
   // 封盤時間;空 = 尚未封盤,此時 selections 只會包含請求者自己的。
+  //
+  // 唯一的例外是 JudgeService.ReviewHandicap:裁判在封盤前也拿得到完整內容
+  // (場上要他執行的規則就寫在那些項目裡)。所以**不要拿 locked_at 為空
+  // 去推論「這份內容還是秘密」**—— 它只說明這場封盤了沒有。
   optional google.protobuf.Timestamp locked_at = 6;
 }

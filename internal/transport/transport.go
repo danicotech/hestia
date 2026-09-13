@@ -412,6 +412,24 @@ func verifyProcedureCoverage() error {
 					"platformAuthActivityProcedures 或 privilegedServices 任何一份裡")
 		}
 	}
+	// 需要授權的每一支,都必須在授權映射表裡指名一個權限。
+	//
+	// privilegedServices 用服務前綴,所以管理服務新增的 RPC 自動落在
+	// 「需要授權」那一側 —— 那一步是 fail closed,很好。但它只回答了
+	// 「要不要授權」,沒有回答「要哪個權限」:映射表漏登記時
+	// PermissionFor 回 false,攔截器一律拒絕,結果是這支 RPC 對**合法的**
+	// 管理者/裁判永遠回 PermissionDenied,而線索不會指向 authz.go。
+	//
+	// 同樣是沉默的功能故障,同樣值得在啟動時就炸掉。
+	for procedure := range known {
+		if !requiresAuthorization(procedure) {
+			continue
+		}
+		if _, ok := authz.PermissionFor(procedure); !ok {
+			problems = append(problems,
+				procedure+" 需要授權,但 authz 的映射表沒有指定它要哪個權限")
+		}
+	}
 	// 反過來:清單裡列的 procedure 必須真的存在,否則改了 proto 留下舊字串,
 	// 那一支會落回「沒登記」而沒有人發現。
 	for procedure := range platformAuthActivityProcedures {

@@ -193,3 +193,39 @@ func TestCreateTournamentUnimplementedWithoutCreator(t *testing.T) {
 
 // mustFail 丟掉成功時的回應,只留錯誤 —— 讓拒絕類的斷言能寫成一行。
 func mustFail[T any](_ *connect.Response[T], err error) error { return err }
+
+// 賽制(幾局幾勝、季軍戰)是 09-13 才加進請求的欄位。漏轉它的後果是
+// 「一屆三局兩勝的賽事被開成單場定勝負」而沒有任何錯誤 —— QA 實際抓到過。
+func TestCreateTournamentForwardsFormat(t *testing.T) {
+	deps, creator, _ := createDeps(t)
+	srv := newActivityServer(t, deps)
+	client := activityv1connect.NewJudgeServiceClient(srv.Client(), srv.URL)
+
+	req := createRequest()
+	req.Msg.Format = &activityv1.TournamentFormatSettings{BestOf: 3, ThirdPlaceMatch: true}
+	if _, err := client.CreateTournament(context.Background(), withUser(req, testUserID)); err != nil {
+		t.Fatalf("CreateTournament: %v", err)
+	}
+	got := creator.calls[0].Config
+	if got.BestOf == nil || *got.BestOf != 3 {
+		t.Errorf("best_of = %v,want 3", got.BestOf)
+	}
+	if got.ThirdPlaceMatch == nil || !*got.ThirdPlaceMatch {
+		t.Errorf("third_place_match = %v,want true", got.ThirdPlaceMatch)
+	}
+}
+
+// 沒填賽制 = 用預設(nil),不是 0 / false —— 0 局 0 勝不是一種賽制。
+func TestCreateTournamentFormatAbsentIsDefault(t *testing.T) {
+	deps, creator, _ := createDeps(t)
+	srv := newActivityServer(t, deps)
+	client := activityv1connect.NewJudgeServiceClient(srv.Client(), srv.URL)
+
+	if _, err := client.CreateTournament(context.Background(), withUser(createRequest(), testUserID)); err != nil {
+		t.Fatalf("CreateTournament: %v", err)
+	}
+	got := creator.calls[0].Config
+	if got.BestOf != nil || got.ThirdPlaceMatch != nil {
+		t.Errorf("沒填賽制應為 nil:best_of=%v third=%v", got.BestOf, got.ThirdPlaceMatch)
+	}
+}

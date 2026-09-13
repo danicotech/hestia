@@ -13,7 +13,9 @@ syntax = "proto3";
 // 動平台代幣的 RPC 一律要帶 idempotency_key(平台鐵則)。這裡**刻意沒有**,
 // 因為 BP 不是代幣:每輪依段位差重發、該場有效、賽後作廢、不可交易。
 // 重複扣一次 BP 的後果是使用者看到餘額不對,不是對不上帳 ——
-// 前者可以由裁判在封盤前退掉,後者無法事後修復。
+// 前者可以由選手自己在封盤前退掉(VoidSelection 只認選擇的本人;
+// 裁判代退走 JudgeService.RefundSelection,那條路要裁判權限並進稽核紀錄),
+// 後者無法事後修復。
 //
 // 真正動錢的是 betting.proto 與 judge.proto 的發獎,那兩處才有冪等鍵。
 //
@@ -22,6 +24,10 @@ syntax = "proto3";
 // 封盤前:只有施加者本人看得到自己買了什麼。
 // 封盤後:雙方與觀眾全部看得到,並自動發一則 Discord 公告。
 // 這條界線由伺服器守,不是前端隱藏。
+//
+// 本服務沒有例外。裁判要在封盤前看內容(場上規則要他看)走的是
+// JudgeService.ReviewHandicap —— 那是另一支需要裁判權限的 RPC,
+// 不是在這裡多一個參數。
 package hestia.activity.v1;
 
 import "hestia/activity/v1/common.proto";
@@ -40,6 +46,9 @@ service HandicapService {
   rpc VoidSelection(VoidSelectionRequest) returns (VoidSelectionResponse) {}
   // 取得某場的讓武全貌。封盤後匿名可讀;封盤前只回請求者自己的。
   rpc GetMatchHandicaps(GetMatchHandicapsRequest) returns (GetMatchHandicapsResponse) {}
+  // 列出我在某場被記的違規(schemas/27):被判負的人有權知道為什麼。
+  // 只回本人的 —— 對手的違規不在這裡,裁判端的 ListViolations 才看得到整場。
+  rpc ListMyViolations(ListMyViolationsRequest) returns (ListMyViolationsResponse) {}
 }
 
 message ListItemsRequest {
@@ -97,4 +106,12 @@ message GetMatchHandicapsRequest {
 
 message GetMatchHandicapsResponse {
   MatchHandicaps handicaps = 1;
+}
+
+message ListMyViolationsRequest {
+  string match_public_id = 1;
+}
+
+message ListMyViolationsResponse {
+  repeated Violation violations = 1;
 }

@@ -4,21 +4,33 @@ syntax = "proto3";
 //
 // ── 這個服務的權限與留痕 ────────────────────────────────────────
 //
-// 全部 RPC 需要平台帳號 + 裁判權限,而且**每一支都寫 admin_audit_logs**。
-// 不是挑幾支寫 —— 賽事的公正性完全建立在「誰在什麼時候改了什麼」查得到。
-// 改段位、重抽籤、交換籤位、封盤、判賽果,每一項都有人會不服氣。
+// 全部 RPC 需要平台帳號 + 裁判權限,而且**每一支會動到資料的都寫
+// admin_audit_logs**。不是挑幾支寫 —— 賽事的公正性完全建立在「誰在什麼時候
+// 改了什麼」查得到。改段位、重抽籤、交換籤位、封盤、代退讓武、判賽果,
+// 每一項都有人會不服氣。
+//
+// 純讀取的兩支(ListUnranked、ReviewHandicap)不寫稽核:它們沒有「改了什麼」
+// 可記,而把裁判每一次查看都記成一列,只會讓真正要查的那幾列被淹掉。
 //
 // ── 為什麼賽果只能裁判填 ────────────────────────────────────────
 //
 // 因為有下注。選手自報會直接變成派彩爭議,而派彩一旦發出去就很難收回。
 // 單一權威來源是這裡唯一可行的設計。
 //
-// ── 不可逆的兩個動作 ────────────────────────────────────────────
+// ── 不可逆的動作 ────────────────────────────────────────────────
 //
-//   LockHandicap  封盤後選手不能再改讓武,且立刻公開並發 Discord 公告。
-//   ReportResult  判定勝負會觸發下注結算與派彩。
+//   LockHandicap  封盤後選手不能再改讓武,且立刻公開並發 Discord 公告;
+//                 隨機抽選也在這一刻做完。
+//   FinishRound   填回合勝者;達到勝場數的那一次會定案整場、觸發晉級與派彩。
+//   ReportResult  單場定勝負(best_of = 1)時的同一件事。
 //
-// 兩者都要求 confirm = true 作為二次確認。誤觸的代價由人承擔,不由系統吞掉。
+// 都要求 confirm = true 作為二次確認。誤觸的代價由人承擔,不由系統吞掉。
+//
+// ── 多回合制的裁判動線(schemas/20「裁判動線」)──────────────────
+//
+//   一場一次:開盤 → 封盤前檢視/代退 → 封盤 → ReviewSetup → ConfirmSetup
+//   每回合一次:StartRound(第 1 回合 = 正式開打,關下注)→ FinishRound
+//   一場一次:整場勝者由回合推導 → 晉級 / 派彩 / 季軍戰
 package hestia.activity.v1;
 
 import "hestia/activity/v1/common.proto";
@@ -51,15 +63,31 @@ service JudgeService {
 
   // 開盤:讓該場的低段位方可以開始選讓武。
   rpc OpenHandicap(OpenHandicapRequest) returns (OpenHandicapResponse) {}
+  // 檢視一場的讓武內容,**不受封盤前的揭露限制**。
+  rpc ReviewHandicap(ReviewHandicapRequest) returns (ReviewHandicapResponse) {}
+  // 退掉某一筆讓武選擇,BP 退回該場預算。**封盤後不可**。
+  rpc RefundSelection(RefundSelectionRequest) returns (RefundSelectionResponse) {}
   // 封盤:選手不能再改,內容立刻公開並發 Discord 公告。**不可逆**。
   rpc LockHandicap(LockHandicapRequest) returns (LockHandicapResponse) {}
 
   // 設定直播連結。
   rpc SetStreamUrl(SetStreamUrlRequest) returns (SetStreamUrlResponse) {}
-  // 標記開打(關閉下注)。
-  rpc StartMatch(StartMatchRequest) returns (StartMatchResponse) {}
-  // 判定勝負。觸發晉級與下注結算。**不可逆**。
+
+  // 開賽前設定確認清單(該場每筆讓武的執行說明 + 抽選結果)與目前回合狀態。純讀取。
+  rpc ReviewSetup(ReviewSetupRequest) returns (ReviewSetupResponse) {}
+  // 裁判確認開賽前設定都做了。**確認完才能開打**(伺服器擋,DB 也擋)。整體一次確認,不逐項。
+  rpc ConfirmSetup(ConfirmSetupRequest) returns (ConfirmSetupResponse) {}
+  // 開始下一個回合。第 1 回合 = 正式開打:同時關閉下注、啟動計時。
+  rpc StartRound(StartRoundRequest) returns (StartRoundResponse) {}
+  // 結束一個回合並填勝者。達到勝場數即整場定案,觸發晉級與派彩。**不可逆**。
+  rpc FinishRound(FinishRoundRequest) returns (FinishRoundResponse) {}
+  // 判定勝負(**只在 best_of = 1 時可用**;多回合制用 FinishRound)。**不可逆**。
   rpc ReportResult(ReportResultRequest) returns (ReportResultResponse) {}
+
+  // 記一筆違規。只記事實與裁判的判決,**不觸發任何後果**(schemas/27)。
+  rpc RecordViolation(RecordViolationRequest) returns (RecordViolationResponse) {}
+  // 列出一場的違規紀錄。純讀取。
+  rpc ListViolations(ListViolationsRequest) returns (ListViolationsResponse) {}
 
   // 選手棄賽。對手不戰而勝,該場所有注單作廢退款。
   rpc WithdrawPlayer(WithdrawPlayerRequest) returns (WithdrawPlayerResponse) {}
@@ -100,8 +128,8 @@ message TournamentOddsSettings {
 message TournamentPrizeSettings {
   int64 champion = 1;
   int64 runner_up = 2;
-  // 單淘汰沒有季軍賽,季軍推不出來。**填 0 以外的值會在發獎時被拒絕**,
-  // 那是刻意的 —— 不是 bug。
+  // 季軍。只有 format.third_place_match = true 的賽事才推得出季軍(季軍戰的勝者);
+  // 沒打季軍戰卻填了金額,發獎時會被拒絕 —— 那是刻意的,不是 bug。
   int64 third = 3;
   // 參加獎,發給每一位報名並綁定平台帳號的選手。
   int64 participation = 4;
@@ -139,6 +167,16 @@ message CreateTournamentRequest {
   TournamentPrizeSettings prizes = 7;
   // 單一讓武項目的重複購買上限。**0 = 不限制**,這是目前的定案值。
   int32 handicap_item_max_qty = 8;
+  // 賽制。整包留空 = 單場定勝負、無季軍戰。
+  TournamentFormatSettings format = 9;
+}
+
+// TournamentFormatSettings 是賽制(schemas/28 的 config.format)。
+message TournamentFormatSettings {
+  // 幾局幾勝,必須是正奇數。0 = 預設 1(單場定勝負)。第一屆是 3。
+  int32 best_of = 1;
+  // 準決賽敗者是否加打季軍戰。
+  bool third_place_match = 2;
 }
 
 message CreateTournamentResponse {
@@ -245,6 +283,62 @@ message OpenHandicapResponse {
   Match match = 1;
 }
 
+// ReviewHandicapRequest 是裁判檢視一場的讓武內容。
+//
+// 為什麼需要一支**裁判專用**的檢視:HandicapService.GetMatchHandicaps 在封盤前
+// 只對施加者本人揭露內容,而裁判不是場上的選手 —— 他走那支拿到的永遠是空清單。
+// 但要裁判執行的規則就寫在買下的項目裡(「禁用奇術」的 referee_note 要求裁判
+// 確認後返還另一項的 BP),看不到內容等於那些規則沒有人執行得了。
+//
+// 這支**不**把內容變成公開:揭露界線只對這條需要裁判權限的路徑讓開,
+// 選手與觀眾走的仍是原來那支,行為一字未改。
+message ReviewHandicapRequest {
+  string match_public_id = 1;
+}
+
+message ReviewHandicapResponse {
+  // 形狀與 GetMatchHandicaps 完全相同(同一個 message 型別)——
+  // 裁判端與選手端顯示的是同一份東西,差別只在封盤前看不看得到。
+  //
+  // 注意 locked_at 為空時仍可能有 selections:那正是這支 RPC 的用途。
+  MatchHandicaps handicaps = 1;
+}
+
+// RefundSelectionRequest 是裁判退掉某一筆讓武選擇。
+//
+// # 為什麼需要它
+//
+// 目錄裡的規則自己要求:「禁用奇術」的 referee_note 寫著「對手全場無法使用任何
+// 奇術,若同時買了禁用任意奇術,將經裁判確認後返還禁用任意奇術的 BP」。
+// 選手自助的 HandicapService.VoidSelection 只認選擇的本人,裁判走不了那條路。
+//
+// # 沒有 idempotency_key
+//
+// BP 不是平台代幣(每輪依段位差重發、該場有效、賽後作廢、不可交易),
+// 退點只是標 voided + 改 spent,不經帳本。重複呼叫由「已經退過」擋下來,
+// 不是靠冪等鍵去重 —— 真正動錢的 AwardPrizes 與 PlaceBet 才有那把鍵。
+//
+// # 沒有 confirm
+//
+// 退點不是不可逆:封盤前選手能拿退回來的 BP 重買同一項。
+// 二次確認由必填的 reason 承擔 —— 要打字的動作不會誤觸。
+message RefundSelectionRequest {
+  string selection_public_id = 1;
+  // 為什麼退。**必填**,進稽核紀錄。
+  //
+  // 這一步拿走的是選手已經買到手的東西,而它唯一的正當理由來自目錄裡的規則。
+  // 不寫理由的退點,事後沒有人分得出「依規則返還」與「把不喜歡的項目刪掉」。
+  string reason = 2;
+}
+
+message RefundSelectionResponse {
+  // 退款後的預算,BP 已經回到裡面。
+  BpBudget budget = 1;
+  // 被退掉的那一筆。回傳它是為了讓裁判端能當場確認「退掉的確實是那一項」——
+  // 請求只帶 public_id,而裁判要核對的是項目名稱與 BP。
+  HandicapSelection selection = 2;
+}
+
 message LockHandicapRequest {
   string match_public_id = 1;
   // 二次確認。**不可逆**:封盤後選手不能再改,內容立刻公開並發公告。
@@ -267,14 +361,101 @@ message SetStreamUrlResponse {
   Match match = 1;
 }
 
-message StartMatchRequest {
+// SetupChecklistEntry 是開賽前設定確認清單的一列。
+//
+// 清單是**推導值**(該場未作廢的讓武選擇 JOIN 項目的執行說明 + 抽選結果),
+// 伺服器不另存一份;所以 referee_note 的文字本身就是清單內容 —— 御風羽審定的
+// 那 34 條正是它。只出現在裁判端(執行說明從不離開裁判端)。
+message SetupChecklistEntry {
+  string selection_public_id = 1;
+  string item_key = 2;
+  string item_name = 3;
+  // 給裁判看的執行說明:怎麼確認對手真的遵守了。
+  string referee_note = 4;
+  // 選手填的指定內容(要改到哪個鍵位、指定哪個武學)。
+  string target_note = 5;
+  // 系統抽選的結果;空 = 這一項不需要抽。
+  string draw_result = 6;
+  // 此項對施加方同樣生效,裁判要看兩邊。
+  bool applies_to_both = 7;
+}
+
+message ReviewSetupRequest {
   string match_public_id = 1;
 }
 
-message StartMatchResponse {
+message ReviewSetupResponse {
+  Match match = 1;
+  repeated SetupChecklistEntry checklist = 2;
+  // 已記錄的違規(含開賽前的)。
+  repeated Violation violations = 3;
+}
+
+message ConfirmSetupRequest {
+  string match_public_id = 1;
+}
+
+message ConfirmSetupResponse {
   Match match = 1;
 }
 
+message StartRoundRequest {
+  string match_public_id = 1;
+}
+
+message StartRoundResponse {
+  Match match = 1;
+  // 剛開始的那個回合(started_at 就是計時起點)。
+  MatchRound round = 2;
+}
+
+message FinishRoundRequest {
+  string match_public_id = 1;
+  int32 round_no = 2;
+  string winner_player_public_id = 3;
+  // 二次確認。填的是回合勝者,但達到勝場數的那一次會定案整場、觸發晉級與派彩。
+  bool confirm = 4;
+  // 備註。爭議回合的裁決理由寫這裡,進稽核紀錄。
+  string note = 5;
+}
+
+message FinishRoundResponse {
+  Match match = 1;
+  MatchRound round = 2;
+  // true = 這一回合讓整場定案(winner_player_public_id 已填、派彩已觸發)。
+  bool match_decided = 3;
+  // 定案後下一輪因此成形的場次;含新建的季軍戰(kind = THIRD_PLACE)。
+  repeated Match advanced_matches = 4;
+}
+
+message RecordViolationRequest {
+  string match_public_id = 1;
+  // 0 = 開賽前。
+  int32 round_no = 2;
+  // 違規者,可以是任一方。
+  string player_public_id = 3;
+  // 違反哪一項;空 = 違反通則。
+  string item_public_id = 4;
+  ViolationRuling ruling = 5;
+  // 必填:發生了什麼、為什麼這樣判。沒有理由的紀錄事後分不出「依規則」與「裁判不喜歡」。
+  string note = 6;
+}
+
+message RecordViolationResponse {
+  Violation violation = 1;
+}
+
+message ListViolationsRequest {
+  string match_public_id = 1;
+}
+
+message ListViolationsResponse {
+  repeated Violation violations = 1;
+}
+
+// ReportResultRequest 判定勝負。**只在 best_of = 1 時可用**:等價於「開始第 1 回合 →
+// 以該勝者結束第 1 回合」。多回合制回 FAILED_PRECONDITION,裁判要用 FinishRound ——
+// 整場勝者是回合推導出來的,不接受直接指定。
 message ReportResultRequest {
   string match_public_id = 1;
   string winner_player_public_id = 2;

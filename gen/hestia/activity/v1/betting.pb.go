@@ -9,13 +9,25 @@
 // ── 為什麼是投票驅動而不是彩池 ──────────────────────────────────
 //
 // 彩池做不了串關:彩池的賠率要等封盤後才算得出來,而串關必須在下注當下就
-// 知道每一腿的賠率才能乘起來。所以改成投票推導隱含機率:
+// 知道每一腿的賠率才能乘起來。所以改成投票推導隱含機率(n 路,schemas/21):
 //
-//   隱含機率 = (該方票數 + SMOOTHING) / (總票數 + 2×SMOOTHING)
-//   賠率     = (1 − VIG) / 隱含機率,夾在 [MIN_ODDS, MAX_ODDS]
+//   p_i    = (票_i + SMOOTHING) / (總票數 + n×SMOOTHING)     n = 該盤口的結果數
+//   賠率_i = (1 − VIG) / p_i,夾在 [MIN_ODDS, MAX_ODDS]
+//
+// 這是標準運彩邏輯:Σp_i = 1,Σ(1/賠率_i) = 1/(1−VIG) —— 那多出來的就是抽水。
+// 兩路(勝負)是 n=2 的特例;比分盤(三局兩勝)是 n=4。
 //
 // **賠率在下注當下鎖定**寫進注單。之後票數再怎麼跑都不影響已成立的注單,
 // 派彩也直接發下注當下算定的金額 —— 選手看到的「可能贏得 X」必須等於實際入帳。
+//
+// ── 盤口(2026-09-13)──────────────────────────────────────────
+//
+// 一場比賽有多個盤口:整場勝敗、單回合勝敗、時長、比分。哪些存在由該屆的
+// 規則設定決定(schemas/28),場次開盤時建。每個盤口各自投票、各自結算。
+//
+// **串關的各腿必須落在不同場次**(同一場只能一腿):押「A 贏整場」+「比分 2:0」
+// 是同一件事押兩次,賠率卻相乘 —— 沒有莊家在對面收錢,超額派彩直接從代幣供給出。
+// 跨場串不同盤口完全可以:第 1 場押時長 + 第 2 場押比分 + 第 3 場押勝負。
 //
 // ── 這裡全部是真錢 ──────────────────────────────────────────────
 //
@@ -164,28 +176,323 @@ func (LegResult) EnumDescriptor() ([]byte, []int) {
 	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{1}
 }
 
-// MatchOdds 是一場比賽的即時賠率。
+// MarketKind 是盤口的種類。結算邏輯每種一個,在伺服器裡;哪些盤口存在是資料。
+type MarketKind int32
+
+const (
+	MarketKind_MARKET_KIND_UNSPECIFIED MarketKind = 0
+	// 整場(系列賽)勝敗。結果:p1 / p2。
+	MarketKind_MARKET_KIND_MATCH_WINNER MarketKind = 1
+	// 單一回合的勝敗,每回合一個盤口。結果:p1 / p2。
+	MarketKind_MARKET_KIND_ROUND_WINNER MarketKind = 2
+	// 該回合時長 vs 線(line_seconds),每回合一個盤口。結果:over / under;**等於線算 over**。
+	MarketKind_MARKET_KIND_DURATION MarketKind = 3
+	// 回合比數。結果由幾局幾勝推導:三局兩勝是 p1_2_0 / p1_2_1 / p2_2_1 / p2_2_0。
+	MarketKind_MARKET_KIND_SCORE MarketKind = 4
+)
+
+// Enum value maps for MarketKind.
+var (
+	MarketKind_name = map[int32]string{
+		0: "MARKET_KIND_UNSPECIFIED",
+		1: "MARKET_KIND_MATCH_WINNER",
+		2: "MARKET_KIND_ROUND_WINNER",
+		3: "MARKET_KIND_DURATION",
+		4: "MARKET_KIND_SCORE",
+	}
+	MarketKind_value = map[string]int32{
+		"MARKET_KIND_UNSPECIFIED":  0,
+		"MARKET_KIND_MATCH_WINNER": 1,
+		"MARKET_KIND_ROUND_WINNER": 2,
+		"MARKET_KIND_DURATION":     3,
+		"MARKET_KIND_SCORE":        4,
+	}
+)
+
+func (x MarketKind) Enum() *MarketKind {
+	p := new(MarketKind)
+	*p = x
+	return p
+}
+
+func (x MarketKind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (MarketKind) Descriptor() protoreflect.EnumDescriptor {
+	return file_hestia_activity_v1_betting_proto_enumTypes[2].Descriptor()
+}
+
+func (MarketKind) Type() protoreflect.EnumType {
+	return &file_hestia_activity_v1_betting_proto_enumTypes[2]
+}
+
+func (x MarketKind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use MarketKind.Descriptor instead.
+func (MarketKind) EnumDescriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{2}
+}
+
+// MarketStatus 是盤口狀態。
+type MarketStatus int32
+
+const (
+	MarketStatus_MARKET_STATUS_UNSPECIFIED MarketStatus = 0
+	MarketStatus_MARKET_STATUS_OPEN        MarketStatus = 1
+	// 已關盤(第一回合正式開打),等結算。
+	MarketStatus_MARKET_STATUS_CLOSED  MarketStatus = 2
+	MarketStatus_MARKET_STATUS_SETTLED MarketStatus = 3
+	// 作廢退款:沒打到的回合(三局兩勝 2:0 結束就沒有第三回合)、或棄賽。
+	MarketStatus_MARKET_STATUS_VOID MarketStatus = 4
+)
+
+// Enum value maps for MarketStatus.
+var (
+	MarketStatus_name = map[int32]string{
+		0: "MARKET_STATUS_UNSPECIFIED",
+		1: "MARKET_STATUS_OPEN",
+		2: "MARKET_STATUS_CLOSED",
+		3: "MARKET_STATUS_SETTLED",
+		4: "MARKET_STATUS_VOID",
+	}
+	MarketStatus_value = map[string]int32{
+		"MARKET_STATUS_UNSPECIFIED": 0,
+		"MARKET_STATUS_OPEN":        1,
+		"MARKET_STATUS_CLOSED":      2,
+		"MARKET_STATUS_SETTLED":     3,
+		"MARKET_STATUS_VOID":        4,
+	}
+)
+
+func (x MarketStatus) Enum() *MarketStatus {
+	p := new(MarketStatus)
+	*p = x
+	return p
+}
+
+func (x MarketStatus) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (MarketStatus) Descriptor() protoreflect.EnumDescriptor {
+	return file_hestia_activity_v1_betting_proto_enumTypes[3].Descriptor()
+}
+
+func (MarketStatus) Type() protoreflect.EnumType {
+	return &file_hestia_activity_v1_betting_proto_enumTypes[3]
+}
+
+func (x MarketStatus) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use MarketStatus.Descriptor instead.
+func (MarketStatus) EnumDescriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{3}
+}
+
+// OutcomeOdds 是一個盤口裡一個結果的票數與賠率。
+type OutcomeOdds struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 結果代碼(p1 / p2 / over / under / p1_2_0 …)。下注與投票都用它。
+	Outcome string `protobuf:"bytes,1,opt,name=outcome,proto3" json:"outcome,omitempty"`
+	// 顯示用的名稱,伺服器組好:選手名、「超過 90 秒」、「2:0」。前端不要自己拼。
+	Label string `protobuf:"bytes,2,opt,name=label,proto3" json:"label,omitempty"`
+	Votes int32  `protobuf:"varint,3,opt,name=votes,proto3" json:"votes,omitempty"`
+	// 賠率 ×1000 的整數(1.43 → 1430)。
+	// 浮點數在這裡是禁止的:賠率會參與串關的連乘,誤差會直接乘進派彩金額。
+	OddsMilli     int64 `protobuf:"varint,4,opt,name=odds_milli,json=oddsMilli,proto3" json:"odds_milli,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *OutcomeOdds) Reset() {
+	*x = OutcomeOdds{}
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[0]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *OutcomeOdds) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*OutcomeOdds) ProtoMessage() {}
+
+func (x *OutcomeOdds) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[0]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use OutcomeOdds.ProtoReflect.Descriptor instead.
+func (*OutcomeOdds) Descriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *OutcomeOdds) GetOutcome() string {
+	if x != nil {
+		return x.Outcome
+	}
+	return ""
+}
+
+func (x *OutcomeOdds) GetLabel() string {
+	if x != nil {
+		return x.Label
+	}
+	return ""
+}
+
+func (x *OutcomeOdds) GetVotes() int32 {
+	if x != nil {
+		return x.Votes
+	}
+	return 0
+}
+
+func (x *OutcomeOdds) GetOddsMilli() int64 {
+	if x != nil {
+		return x.OddsMilli
+	}
+	return 0
+}
+
+// MarketOdds 是一個盤口的即時賠率。
+type MarketOdds struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	MarketPublicId string                 `protobuf:"bytes,1,opt,name=market_public_id,json=marketPublicId,proto3" json:"market_public_id,omitempty"`
+	MatchPublicId  string                 `protobuf:"bytes,2,opt,name=match_public_id,json=matchPublicId,proto3" json:"match_public_id,omitempty"`
+	Kind           MarketKind             `protobuf:"varint,3,opt,name=kind,proto3,enum=hestia.activity.v1.MarketKind" json:"kind,omitempty"`
+	// ROUND_WINNER / DURATION 才有;其餘 0。
+	RoundNo int32 `protobuf:"varint,4,opt,name=round_no,json=roundNo,proto3" json:"round_no,omitempty"`
+	// DURATION 才有;其餘 0。
+	LineSeconds int64          `protobuf:"varint,5,opt,name=line_seconds,json=lineSeconds,proto3" json:"line_seconds,omitempty"`
+	Status      MarketStatus   `protobuf:"varint,6,opt,name=status,proto3,enum=hestia.activity.v1.MarketStatus" json:"status,omitempty"`
+	Outcomes    []*OutcomeOdds `protobuf:"bytes,7,rep,name=outcomes,proto3" json:"outcomes,omitempty"`
+	// 現在能不能下注(status = OPEN)。
+	OpenForBets bool `protobuf:"varint,8,opt,name=open_for_bets,json=openForBets,proto3" json:"open_for_bets,omitempty"`
+	// 我投了哪個結果;空 = 還沒投或未登入。
+	// 只回自己的 —— 別人投給誰永遠不會出現在任何回應裡。
+	MyVote        string `protobuf:"bytes,9,opt,name=my_vote,json=myVote,proto3" json:"my_vote,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MarketOdds) Reset() {
+	*x = MarketOdds{}
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MarketOdds) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MarketOdds) ProtoMessage() {}
+
+func (x *MarketOdds) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MarketOdds.ProtoReflect.Descriptor instead.
+func (*MarketOdds) Descriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *MarketOdds) GetMarketPublicId() string {
+	if x != nil {
+		return x.MarketPublicId
+	}
+	return ""
+}
+
+func (x *MarketOdds) GetMatchPublicId() string {
+	if x != nil {
+		return x.MatchPublicId
+	}
+	return ""
+}
+
+func (x *MarketOdds) GetKind() MarketKind {
+	if x != nil {
+		return x.Kind
+	}
+	return MarketKind_MARKET_KIND_UNSPECIFIED
+}
+
+func (x *MarketOdds) GetRoundNo() int32 {
+	if x != nil {
+		return x.RoundNo
+	}
+	return 0
+}
+
+func (x *MarketOdds) GetLineSeconds() int64 {
+	if x != nil {
+		return x.LineSeconds
+	}
+	return 0
+}
+
+func (x *MarketOdds) GetStatus() MarketStatus {
+	if x != nil {
+		return x.Status
+	}
+	return MarketStatus_MARKET_STATUS_UNSPECIFIED
+}
+
+func (x *MarketOdds) GetOutcomes() []*OutcomeOdds {
+	if x != nil {
+		return x.Outcomes
+	}
+	return nil
+}
+
+func (x *MarketOdds) GetOpenForBets() bool {
+	if x != nil {
+		return x.OpenForBets
+	}
+	return false
+}
+
+func (x *MarketOdds) GetMyVote() string {
+	if x != nil {
+		return x.MyVote
+	}
+	return ""
+}
+
+// MatchOdds 是一場比賽全部盤口的即時賠率。
 type MatchOdds struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	MatchPublicId string                 `protobuf:"bytes,1,opt,name=match_public_id,json=matchPublicId,proto3" json:"match_public_id,omitempty"`
-	P1Votes       int32                  `protobuf:"varint,2,opt,name=p1_votes,json=p1Votes,proto3" json:"p1_votes,omitempty"`
-	P2Votes       int32                  `protobuf:"varint,3,opt,name=p2_votes,json=p2Votes,proto3" json:"p2_votes,omitempty"`
-	// 賠率 ×1000 的整數(1.43 → 1430)。
-	// 浮點數在這裡是禁止的:賠率會參與串關的連乘,誤差會直接乘進派彩金額。
-	P1OddsMilli int64 `protobuf:"varint,4,opt,name=p1_odds_milli,json=p1OddsMilli,proto3" json:"p1_odds_milli,omitempty"`
-	P2OddsMilli int64 `protobuf:"varint,5,opt,name=p2_odds_milli,json=p2OddsMilli,proto3" json:"p2_odds_milli,omitempty"`
-	// 現在能不能下注。READY 與 LOCKED 可以,LIVE 之後不行。
-	OpenForBets bool `protobuf:"varint,6,opt,name=open_for_bets,json=openForBets,proto3" json:"open_for_bets,omitempty"`
-	// 我投給了哪一方(1 或 2);0 = 還沒投或未登入。
-	// 只回自己的 —— 別人投給誰永遠不會出現在任何回應裡。
-	MyVote        int32 `protobuf:"varint,7,opt,name=my_vote,json=myVote,proto3" json:"my_vote,omitempty"`
+	Markets       []*MarketOdds          `protobuf:"bytes,2,rep,name=markets,proto3" json:"markets,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *MatchOdds) Reset() {
 	*x = MatchOdds{}
-	mi := &file_hestia_activity_v1_betting_proto_msgTypes[0]
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -197,7 +504,7 @@ func (x *MatchOdds) String() string {
 func (*MatchOdds) ProtoMessage() {}
 
 func (x *MatchOdds) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_betting_proto_msgTypes[0]
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -210,7 +517,7 @@ func (x *MatchOdds) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MatchOdds.ProtoReflect.Descriptor instead.
 func (*MatchOdds) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{0}
+	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *MatchOdds) GetMatchPublicId() string {
@@ -220,60 +527,25 @@ func (x *MatchOdds) GetMatchPublicId() string {
 	return ""
 }
 
-func (x *MatchOdds) GetP1Votes() int32 {
+func (x *MatchOdds) GetMarkets() []*MarketOdds {
 	if x != nil {
-		return x.P1Votes
+		return x.Markets
 	}
-	return 0
-}
-
-func (x *MatchOdds) GetP2Votes() int32 {
-	if x != nil {
-		return x.P2Votes
-	}
-	return 0
-}
-
-func (x *MatchOdds) GetP1OddsMilli() int64 {
-	if x != nil {
-		return x.P1OddsMilli
-	}
-	return 0
-}
-
-func (x *MatchOdds) GetP2OddsMilli() int64 {
-	if x != nil {
-		return x.P2OddsMilli
-	}
-	return 0
-}
-
-func (x *MatchOdds) GetOpenForBets() bool {
-	if x != nil {
-		return x.OpenForBets
-	}
-	return false
-}
-
-func (x *MatchOdds) GetMyVote() int32 {
-	if x != nil {
-		return x.MyVote
-	}
-	return 0
+	return nil
 }
 
 type VoteRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	MatchPublicId string                 `protobuf:"bytes,1,opt,name=match_public_id,json=matchPublicId,proto3" json:"match_public_id,omitempty"`
-	// 1 = p1,2 = p2。
-	Side          int32 `protobuf:"varint,2,opt,name=side,proto3" json:"side,omitempty"`
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	MarketPublicId string                 `protobuf:"bytes,1,opt,name=market_public_id,json=marketPublicId,proto3" json:"market_public_id,omitempty"`
+	// 該盤口的結果代碼。
+	Outcome       string `protobuf:"bytes,2,opt,name=outcome,proto3" json:"outcome,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *VoteRequest) Reset() {
 	*x = VoteRequest{}
-	mi := &file_hestia_activity_v1_betting_proto_msgTypes[1]
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -285,7 +557,7 @@ func (x *VoteRequest) String() string {
 func (*VoteRequest) ProtoMessage() {}
 
 func (x *VoteRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_betting_proto_msgTypes[1]
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -298,34 +570,34 @@ func (x *VoteRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VoteRequest.ProtoReflect.Descriptor instead.
 func (*VoteRequest) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{1}
+	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{3}
 }
 
-func (x *VoteRequest) GetMatchPublicId() string {
+func (x *VoteRequest) GetMarketPublicId() string {
 	if x != nil {
-		return x.MatchPublicId
+		return x.MarketPublicId
 	}
 	return ""
 }
 
-func (x *VoteRequest) GetSide() int32 {
+func (x *VoteRequest) GetOutcome() string {
 	if x != nil {
-		return x.Side
+		return x.Outcome
 	}
-	return 0
+	return ""
 }
 
 type VoteResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// 投完後的即時賠率。票數變了賠率就會變,所以一併回。
-	Odds          *MatchOdds `protobuf:"bytes,1,opt,name=odds,proto3" json:"odds,omitempty"`
+	// 投完後該盤口的即時賠率。票數變了賠率就會變,所以一併回。
+	Odds          *MarketOdds `protobuf:"bytes,1,opt,name=odds,proto3" json:"odds,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *VoteResponse) Reset() {
 	*x = VoteResponse{}
-	mi := &file_hestia_activity_v1_betting_proto_msgTypes[2]
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -337,7 +609,7 @@ func (x *VoteResponse) String() string {
 func (*VoteResponse) ProtoMessage() {}
 
 func (x *VoteResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_betting_proto_msgTypes[2]
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -350,10 +622,10 @@ func (x *VoteResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use VoteResponse.ProtoReflect.Descriptor instead.
 func (*VoteResponse) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{2}
+	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{4}
 }
 
-func (x *VoteResponse) GetOdds() *MatchOdds {
+func (x *VoteResponse) GetOdds() *MarketOdds {
 	if x != nil {
 		return x.Odds
 	}
@@ -370,7 +642,7 @@ type GetOddsRequest struct {
 
 func (x *GetOddsRequest) Reset() {
 	*x = GetOddsRequest{}
-	mi := &file_hestia_activity_v1_betting_proto_msgTypes[3]
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -382,7 +654,7 @@ func (x *GetOddsRequest) String() string {
 func (*GetOddsRequest) ProtoMessage() {}
 
 func (x *GetOddsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_betting_proto_msgTypes[3]
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -395,7 +667,7 @@ func (x *GetOddsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetOddsRequest.ProtoReflect.Descriptor instead.
 func (*GetOddsRequest) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{3}
+	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *GetOddsRequest) GetMatchPublicIds() []string {
@@ -414,7 +686,7 @@ type GetOddsResponse struct {
 
 func (x *GetOddsResponse) Reset() {
 	*x = GetOddsResponse{}
-	mi := &file_hestia_activity_v1_betting_proto_msgTypes[4]
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -426,7 +698,7 @@ func (x *GetOddsResponse) String() string {
 func (*GetOddsResponse) ProtoMessage() {}
 
 func (x *GetOddsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_betting_proto_msgTypes[4]
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -439,7 +711,7 @@ func (x *GetOddsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetOddsResponse.ProtoReflect.Descriptor instead.
 func (*GetOddsResponse) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{4}
+	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *GetOddsResponse) GetOdds() []*MatchOdds {
@@ -449,19 +721,18 @@ func (x *GetOddsResponse) GetOdds() []*MatchOdds {
 	return nil
 }
 
-// BetLegInput 是要押的一腿。
+// BetLegInput 是要押的一腿:哪個盤口的哪個結果。
 type BetLegInput struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	MatchPublicId string                 `protobuf:"bytes,1,opt,name=match_public_id,json=matchPublicId,proto3" json:"match_public_id,omitempty"`
-	// 1 = p1,2 = p2。
-	Side          int32 `protobuf:"varint,2,opt,name=side,proto3" json:"side,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	MarketPublicId string                 `protobuf:"bytes,1,opt,name=market_public_id,json=marketPublicId,proto3" json:"market_public_id,omitempty"`
+	Outcome        string                 `protobuf:"bytes,2,opt,name=outcome,proto3" json:"outcome,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *BetLegInput) Reset() {
 	*x = BetLegInput{}
-	mi := &file_hestia_activity_v1_betting_proto_msgTypes[5]
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -473,7 +744,7 @@ func (x *BetLegInput) String() string {
 func (*BetLegInput) ProtoMessage() {}
 
 func (x *BetLegInput) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_betting_proto_msgTypes[5]
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -486,21 +757,21 @@ func (x *BetLegInput) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BetLegInput.ProtoReflect.Descriptor instead.
 func (*BetLegInput) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{5}
+	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{7}
 }
 
-func (x *BetLegInput) GetMatchPublicId() string {
+func (x *BetLegInput) GetMarketPublicId() string {
 	if x != nil {
-		return x.MatchPublicId
+		return x.MarketPublicId
 	}
 	return ""
 }
 
-func (x *BetLegInput) GetSide() int32 {
+func (x *BetLegInput) GetOutcome() string {
 	if x != nil {
-		return x.Side
+		return x.Outcome
 	}
-	return 0
+	return ""
 }
 
 type PlaceBetRequest struct {
@@ -508,7 +779,7 @@ type PlaceBetRequest struct {
 	TournamentSlug string                 `protobuf:"bytes,1,opt,name=tournament_slug,json=tournamentSlug,proto3" json:"tournament_slug,omitempty"`
 	// 下注額。同一注單的所有腿共用這一筆本金(串關不是各押各的)。
 	Stake int64 `protobuf:"varint,2,opt,name=stake,proto3" json:"stake,omitempty"`
-	// 一腿 = 單場,多腿 = 串關。同一場不可押兩次(押完 p1 再押 p2 等於穩賺)。
+	// 一腿 = 單場,多腿 = 串關。**同一場只能一腿**(不同盤口也不行,見檔頭)。
 	Legs []*BetLegInput `protobuf:"bytes,3,rep,name=legs,proto3" json:"legs,omitempty"`
 	// 動錢的 RPC 一律要帶。重送同一把鍵回同一張注單,不會重複扣款。
 	IdempotencyKey string `protobuf:"bytes,4,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
@@ -522,7 +793,7 @@ type PlaceBetRequest struct {
 
 func (x *PlaceBetRequest) Reset() {
 	*x = PlaceBetRequest{}
-	mi := &file_hestia_activity_v1_betting_proto_msgTypes[6]
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -534,7 +805,7 @@ func (x *PlaceBetRequest) String() string {
 func (*PlaceBetRequest) ProtoMessage() {}
 
 func (x *PlaceBetRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_betting_proto_msgTypes[6]
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -547,7 +818,7 @@ func (x *PlaceBetRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlaceBetRequest.ProtoReflect.Descriptor instead.
 func (*PlaceBetRequest) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{6}
+	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *PlaceBetRequest) GetTournamentSlug() string {
@@ -605,7 +876,7 @@ type Bet struct {
 
 func (x *Bet) Reset() {
 	*x = Bet{}
-	mi := &file_hestia_activity_v1_betting_proto_msgTypes[7]
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -617,7 +888,7 @@ func (x *Bet) String() string {
 func (*Bet) ProtoMessage() {}
 
 func (x *Bet) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_betting_proto_msgTypes[7]
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -630,7 +901,7 @@ func (x *Bet) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Bet.ProtoReflect.Descriptor instead.
 func (*Bet) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{7}
+	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *Bet) GetPublicId() string {
@@ -694,20 +965,24 @@ type BetLeg struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	MatchPublicId string                 `protobuf:"bytes,1,opt,name=match_public_id,json=matchPublicId,proto3" json:"match_public_id,omitempty"`
 	// 場次描述快照,如「首輪 · 李璃 vs A冷」。避免列注單時還要再查每一場。
-	MatchLabel string `protobuf:"bytes,2,opt,name=match_label,json=matchLabel,proto3" json:"match_label,omitempty"`
-	Side       int32  `protobuf:"varint,3,opt,name=side,proto3" json:"side,omitempty"`
-	// 押的那一方的顯示名快照。
-	SideDisplayName string `protobuf:"bytes,4,opt,name=side_display_name,json=sideDisplayName,proto3" json:"side_display_name,omitempty"`
+	MatchLabel     string     `protobuf:"bytes,2,opt,name=match_label,json=matchLabel,proto3" json:"match_label,omitempty"`
+	MarketPublicId string     `protobuf:"bytes,3,opt,name=market_public_id,json=marketPublicId,proto3" json:"market_public_id,omitempty"`
+	Kind           MarketKind `protobuf:"varint,4,opt,name=kind,proto3,enum=hestia.activity.v1.MarketKind" json:"kind,omitempty"`
+	// ROUND_WINNER / DURATION 才有。
+	RoundNo int32  `protobuf:"varint,5,opt,name=round_no,json=roundNo,proto3" json:"round_no,omitempty"`
+	Outcome string `protobuf:"bytes,6,opt,name=outcome,proto3" json:"outcome,omitempty"`
+	// 押的結果的顯示名快照(選手名、「超過 90 秒」、「2:0」)。
+	OutcomeLabel string `protobuf:"bytes,7,opt,name=outcome_label,json=outcomeLabel,proto3" json:"outcome_label,omitempty"`
 	// 下注當下鎖定的賠率 ×1000。之後票數再跑都不改這個值。
-	OddsMilli     int64     `protobuf:"varint,5,opt,name=odds_milli,json=oddsMilli,proto3" json:"odds_milli,omitempty"`
-	Result        LegResult `protobuf:"varint,6,opt,name=result,proto3,enum=hestia.activity.v1.LegResult" json:"result,omitempty"`
+	OddsMilli     int64     `protobuf:"varint,8,opt,name=odds_milli,json=oddsMilli,proto3" json:"odds_milli,omitempty"`
+	Result        LegResult `protobuf:"varint,9,opt,name=result,proto3,enum=hestia.activity.v1.LegResult" json:"result,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *BetLeg) Reset() {
 	*x = BetLeg{}
-	mi := &file_hestia_activity_v1_betting_proto_msgTypes[8]
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -719,7 +994,7 @@ func (x *BetLeg) String() string {
 func (*BetLeg) ProtoMessage() {}
 
 func (x *BetLeg) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_betting_proto_msgTypes[8]
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -732,7 +1007,7 @@ func (x *BetLeg) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BetLeg.ProtoReflect.Descriptor instead.
 func (*BetLeg) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{8}
+	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *BetLeg) GetMatchPublicId() string {
@@ -749,16 +1024,37 @@ func (x *BetLeg) GetMatchLabel() string {
 	return ""
 }
 
-func (x *BetLeg) GetSide() int32 {
+func (x *BetLeg) GetMarketPublicId() string {
 	if x != nil {
-		return x.Side
+		return x.MarketPublicId
+	}
+	return ""
+}
+
+func (x *BetLeg) GetKind() MarketKind {
+	if x != nil {
+		return x.Kind
+	}
+	return MarketKind_MARKET_KIND_UNSPECIFIED
+}
+
+func (x *BetLeg) GetRoundNo() int32 {
+	if x != nil {
+		return x.RoundNo
 	}
 	return 0
 }
 
-func (x *BetLeg) GetSideDisplayName() string {
+func (x *BetLeg) GetOutcome() string {
 	if x != nil {
-		return x.SideDisplayName
+		return x.Outcome
+	}
+	return ""
+}
+
+func (x *BetLeg) GetOutcomeLabel() string {
+	if x != nil {
+		return x.OutcomeLabel
 	}
 	return ""
 }
@@ -788,7 +1084,7 @@ type PlaceBetResponse struct {
 
 func (x *PlaceBetResponse) Reset() {
 	*x = PlaceBetResponse{}
-	mi := &file_hestia_activity_v1_betting_proto_msgTypes[9]
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -800,7 +1096,7 @@ func (x *PlaceBetResponse) String() string {
 func (*PlaceBetResponse) ProtoMessage() {}
 
 func (x *PlaceBetResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_betting_proto_msgTypes[9]
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -813,7 +1109,7 @@ func (x *PlaceBetResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlaceBetResponse.ProtoReflect.Descriptor instead.
 func (*PlaceBetResponse) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{9}
+	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *PlaceBetResponse) GetBet() *Bet {
@@ -841,7 +1137,7 @@ type ListMyBetsRequest struct {
 
 func (x *ListMyBetsRequest) Reset() {
 	*x = ListMyBetsRequest{}
-	mi := &file_hestia_activity_v1_betting_proto_msgTypes[10]
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -853,7 +1149,7 @@ func (x *ListMyBetsRequest) String() string {
 func (*ListMyBetsRequest) ProtoMessage() {}
 
 func (x *ListMyBetsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_betting_proto_msgTypes[10]
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -866,7 +1162,7 @@ func (x *ListMyBetsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListMyBetsRequest.ProtoReflect.Descriptor instead.
 func (*ListMyBetsRequest) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{10}
+	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *ListMyBetsRequest) GetTournamentSlug() string {
@@ -892,7 +1188,7 @@ type ListMyBetsResponse struct {
 
 func (x *ListMyBetsResponse) Reset() {
 	*x = ListMyBetsResponse{}
-	mi := &file_hestia_activity_v1_betting_proto_msgTypes[11]
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -904,7 +1200,7 @@ func (x *ListMyBetsResponse) String() string {
 func (*ListMyBetsResponse) ProtoMessage() {}
 
 func (x *ListMyBetsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_betting_proto_msgTypes[11]
+	mi := &file_hestia_activity_v1_betting_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -917,7 +1213,7 @@ func (x *ListMyBetsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListMyBetsResponse.ProtoReflect.Descriptor instead.
 func (*ListMyBetsResponse) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{11}
+	return file_hestia_activity_v1_betting_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *ListMyBetsResponse) GetBets() []*Bet {
@@ -931,27 +1227,39 @@ var File_hestia_activity_v1_betting_proto protoreflect.FileDescriptor
 
 const file_hestia_activity_v1_betting_proto_rawDesc = "" +
 	"\n" +
-	" hestia/activity/v1/betting.proto\x12\x12hestia.activity.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xee\x01\n" +
+	" hestia/activity/v1/betting.proto\x12\x12hestia.activity.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"r\n" +
+	"\vOutcomeOdds\x12\x18\n" +
+	"\aoutcome\x18\x01 \x01(\tR\aoutcome\x12\x14\n" +
+	"\x05label\x18\x02 \x01(\tR\x05label\x12\x14\n" +
+	"\x05votes\x18\x03 \x01(\x05R\x05votes\x12\x1d\n" +
+	"\n" +
+	"odds_milli\x18\x04 \x01(\x03R\toddsMilli\"\x84\x03\n" +
+	"\n" +
+	"MarketOdds\x12(\n" +
+	"\x10market_public_id\x18\x01 \x01(\tR\x0emarketPublicId\x12&\n" +
+	"\x0fmatch_public_id\x18\x02 \x01(\tR\rmatchPublicId\x122\n" +
+	"\x04kind\x18\x03 \x01(\x0e2\x1e.hestia.activity.v1.MarketKindR\x04kind\x12\x19\n" +
+	"\bround_no\x18\x04 \x01(\x05R\aroundNo\x12!\n" +
+	"\fline_seconds\x18\x05 \x01(\x03R\vlineSeconds\x128\n" +
+	"\x06status\x18\x06 \x01(\x0e2 .hestia.activity.v1.MarketStatusR\x06status\x12;\n" +
+	"\boutcomes\x18\a \x03(\v2\x1f.hestia.activity.v1.OutcomeOddsR\boutcomes\x12\"\n" +
+	"\ropen_for_bets\x18\b \x01(\bR\vopenForBets\x12\x17\n" +
+	"\amy_vote\x18\t \x01(\tR\x06myVote\"m\n" +
 	"\tMatchOdds\x12&\n" +
-	"\x0fmatch_public_id\x18\x01 \x01(\tR\rmatchPublicId\x12\x19\n" +
-	"\bp1_votes\x18\x02 \x01(\x05R\ap1Votes\x12\x19\n" +
-	"\bp2_votes\x18\x03 \x01(\x05R\ap2Votes\x12\"\n" +
-	"\rp1_odds_milli\x18\x04 \x01(\x03R\vp1OddsMilli\x12\"\n" +
-	"\rp2_odds_milli\x18\x05 \x01(\x03R\vp2OddsMilli\x12\"\n" +
-	"\ropen_for_bets\x18\x06 \x01(\bR\vopenForBets\x12\x17\n" +
-	"\amy_vote\x18\a \x01(\x05R\x06myVote\"I\n" +
-	"\vVoteRequest\x12&\n" +
-	"\x0fmatch_public_id\x18\x01 \x01(\tR\rmatchPublicId\x12\x12\n" +
-	"\x04side\x18\x02 \x01(\x05R\x04side\"A\n" +
-	"\fVoteResponse\x121\n" +
-	"\x04odds\x18\x01 \x01(\v2\x1d.hestia.activity.v1.MatchOddsR\x04odds\":\n" +
+	"\x0fmatch_public_id\x18\x01 \x01(\tR\rmatchPublicId\x128\n" +
+	"\amarkets\x18\x02 \x03(\v2\x1e.hestia.activity.v1.MarketOddsR\amarkets\"Q\n" +
+	"\vVoteRequest\x12(\n" +
+	"\x10market_public_id\x18\x01 \x01(\tR\x0emarketPublicId\x12\x18\n" +
+	"\aoutcome\x18\x02 \x01(\tR\aoutcome\"B\n" +
+	"\fVoteResponse\x122\n" +
+	"\x04odds\x18\x01 \x01(\v2\x1e.hestia.activity.v1.MarketOddsR\x04odds\":\n" +
 	"\x0eGetOddsRequest\x12(\n" +
 	"\x10match_public_ids\x18\x01 \x03(\tR\x0ematchPublicIds\"D\n" +
 	"\x0fGetOddsResponse\x121\n" +
-	"\x04odds\x18\x01 \x03(\v2\x1d.hestia.activity.v1.MatchOddsR\x04odds\"I\n" +
-	"\vBetLegInput\x12&\n" +
-	"\x0fmatch_public_id\x18\x01 \x01(\tR\rmatchPublicId\x12\x12\n" +
-	"\x04side\x18\x02 \x01(\x05R\x04side\"\xd7\x01\n" +
+	"\x04odds\x18\x01 \x03(\v2\x1d.hestia.activity.v1.MatchOddsR\x04odds\"Q\n" +
+	"\vBetLegInput\x12(\n" +
+	"\x10market_public_id\x18\x01 \x01(\tR\x0emarketPublicId\x12\x18\n" +
+	"\aoutcome\x18\x02 \x01(\tR\aoutcome\"\xd7\x01\n" +
 	"\x0fPlaceBetRequest\x12'\n" +
 	"\x0ftournament_slug\x18\x01 \x01(\tR\x0etournamentSlug\x12\x14\n" +
 	"\x05stake\x18\x02 \x01(\x03R\x05stake\x123\n" +
@@ -969,16 +1277,19 @@ const file_hestia_activity_v1_betting_proto_rawDesc = "" +
 	"created_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x12>\n" +
 	"\n" +
 	"settled_at\x18\b \x01(\v2\x1a.google.protobuf.TimestampH\x00R\tsettledAt\x88\x01\x01B\r\n" +
-	"\v_settled_at\"\xe7\x01\n" +
+	"\v_settled_at\"\xdf\x02\n" +
 	"\x06BetLeg\x12&\n" +
 	"\x0fmatch_public_id\x18\x01 \x01(\tR\rmatchPublicId\x12\x1f\n" +
 	"\vmatch_label\x18\x02 \x01(\tR\n" +
-	"matchLabel\x12\x12\n" +
-	"\x04side\x18\x03 \x01(\x05R\x04side\x12*\n" +
-	"\x11side_display_name\x18\x04 \x01(\tR\x0fsideDisplayName\x12\x1d\n" +
+	"matchLabel\x12(\n" +
+	"\x10market_public_id\x18\x03 \x01(\tR\x0emarketPublicId\x122\n" +
+	"\x04kind\x18\x04 \x01(\x0e2\x1e.hestia.activity.v1.MarketKindR\x04kind\x12\x19\n" +
+	"\bround_no\x18\x05 \x01(\x05R\aroundNo\x12\x18\n" +
+	"\aoutcome\x18\x06 \x01(\tR\aoutcome\x12#\n" +
+	"\routcome_label\x18\a \x01(\tR\foutcomeLabel\x12\x1d\n" +
 	"\n" +
-	"odds_milli\x18\x05 \x01(\x03R\toddsMilli\x125\n" +
-	"\x06result\x18\x06 \x01(\x0e2\x1d.hestia.activity.v1.LegResultR\x06result\"Y\n" +
+	"odds_milli\x18\b \x01(\x03R\toddsMilli\x125\n" +
+	"\x06result\x18\t \x01(\x0e2\x1d.hestia.activity.v1.LegResultR\x06result\"Y\n" +
 	"\x10PlaceBetResponse\x12)\n" +
 	"\x03bet\x18\x01 \x01(\v2\x17.hestia.activity.v1.BetR\x03bet\x12\x1a\n" +
 	"\breplayed\x18\x02 \x01(\bR\breplayed\"Y\n" +
@@ -998,7 +1309,20 @@ const file_hestia_activity_v1_betting_proto_rawDesc = "" +
 	"\x12LEG_RESULT_PENDING\x10\x01\x12\x12\n" +
 	"\x0eLEG_RESULT_WON\x10\x02\x12\x13\n" +
 	"\x0fLEG_RESULT_LOST\x10\x03\x12\x13\n" +
-	"\x0fLEG_RESULT_VOID\x10\x042\xeb\x02\n" +
+	"\x0fLEG_RESULT_VOID\x10\x04*\x96\x01\n" +
+	"\n" +
+	"MarketKind\x12\x1b\n" +
+	"\x17MARKET_KIND_UNSPECIFIED\x10\x00\x12\x1c\n" +
+	"\x18MARKET_KIND_MATCH_WINNER\x10\x01\x12\x1c\n" +
+	"\x18MARKET_KIND_ROUND_WINNER\x10\x02\x12\x18\n" +
+	"\x14MARKET_KIND_DURATION\x10\x03\x12\x15\n" +
+	"\x11MARKET_KIND_SCORE\x10\x04*\x92\x01\n" +
+	"\fMarketStatus\x12\x1d\n" +
+	"\x19MARKET_STATUS_UNSPECIFIED\x10\x00\x12\x16\n" +
+	"\x12MARKET_STATUS_OPEN\x10\x01\x12\x18\n" +
+	"\x14MARKET_STATUS_CLOSED\x10\x02\x12\x19\n" +
+	"\x15MARKET_STATUS_SETTLED\x10\x03\x12\x16\n" +
+	"\x12MARKET_STATUS_VOID\x10\x042\xeb\x02\n" +
 	"\x0eBettingService\x12K\n" +
 	"\x04Vote\x12\x1f.hestia.activity.v1.VoteRequest\x1a .hestia.activity.v1.VoteResponse\"\x00\x12T\n" +
 	"\aGetOdds\x12\".hestia.activity.v1.GetOddsRequest\x1a#.hestia.activity.v1.GetOddsResponse\"\x00\x12W\n" +
@@ -1018,49 +1342,58 @@ func file_hestia_activity_v1_betting_proto_rawDescGZIP() []byte {
 	return file_hestia_activity_v1_betting_proto_rawDescData
 }
 
-var file_hestia_activity_v1_betting_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_hestia_activity_v1_betting_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
+var file_hestia_activity_v1_betting_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
+var file_hestia_activity_v1_betting_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
 var file_hestia_activity_v1_betting_proto_goTypes = []any{
 	(BetStatus)(0),                // 0: hestia.activity.v1.BetStatus
 	(LegResult)(0),                // 1: hestia.activity.v1.LegResult
-	(*MatchOdds)(nil),             // 2: hestia.activity.v1.MatchOdds
-	(*VoteRequest)(nil),           // 3: hestia.activity.v1.VoteRequest
-	(*VoteResponse)(nil),          // 4: hestia.activity.v1.VoteResponse
-	(*GetOddsRequest)(nil),        // 5: hestia.activity.v1.GetOddsRequest
-	(*GetOddsResponse)(nil),       // 6: hestia.activity.v1.GetOddsResponse
-	(*BetLegInput)(nil),           // 7: hestia.activity.v1.BetLegInput
-	(*PlaceBetRequest)(nil),       // 8: hestia.activity.v1.PlaceBetRequest
-	(*Bet)(nil),                   // 9: hestia.activity.v1.Bet
-	(*BetLeg)(nil),                // 10: hestia.activity.v1.BetLeg
-	(*PlaceBetResponse)(nil),      // 11: hestia.activity.v1.PlaceBetResponse
-	(*ListMyBetsRequest)(nil),     // 12: hestia.activity.v1.ListMyBetsRequest
-	(*ListMyBetsResponse)(nil),    // 13: hestia.activity.v1.ListMyBetsResponse
-	(*timestamppb.Timestamp)(nil), // 14: google.protobuf.Timestamp
+	(MarketKind)(0),               // 2: hestia.activity.v1.MarketKind
+	(MarketStatus)(0),             // 3: hestia.activity.v1.MarketStatus
+	(*OutcomeOdds)(nil),           // 4: hestia.activity.v1.OutcomeOdds
+	(*MarketOdds)(nil),            // 5: hestia.activity.v1.MarketOdds
+	(*MatchOdds)(nil),             // 6: hestia.activity.v1.MatchOdds
+	(*VoteRequest)(nil),           // 7: hestia.activity.v1.VoteRequest
+	(*VoteResponse)(nil),          // 8: hestia.activity.v1.VoteResponse
+	(*GetOddsRequest)(nil),        // 9: hestia.activity.v1.GetOddsRequest
+	(*GetOddsResponse)(nil),       // 10: hestia.activity.v1.GetOddsResponse
+	(*BetLegInput)(nil),           // 11: hestia.activity.v1.BetLegInput
+	(*PlaceBetRequest)(nil),       // 12: hestia.activity.v1.PlaceBetRequest
+	(*Bet)(nil),                   // 13: hestia.activity.v1.Bet
+	(*BetLeg)(nil),                // 14: hestia.activity.v1.BetLeg
+	(*PlaceBetResponse)(nil),      // 15: hestia.activity.v1.PlaceBetResponse
+	(*ListMyBetsRequest)(nil),     // 16: hestia.activity.v1.ListMyBetsRequest
+	(*ListMyBetsResponse)(nil),    // 17: hestia.activity.v1.ListMyBetsResponse
+	(*timestamppb.Timestamp)(nil), // 18: google.protobuf.Timestamp
 }
 var file_hestia_activity_v1_betting_proto_depIdxs = []int32{
-	2,  // 0: hestia.activity.v1.VoteResponse.odds:type_name -> hestia.activity.v1.MatchOdds
-	2,  // 1: hestia.activity.v1.GetOddsResponse.odds:type_name -> hestia.activity.v1.MatchOdds
-	7,  // 2: hestia.activity.v1.PlaceBetRequest.legs:type_name -> hestia.activity.v1.BetLegInput
-	0,  // 3: hestia.activity.v1.Bet.status:type_name -> hestia.activity.v1.BetStatus
-	10, // 4: hestia.activity.v1.Bet.legs:type_name -> hestia.activity.v1.BetLeg
-	14, // 5: hestia.activity.v1.Bet.created_at:type_name -> google.protobuf.Timestamp
-	14, // 6: hestia.activity.v1.Bet.settled_at:type_name -> google.protobuf.Timestamp
-	1,  // 7: hestia.activity.v1.BetLeg.result:type_name -> hestia.activity.v1.LegResult
-	9,  // 8: hestia.activity.v1.PlaceBetResponse.bet:type_name -> hestia.activity.v1.Bet
-	9,  // 9: hestia.activity.v1.ListMyBetsResponse.bets:type_name -> hestia.activity.v1.Bet
-	3,  // 10: hestia.activity.v1.BettingService.Vote:input_type -> hestia.activity.v1.VoteRequest
-	5,  // 11: hestia.activity.v1.BettingService.GetOdds:input_type -> hestia.activity.v1.GetOddsRequest
-	8,  // 12: hestia.activity.v1.BettingService.PlaceBet:input_type -> hestia.activity.v1.PlaceBetRequest
-	12, // 13: hestia.activity.v1.BettingService.ListMyBets:input_type -> hestia.activity.v1.ListMyBetsRequest
-	4,  // 14: hestia.activity.v1.BettingService.Vote:output_type -> hestia.activity.v1.VoteResponse
-	6,  // 15: hestia.activity.v1.BettingService.GetOdds:output_type -> hestia.activity.v1.GetOddsResponse
-	11, // 16: hestia.activity.v1.BettingService.PlaceBet:output_type -> hestia.activity.v1.PlaceBetResponse
-	13, // 17: hestia.activity.v1.BettingService.ListMyBets:output_type -> hestia.activity.v1.ListMyBetsResponse
-	14, // [14:18] is the sub-list for method output_type
-	10, // [10:14] is the sub-list for method input_type
-	10, // [10:10] is the sub-list for extension type_name
-	10, // [10:10] is the sub-list for extension extendee
-	0,  // [0:10] is the sub-list for field type_name
+	2,  // 0: hestia.activity.v1.MarketOdds.kind:type_name -> hestia.activity.v1.MarketKind
+	3,  // 1: hestia.activity.v1.MarketOdds.status:type_name -> hestia.activity.v1.MarketStatus
+	4,  // 2: hestia.activity.v1.MarketOdds.outcomes:type_name -> hestia.activity.v1.OutcomeOdds
+	5,  // 3: hestia.activity.v1.MatchOdds.markets:type_name -> hestia.activity.v1.MarketOdds
+	5,  // 4: hestia.activity.v1.VoteResponse.odds:type_name -> hestia.activity.v1.MarketOdds
+	6,  // 5: hestia.activity.v1.GetOddsResponse.odds:type_name -> hestia.activity.v1.MatchOdds
+	11, // 6: hestia.activity.v1.PlaceBetRequest.legs:type_name -> hestia.activity.v1.BetLegInput
+	0,  // 7: hestia.activity.v1.Bet.status:type_name -> hestia.activity.v1.BetStatus
+	14, // 8: hestia.activity.v1.Bet.legs:type_name -> hestia.activity.v1.BetLeg
+	18, // 9: hestia.activity.v1.Bet.created_at:type_name -> google.protobuf.Timestamp
+	18, // 10: hestia.activity.v1.Bet.settled_at:type_name -> google.protobuf.Timestamp
+	2,  // 11: hestia.activity.v1.BetLeg.kind:type_name -> hestia.activity.v1.MarketKind
+	1,  // 12: hestia.activity.v1.BetLeg.result:type_name -> hestia.activity.v1.LegResult
+	13, // 13: hestia.activity.v1.PlaceBetResponse.bet:type_name -> hestia.activity.v1.Bet
+	13, // 14: hestia.activity.v1.ListMyBetsResponse.bets:type_name -> hestia.activity.v1.Bet
+	7,  // 15: hestia.activity.v1.BettingService.Vote:input_type -> hestia.activity.v1.VoteRequest
+	9,  // 16: hestia.activity.v1.BettingService.GetOdds:input_type -> hestia.activity.v1.GetOddsRequest
+	12, // 17: hestia.activity.v1.BettingService.PlaceBet:input_type -> hestia.activity.v1.PlaceBetRequest
+	16, // 18: hestia.activity.v1.BettingService.ListMyBets:input_type -> hestia.activity.v1.ListMyBetsRequest
+	8,  // 19: hestia.activity.v1.BettingService.Vote:output_type -> hestia.activity.v1.VoteResponse
+	10, // 20: hestia.activity.v1.BettingService.GetOdds:output_type -> hestia.activity.v1.GetOddsResponse
+	15, // 21: hestia.activity.v1.BettingService.PlaceBet:output_type -> hestia.activity.v1.PlaceBetResponse
+	17, // 22: hestia.activity.v1.BettingService.ListMyBets:output_type -> hestia.activity.v1.ListMyBetsResponse
+	19, // [19:23] is the sub-list for method output_type
+	15, // [15:19] is the sub-list for method input_type
+	15, // [15:15] is the sub-list for extension type_name
+	15, // [15:15] is the sub-list for extension extendee
+	0,  // [0:15] is the sub-list for field type_name
 }
 
 func init() { file_hestia_activity_v1_betting_proto_init() }
@@ -1068,14 +1401,14 @@ func file_hestia_activity_v1_betting_proto_init() {
 	if File_hestia_activity_v1_betting_proto != nil {
 		return
 	}
-	file_hestia_activity_v1_betting_proto_msgTypes[7].OneofWrappers = []any{}
+	file_hestia_activity_v1_betting_proto_msgTypes[9].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_hestia_activity_v1_betting_proto_rawDesc), len(file_hestia_activity_v1_betting_proto_rawDesc)),
-			NumEnums:      2,
-			NumMessages:   12,
+			NumEnums:      4,
+			NumMessages:   14,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

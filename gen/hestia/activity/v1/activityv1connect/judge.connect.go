@@ -6,21 +6,33 @@
 //
 // ── 這個服務的權限與留痕 ────────────────────────────────────────
 //
-// 全部 RPC 需要平台帳號 + 裁判權限,而且**每一支都寫 admin_audit_logs**。
-// 不是挑幾支寫 —— 賽事的公正性完全建立在「誰在什麼時候改了什麼」查得到。
-// 改段位、重抽籤、交換籤位、封盤、判賽果,每一項都有人會不服氣。
+// 全部 RPC 需要平台帳號 + 裁判權限,而且**每一支會動到資料的都寫
+// admin_audit_logs**。不是挑幾支寫 —— 賽事的公正性完全建立在「誰在什麼時候
+// 改了什麼」查得到。改段位、重抽籤、交換籤位、封盤、代退讓武、判賽果,
+// 每一項都有人會不服氣。
+//
+// 純讀取的兩支(ListUnranked、ReviewHandicap)不寫稽核:它們沒有「改了什麼」
+// 可記,而把裁判每一次查看都記成一列,只會讓真正要查的那幾列被淹掉。
 //
 // ── 為什麼賽果只能裁判填 ────────────────────────────────────────
 //
 // 因為有下注。選手自報會直接變成派彩爭議,而派彩一旦發出去就很難收回。
 // 單一權威來源是這裡唯一可行的設計。
 //
-// ── 不可逆的兩個動作 ────────────────────────────────────────────
+// ── 不可逆的動作 ────────────────────────────────────────────────
 //
-//	LockHandicap  封盤後選手不能再改讓武,且立刻公開並發 Discord 公告。
-//	ReportResult  判定勝負會觸發下注結算與派彩。
+//	LockHandicap  封盤後選手不能再改讓武,且立刻公開並發 Discord 公告;
+//	              隨機抽選也在這一刻做完。
+//	FinishRound   填回合勝者;達到勝場數的那一次會定案整場、觸發晉級與派彩。
+//	ReportResult  單場定勝負(best_of = 1)時的同一件事。
 //
-// 兩者都要求 confirm = true 作為二次確認。誤觸的代價由人承擔,不由系統吞掉。
+// 都要求 confirm = true 作為二次確認。誤觸的代價由人承擔,不由系統吞掉。
+//
+// ── 多回合制的裁判動線(schemas/20「裁判動線」)──────────────────
+//
+//	一場一次:開盤 → 封盤前檢視/代退 → 封盤 → ReviewSetup → ConfirmSetup
+//	每回合一次:StartRound(第 1 回合 = 正式開打,關下注)→ FinishRound
+//	一場一次:整場勝者由回合推導 → 晉級 / 派彩 / 季軍戰
 package activityv1connect
 
 import (
@@ -74,17 +86,38 @@ const (
 	// JudgeServiceOpenHandicapProcedure is the fully-qualified name of the JudgeService's OpenHandicap
 	// RPC.
 	JudgeServiceOpenHandicapProcedure = "/hestia.activity.v1.JudgeService/OpenHandicap"
+	// JudgeServiceReviewHandicapProcedure is the fully-qualified name of the JudgeService's
+	// ReviewHandicap RPC.
+	JudgeServiceReviewHandicapProcedure = "/hestia.activity.v1.JudgeService/ReviewHandicap"
+	// JudgeServiceRefundSelectionProcedure is the fully-qualified name of the JudgeService's
+	// RefundSelection RPC.
+	JudgeServiceRefundSelectionProcedure = "/hestia.activity.v1.JudgeService/RefundSelection"
 	// JudgeServiceLockHandicapProcedure is the fully-qualified name of the JudgeService's LockHandicap
 	// RPC.
 	JudgeServiceLockHandicapProcedure = "/hestia.activity.v1.JudgeService/LockHandicap"
 	// JudgeServiceSetStreamUrlProcedure is the fully-qualified name of the JudgeService's SetStreamUrl
 	// RPC.
 	JudgeServiceSetStreamUrlProcedure = "/hestia.activity.v1.JudgeService/SetStreamUrl"
-	// JudgeServiceStartMatchProcedure is the fully-qualified name of the JudgeService's StartMatch RPC.
-	JudgeServiceStartMatchProcedure = "/hestia.activity.v1.JudgeService/StartMatch"
+	// JudgeServiceReviewSetupProcedure is the fully-qualified name of the JudgeService's ReviewSetup
+	// RPC.
+	JudgeServiceReviewSetupProcedure = "/hestia.activity.v1.JudgeService/ReviewSetup"
+	// JudgeServiceConfirmSetupProcedure is the fully-qualified name of the JudgeService's ConfirmSetup
+	// RPC.
+	JudgeServiceConfirmSetupProcedure = "/hestia.activity.v1.JudgeService/ConfirmSetup"
+	// JudgeServiceStartRoundProcedure is the fully-qualified name of the JudgeService's StartRound RPC.
+	JudgeServiceStartRoundProcedure = "/hestia.activity.v1.JudgeService/StartRound"
+	// JudgeServiceFinishRoundProcedure is the fully-qualified name of the JudgeService's FinishRound
+	// RPC.
+	JudgeServiceFinishRoundProcedure = "/hestia.activity.v1.JudgeService/FinishRound"
 	// JudgeServiceReportResultProcedure is the fully-qualified name of the JudgeService's ReportResult
 	// RPC.
 	JudgeServiceReportResultProcedure = "/hestia.activity.v1.JudgeService/ReportResult"
+	// JudgeServiceRecordViolationProcedure is the fully-qualified name of the JudgeService's
+	// RecordViolation RPC.
+	JudgeServiceRecordViolationProcedure = "/hestia.activity.v1.JudgeService/RecordViolation"
+	// JudgeServiceListViolationsProcedure is the fully-qualified name of the JudgeService's
+	// ListViolations RPC.
+	JudgeServiceListViolationsProcedure = "/hestia.activity.v1.JudgeService/ListViolations"
 	// JudgeServiceWithdrawPlayerProcedure is the fully-qualified name of the JudgeService's
 	// WithdrawPlayer RPC.
 	JudgeServiceWithdrawPlayerProcedure = "/hestia.activity.v1.JudgeService/WithdrawPlayer"
@@ -118,14 +151,28 @@ type JudgeServiceClient interface {
 	ConfirmBracket(context.Context, *connect.Request[v1.ConfirmBracketRequest]) (*connect.Response[v1.ConfirmBracketResponse], error)
 	// 開盤:讓該場的低段位方可以開始選讓武。
 	OpenHandicap(context.Context, *connect.Request[v1.OpenHandicapRequest]) (*connect.Response[v1.OpenHandicapResponse], error)
+	// 檢視一場的讓武內容,**不受封盤前的揭露限制**。
+	ReviewHandicap(context.Context, *connect.Request[v1.ReviewHandicapRequest]) (*connect.Response[v1.ReviewHandicapResponse], error)
+	// 退掉某一筆讓武選擇,BP 退回該場預算。**封盤後不可**。
+	RefundSelection(context.Context, *connect.Request[v1.RefundSelectionRequest]) (*connect.Response[v1.RefundSelectionResponse], error)
 	// 封盤:選手不能再改,內容立刻公開並發 Discord 公告。**不可逆**。
 	LockHandicap(context.Context, *connect.Request[v1.LockHandicapRequest]) (*connect.Response[v1.LockHandicapResponse], error)
 	// 設定直播連結。
 	SetStreamUrl(context.Context, *connect.Request[v1.SetStreamUrlRequest]) (*connect.Response[v1.SetStreamUrlResponse], error)
-	// 標記開打(關閉下注)。
-	StartMatch(context.Context, *connect.Request[v1.StartMatchRequest]) (*connect.Response[v1.StartMatchResponse], error)
-	// 判定勝負。觸發晉級與下注結算。**不可逆**。
+	// 開賽前設定確認清單(該場每筆讓武的執行說明 + 抽選結果)與目前回合狀態。純讀取。
+	ReviewSetup(context.Context, *connect.Request[v1.ReviewSetupRequest]) (*connect.Response[v1.ReviewSetupResponse], error)
+	// 裁判確認開賽前設定都做了。**確認完才能開打**(伺服器擋,DB 也擋)。整體一次確認,不逐項。
+	ConfirmSetup(context.Context, *connect.Request[v1.ConfirmSetupRequest]) (*connect.Response[v1.ConfirmSetupResponse], error)
+	// 開始下一個回合。第 1 回合 = 正式開打:同時關閉下注、啟動計時。
+	StartRound(context.Context, *connect.Request[v1.StartRoundRequest]) (*connect.Response[v1.StartRoundResponse], error)
+	// 結束一個回合並填勝者。達到勝場數即整場定案,觸發晉級與派彩。**不可逆**。
+	FinishRound(context.Context, *connect.Request[v1.FinishRoundRequest]) (*connect.Response[v1.FinishRoundResponse], error)
+	// 判定勝負(**只在 best_of = 1 時可用**;多回合制用 FinishRound)。**不可逆**。
 	ReportResult(context.Context, *connect.Request[v1.ReportResultRequest]) (*connect.Response[v1.ReportResultResponse], error)
+	// 記一筆違規。只記事實與裁判的判決,**不觸發任何後果**(schemas/27)。
+	RecordViolation(context.Context, *connect.Request[v1.RecordViolationRequest]) (*connect.Response[v1.RecordViolationResponse], error)
+	// 列出一場的違規紀錄。純讀取。
+	ListViolations(context.Context, *connect.Request[v1.ListViolationsRequest]) (*connect.Response[v1.ListViolationsResponse], error)
 	// 選手棄賽。對手不戰而勝,該場所有注單作廢退款。
 	WithdrawPlayer(context.Context, *connect.Request[v1.WithdrawPlayerRequest]) (*connect.Response[v1.WithdrawPlayerResponse], error)
 	// 重新產生通行碼。舊碼立即失效,回傳的明碼要由裁判私訊給本人。
@@ -193,6 +240,18 @@ func NewJudgeServiceClient(httpClient connect.HTTPClient, baseURL string, opts .
 			connect.WithSchema(judgeServiceMethods.ByName("OpenHandicap")),
 			connect.WithClientOptions(opts...),
 		),
+		reviewHandicap: connect.NewClient[v1.ReviewHandicapRequest, v1.ReviewHandicapResponse](
+			httpClient,
+			baseURL+JudgeServiceReviewHandicapProcedure,
+			connect.WithSchema(judgeServiceMethods.ByName("ReviewHandicap")),
+			connect.WithClientOptions(opts...),
+		),
+		refundSelection: connect.NewClient[v1.RefundSelectionRequest, v1.RefundSelectionResponse](
+			httpClient,
+			baseURL+JudgeServiceRefundSelectionProcedure,
+			connect.WithSchema(judgeServiceMethods.ByName("RefundSelection")),
+			connect.WithClientOptions(opts...),
+		),
 		lockHandicap: connect.NewClient[v1.LockHandicapRequest, v1.LockHandicapResponse](
 			httpClient,
 			baseURL+JudgeServiceLockHandicapProcedure,
@@ -205,16 +264,46 @@ func NewJudgeServiceClient(httpClient connect.HTTPClient, baseURL string, opts .
 			connect.WithSchema(judgeServiceMethods.ByName("SetStreamUrl")),
 			connect.WithClientOptions(opts...),
 		),
-		startMatch: connect.NewClient[v1.StartMatchRequest, v1.StartMatchResponse](
+		reviewSetup: connect.NewClient[v1.ReviewSetupRequest, v1.ReviewSetupResponse](
 			httpClient,
-			baseURL+JudgeServiceStartMatchProcedure,
-			connect.WithSchema(judgeServiceMethods.ByName("StartMatch")),
+			baseURL+JudgeServiceReviewSetupProcedure,
+			connect.WithSchema(judgeServiceMethods.ByName("ReviewSetup")),
+			connect.WithClientOptions(opts...),
+		),
+		confirmSetup: connect.NewClient[v1.ConfirmSetupRequest, v1.ConfirmSetupResponse](
+			httpClient,
+			baseURL+JudgeServiceConfirmSetupProcedure,
+			connect.WithSchema(judgeServiceMethods.ByName("ConfirmSetup")),
+			connect.WithClientOptions(opts...),
+		),
+		startRound: connect.NewClient[v1.StartRoundRequest, v1.StartRoundResponse](
+			httpClient,
+			baseURL+JudgeServiceStartRoundProcedure,
+			connect.WithSchema(judgeServiceMethods.ByName("StartRound")),
+			connect.WithClientOptions(opts...),
+		),
+		finishRound: connect.NewClient[v1.FinishRoundRequest, v1.FinishRoundResponse](
+			httpClient,
+			baseURL+JudgeServiceFinishRoundProcedure,
+			connect.WithSchema(judgeServiceMethods.ByName("FinishRound")),
 			connect.WithClientOptions(opts...),
 		),
 		reportResult: connect.NewClient[v1.ReportResultRequest, v1.ReportResultResponse](
 			httpClient,
 			baseURL+JudgeServiceReportResultProcedure,
 			connect.WithSchema(judgeServiceMethods.ByName("ReportResult")),
+			connect.WithClientOptions(opts...),
+		),
+		recordViolation: connect.NewClient[v1.RecordViolationRequest, v1.RecordViolationResponse](
+			httpClient,
+			baseURL+JudgeServiceRecordViolationProcedure,
+			connect.WithSchema(judgeServiceMethods.ByName("RecordViolation")),
+			connect.WithClientOptions(opts...),
+		),
+		listViolations: connect.NewClient[v1.ListViolationsRequest, v1.ListViolationsResponse](
+			httpClient,
+			baseURL+JudgeServiceListViolationsProcedure,
+			connect.WithSchema(judgeServiceMethods.ByName("ListViolations")),
 			connect.WithClientOptions(opts...),
 		),
 		withdrawPlayer: connect.NewClient[v1.WithdrawPlayerRequest, v1.WithdrawPlayerResponse](
@@ -248,10 +337,17 @@ type judgeServiceClient struct {
 	swapSeeds          *connect.Client[v1.SwapSeedsRequest, v1.SwapSeedsResponse]
 	confirmBracket     *connect.Client[v1.ConfirmBracketRequest, v1.ConfirmBracketResponse]
 	openHandicap       *connect.Client[v1.OpenHandicapRequest, v1.OpenHandicapResponse]
+	reviewHandicap     *connect.Client[v1.ReviewHandicapRequest, v1.ReviewHandicapResponse]
+	refundSelection    *connect.Client[v1.RefundSelectionRequest, v1.RefundSelectionResponse]
 	lockHandicap       *connect.Client[v1.LockHandicapRequest, v1.LockHandicapResponse]
 	setStreamUrl       *connect.Client[v1.SetStreamUrlRequest, v1.SetStreamUrlResponse]
-	startMatch         *connect.Client[v1.StartMatchRequest, v1.StartMatchResponse]
+	reviewSetup        *connect.Client[v1.ReviewSetupRequest, v1.ReviewSetupResponse]
+	confirmSetup       *connect.Client[v1.ConfirmSetupRequest, v1.ConfirmSetupResponse]
+	startRound         *connect.Client[v1.StartRoundRequest, v1.StartRoundResponse]
+	finishRound        *connect.Client[v1.FinishRoundRequest, v1.FinishRoundResponse]
 	reportResult       *connect.Client[v1.ReportResultRequest, v1.ReportResultResponse]
+	recordViolation    *connect.Client[v1.RecordViolationRequest, v1.RecordViolationResponse]
+	listViolations     *connect.Client[v1.ListViolationsRequest, v1.ListViolationsResponse]
 	withdrawPlayer     *connect.Client[v1.WithdrawPlayerRequest, v1.WithdrawPlayerResponse]
 	regeneratePasscode *connect.Client[v1.RegeneratePasscodeRequest, v1.RegeneratePasscodeResponse]
 	awardPrizes        *connect.Client[v1.AwardPrizesRequest, v1.AwardPrizesResponse]
@@ -297,6 +393,16 @@ func (c *judgeServiceClient) OpenHandicap(ctx context.Context, req *connect.Requ
 	return c.openHandicap.CallUnary(ctx, req)
 }
 
+// ReviewHandicap calls hestia.activity.v1.JudgeService.ReviewHandicap.
+func (c *judgeServiceClient) ReviewHandicap(ctx context.Context, req *connect.Request[v1.ReviewHandicapRequest]) (*connect.Response[v1.ReviewHandicapResponse], error) {
+	return c.reviewHandicap.CallUnary(ctx, req)
+}
+
+// RefundSelection calls hestia.activity.v1.JudgeService.RefundSelection.
+func (c *judgeServiceClient) RefundSelection(ctx context.Context, req *connect.Request[v1.RefundSelectionRequest]) (*connect.Response[v1.RefundSelectionResponse], error) {
+	return c.refundSelection.CallUnary(ctx, req)
+}
+
 // LockHandicap calls hestia.activity.v1.JudgeService.LockHandicap.
 func (c *judgeServiceClient) LockHandicap(ctx context.Context, req *connect.Request[v1.LockHandicapRequest]) (*connect.Response[v1.LockHandicapResponse], error) {
 	return c.lockHandicap.CallUnary(ctx, req)
@@ -307,14 +413,39 @@ func (c *judgeServiceClient) SetStreamUrl(ctx context.Context, req *connect.Requ
 	return c.setStreamUrl.CallUnary(ctx, req)
 }
 
-// StartMatch calls hestia.activity.v1.JudgeService.StartMatch.
-func (c *judgeServiceClient) StartMatch(ctx context.Context, req *connect.Request[v1.StartMatchRequest]) (*connect.Response[v1.StartMatchResponse], error) {
-	return c.startMatch.CallUnary(ctx, req)
+// ReviewSetup calls hestia.activity.v1.JudgeService.ReviewSetup.
+func (c *judgeServiceClient) ReviewSetup(ctx context.Context, req *connect.Request[v1.ReviewSetupRequest]) (*connect.Response[v1.ReviewSetupResponse], error) {
+	return c.reviewSetup.CallUnary(ctx, req)
+}
+
+// ConfirmSetup calls hestia.activity.v1.JudgeService.ConfirmSetup.
+func (c *judgeServiceClient) ConfirmSetup(ctx context.Context, req *connect.Request[v1.ConfirmSetupRequest]) (*connect.Response[v1.ConfirmSetupResponse], error) {
+	return c.confirmSetup.CallUnary(ctx, req)
+}
+
+// StartRound calls hestia.activity.v1.JudgeService.StartRound.
+func (c *judgeServiceClient) StartRound(ctx context.Context, req *connect.Request[v1.StartRoundRequest]) (*connect.Response[v1.StartRoundResponse], error) {
+	return c.startRound.CallUnary(ctx, req)
+}
+
+// FinishRound calls hestia.activity.v1.JudgeService.FinishRound.
+func (c *judgeServiceClient) FinishRound(ctx context.Context, req *connect.Request[v1.FinishRoundRequest]) (*connect.Response[v1.FinishRoundResponse], error) {
+	return c.finishRound.CallUnary(ctx, req)
 }
 
 // ReportResult calls hestia.activity.v1.JudgeService.ReportResult.
 func (c *judgeServiceClient) ReportResult(ctx context.Context, req *connect.Request[v1.ReportResultRequest]) (*connect.Response[v1.ReportResultResponse], error) {
 	return c.reportResult.CallUnary(ctx, req)
+}
+
+// RecordViolation calls hestia.activity.v1.JudgeService.RecordViolation.
+func (c *judgeServiceClient) RecordViolation(ctx context.Context, req *connect.Request[v1.RecordViolationRequest]) (*connect.Response[v1.RecordViolationResponse], error) {
+	return c.recordViolation.CallUnary(ctx, req)
+}
+
+// ListViolations calls hestia.activity.v1.JudgeService.ListViolations.
+func (c *judgeServiceClient) ListViolations(ctx context.Context, req *connect.Request[v1.ListViolationsRequest]) (*connect.Response[v1.ListViolationsResponse], error) {
+	return c.listViolations.CallUnary(ctx, req)
 }
 
 // WithdrawPlayer calls hestia.activity.v1.JudgeService.WithdrawPlayer.
@@ -354,14 +485,28 @@ type JudgeServiceHandler interface {
 	ConfirmBracket(context.Context, *connect.Request[v1.ConfirmBracketRequest]) (*connect.Response[v1.ConfirmBracketResponse], error)
 	// 開盤:讓該場的低段位方可以開始選讓武。
 	OpenHandicap(context.Context, *connect.Request[v1.OpenHandicapRequest]) (*connect.Response[v1.OpenHandicapResponse], error)
+	// 檢視一場的讓武內容,**不受封盤前的揭露限制**。
+	ReviewHandicap(context.Context, *connect.Request[v1.ReviewHandicapRequest]) (*connect.Response[v1.ReviewHandicapResponse], error)
+	// 退掉某一筆讓武選擇,BP 退回該場預算。**封盤後不可**。
+	RefundSelection(context.Context, *connect.Request[v1.RefundSelectionRequest]) (*connect.Response[v1.RefundSelectionResponse], error)
 	// 封盤:選手不能再改,內容立刻公開並發 Discord 公告。**不可逆**。
 	LockHandicap(context.Context, *connect.Request[v1.LockHandicapRequest]) (*connect.Response[v1.LockHandicapResponse], error)
 	// 設定直播連結。
 	SetStreamUrl(context.Context, *connect.Request[v1.SetStreamUrlRequest]) (*connect.Response[v1.SetStreamUrlResponse], error)
-	// 標記開打(關閉下注)。
-	StartMatch(context.Context, *connect.Request[v1.StartMatchRequest]) (*connect.Response[v1.StartMatchResponse], error)
-	// 判定勝負。觸發晉級與下注結算。**不可逆**。
+	// 開賽前設定確認清單(該場每筆讓武的執行說明 + 抽選結果)與目前回合狀態。純讀取。
+	ReviewSetup(context.Context, *connect.Request[v1.ReviewSetupRequest]) (*connect.Response[v1.ReviewSetupResponse], error)
+	// 裁判確認開賽前設定都做了。**確認完才能開打**(伺服器擋,DB 也擋)。整體一次確認,不逐項。
+	ConfirmSetup(context.Context, *connect.Request[v1.ConfirmSetupRequest]) (*connect.Response[v1.ConfirmSetupResponse], error)
+	// 開始下一個回合。第 1 回合 = 正式開打:同時關閉下注、啟動計時。
+	StartRound(context.Context, *connect.Request[v1.StartRoundRequest]) (*connect.Response[v1.StartRoundResponse], error)
+	// 結束一個回合並填勝者。達到勝場數即整場定案,觸發晉級與派彩。**不可逆**。
+	FinishRound(context.Context, *connect.Request[v1.FinishRoundRequest]) (*connect.Response[v1.FinishRoundResponse], error)
+	// 判定勝負(**只在 best_of = 1 時可用**;多回合制用 FinishRound)。**不可逆**。
 	ReportResult(context.Context, *connect.Request[v1.ReportResultRequest]) (*connect.Response[v1.ReportResultResponse], error)
+	// 記一筆違規。只記事實與裁判的判決,**不觸發任何後果**(schemas/27)。
+	RecordViolation(context.Context, *connect.Request[v1.RecordViolationRequest]) (*connect.Response[v1.RecordViolationResponse], error)
+	// 列出一場的違規紀錄。純讀取。
+	ListViolations(context.Context, *connect.Request[v1.ListViolationsRequest]) (*connect.Response[v1.ListViolationsResponse], error)
 	// 選手棄賽。對手不戰而勝,該場所有注單作廢退款。
 	WithdrawPlayer(context.Context, *connect.Request[v1.WithdrawPlayerRequest]) (*connect.Response[v1.WithdrawPlayerResponse], error)
 	// 重新產生通行碼。舊碼立即失效,回傳的明碼要由裁判私訊給本人。
@@ -425,6 +570,18 @@ func NewJudgeServiceHandler(svc JudgeServiceHandler, opts ...connect.HandlerOpti
 		connect.WithSchema(judgeServiceMethods.ByName("OpenHandicap")),
 		connect.WithHandlerOptions(opts...),
 	)
+	judgeServiceReviewHandicapHandler := connect.NewUnaryHandler(
+		JudgeServiceReviewHandicapProcedure,
+		svc.ReviewHandicap,
+		connect.WithSchema(judgeServiceMethods.ByName("ReviewHandicap")),
+		connect.WithHandlerOptions(opts...),
+	)
+	judgeServiceRefundSelectionHandler := connect.NewUnaryHandler(
+		JudgeServiceRefundSelectionProcedure,
+		svc.RefundSelection,
+		connect.WithSchema(judgeServiceMethods.ByName("RefundSelection")),
+		connect.WithHandlerOptions(opts...),
+	)
 	judgeServiceLockHandicapHandler := connect.NewUnaryHandler(
 		JudgeServiceLockHandicapProcedure,
 		svc.LockHandicap,
@@ -437,16 +594,46 @@ func NewJudgeServiceHandler(svc JudgeServiceHandler, opts ...connect.HandlerOpti
 		connect.WithSchema(judgeServiceMethods.ByName("SetStreamUrl")),
 		connect.WithHandlerOptions(opts...),
 	)
-	judgeServiceStartMatchHandler := connect.NewUnaryHandler(
-		JudgeServiceStartMatchProcedure,
-		svc.StartMatch,
-		connect.WithSchema(judgeServiceMethods.ByName("StartMatch")),
+	judgeServiceReviewSetupHandler := connect.NewUnaryHandler(
+		JudgeServiceReviewSetupProcedure,
+		svc.ReviewSetup,
+		connect.WithSchema(judgeServiceMethods.ByName("ReviewSetup")),
+		connect.WithHandlerOptions(opts...),
+	)
+	judgeServiceConfirmSetupHandler := connect.NewUnaryHandler(
+		JudgeServiceConfirmSetupProcedure,
+		svc.ConfirmSetup,
+		connect.WithSchema(judgeServiceMethods.ByName("ConfirmSetup")),
+		connect.WithHandlerOptions(opts...),
+	)
+	judgeServiceStartRoundHandler := connect.NewUnaryHandler(
+		JudgeServiceStartRoundProcedure,
+		svc.StartRound,
+		connect.WithSchema(judgeServiceMethods.ByName("StartRound")),
+		connect.WithHandlerOptions(opts...),
+	)
+	judgeServiceFinishRoundHandler := connect.NewUnaryHandler(
+		JudgeServiceFinishRoundProcedure,
+		svc.FinishRound,
+		connect.WithSchema(judgeServiceMethods.ByName("FinishRound")),
 		connect.WithHandlerOptions(opts...),
 	)
 	judgeServiceReportResultHandler := connect.NewUnaryHandler(
 		JudgeServiceReportResultProcedure,
 		svc.ReportResult,
 		connect.WithSchema(judgeServiceMethods.ByName("ReportResult")),
+		connect.WithHandlerOptions(opts...),
+	)
+	judgeServiceRecordViolationHandler := connect.NewUnaryHandler(
+		JudgeServiceRecordViolationProcedure,
+		svc.RecordViolation,
+		connect.WithSchema(judgeServiceMethods.ByName("RecordViolation")),
+		connect.WithHandlerOptions(opts...),
+	)
+	judgeServiceListViolationsHandler := connect.NewUnaryHandler(
+		JudgeServiceListViolationsProcedure,
+		svc.ListViolations,
+		connect.WithSchema(judgeServiceMethods.ByName("ListViolations")),
 		connect.WithHandlerOptions(opts...),
 	)
 	judgeServiceWithdrawPlayerHandler := connect.NewUnaryHandler(
@@ -485,14 +672,28 @@ func NewJudgeServiceHandler(svc JudgeServiceHandler, opts ...connect.HandlerOpti
 			judgeServiceConfirmBracketHandler.ServeHTTP(w, r)
 		case JudgeServiceOpenHandicapProcedure:
 			judgeServiceOpenHandicapHandler.ServeHTTP(w, r)
+		case JudgeServiceReviewHandicapProcedure:
+			judgeServiceReviewHandicapHandler.ServeHTTP(w, r)
+		case JudgeServiceRefundSelectionProcedure:
+			judgeServiceRefundSelectionHandler.ServeHTTP(w, r)
 		case JudgeServiceLockHandicapProcedure:
 			judgeServiceLockHandicapHandler.ServeHTTP(w, r)
 		case JudgeServiceSetStreamUrlProcedure:
 			judgeServiceSetStreamUrlHandler.ServeHTTP(w, r)
-		case JudgeServiceStartMatchProcedure:
-			judgeServiceStartMatchHandler.ServeHTTP(w, r)
+		case JudgeServiceReviewSetupProcedure:
+			judgeServiceReviewSetupHandler.ServeHTTP(w, r)
+		case JudgeServiceConfirmSetupProcedure:
+			judgeServiceConfirmSetupHandler.ServeHTTP(w, r)
+		case JudgeServiceStartRoundProcedure:
+			judgeServiceStartRoundHandler.ServeHTTP(w, r)
+		case JudgeServiceFinishRoundProcedure:
+			judgeServiceFinishRoundHandler.ServeHTTP(w, r)
 		case JudgeServiceReportResultProcedure:
 			judgeServiceReportResultHandler.ServeHTTP(w, r)
+		case JudgeServiceRecordViolationProcedure:
+			judgeServiceRecordViolationHandler.ServeHTTP(w, r)
+		case JudgeServiceListViolationsProcedure:
+			judgeServiceListViolationsHandler.ServeHTTP(w, r)
 		case JudgeServiceWithdrawPlayerProcedure:
 			judgeServiceWithdrawPlayerHandler.ServeHTTP(w, r)
 		case JudgeServiceRegeneratePasscodeProcedure:
@@ -540,6 +741,14 @@ func (UnimplementedJudgeServiceHandler) OpenHandicap(context.Context, *connect.R
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("hestia.activity.v1.JudgeService.OpenHandicap is not implemented"))
 }
 
+func (UnimplementedJudgeServiceHandler) ReviewHandicap(context.Context, *connect.Request[v1.ReviewHandicapRequest]) (*connect.Response[v1.ReviewHandicapResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("hestia.activity.v1.JudgeService.ReviewHandicap is not implemented"))
+}
+
+func (UnimplementedJudgeServiceHandler) RefundSelection(context.Context, *connect.Request[v1.RefundSelectionRequest]) (*connect.Response[v1.RefundSelectionResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("hestia.activity.v1.JudgeService.RefundSelection is not implemented"))
+}
+
 func (UnimplementedJudgeServiceHandler) LockHandicap(context.Context, *connect.Request[v1.LockHandicapRequest]) (*connect.Response[v1.LockHandicapResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("hestia.activity.v1.JudgeService.LockHandicap is not implemented"))
 }
@@ -548,12 +757,32 @@ func (UnimplementedJudgeServiceHandler) SetStreamUrl(context.Context, *connect.R
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("hestia.activity.v1.JudgeService.SetStreamUrl is not implemented"))
 }
 
-func (UnimplementedJudgeServiceHandler) StartMatch(context.Context, *connect.Request[v1.StartMatchRequest]) (*connect.Response[v1.StartMatchResponse], error) {
-	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("hestia.activity.v1.JudgeService.StartMatch is not implemented"))
+func (UnimplementedJudgeServiceHandler) ReviewSetup(context.Context, *connect.Request[v1.ReviewSetupRequest]) (*connect.Response[v1.ReviewSetupResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("hestia.activity.v1.JudgeService.ReviewSetup is not implemented"))
+}
+
+func (UnimplementedJudgeServiceHandler) ConfirmSetup(context.Context, *connect.Request[v1.ConfirmSetupRequest]) (*connect.Response[v1.ConfirmSetupResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("hestia.activity.v1.JudgeService.ConfirmSetup is not implemented"))
+}
+
+func (UnimplementedJudgeServiceHandler) StartRound(context.Context, *connect.Request[v1.StartRoundRequest]) (*connect.Response[v1.StartRoundResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("hestia.activity.v1.JudgeService.StartRound is not implemented"))
+}
+
+func (UnimplementedJudgeServiceHandler) FinishRound(context.Context, *connect.Request[v1.FinishRoundRequest]) (*connect.Response[v1.FinishRoundResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("hestia.activity.v1.JudgeService.FinishRound is not implemented"))
 }
 
 func (UnimplementedJudgeServiceHandler) ReportResult(context.Context, *connect.Request[v1.ReportResultRequest]) (*connect.Response[v1.ReportResultResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("hestia.activity.v1.JudgeService.ReportResult is not implemented"))
+}
+
+func (UnimplementedJudgeServiceHandler) RecordViolation(context.Context, *connect.Request[v1.RecordViolationRequest]) (*connect.Response[v1.RecordViolationResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("hestia.activity.v1.JudgeService.RecordViolation is not implemented"))
+}
+
+func (UnimplementedJudgeServiceHandler) ListViolations(context.Context, *connect.Request[v1.ListViolationsRequest]) (*connect.Response[v1.ListViolationsResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("hestia.activity.v1.JudgeService.ListViolations is not implemented"))
 }
 
 func (UnimplementedJudgeServiceHandler) WithdrawPlayer(context.Context, *connect.Request[v1.WithdrawPlayerRequest]) (*connect.Response[v1.WithdrawPlayerResponse], error) {

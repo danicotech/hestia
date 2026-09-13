@@ -17,7 +17,9 @@
 // 動平台代幣的 RPC 一律要帶 idempotency_key(平台鐵則)。這裡**刻意沒有**,
 // 因為 BP 不是代幣:每輪依段位差重發、該場有效、賽後作廢、不可交易。
 // 重複扣一次 BP 的後果是使用者看到餘額不對,不是對不上帳 ——
-// 前者可以由裁判在封盤前退掉,後者無法事後修復。
+// 前者可以由選手自己在封盤前退掉(VoidSelection 只認選擇的本人;
+// 裁判代退走 JudgeService.RefundSelection,那條路要裁判權限並進稽核紀錄),
+// 後者無法事後修復。
 //
 // 真正動錢的是 betting.proto 與 judge.proto 的發獎,那兩處才有冪等鍵。
 //
@@ -26,6 +28,10 @@
 // 封盤前:只有施加者本人看得到自己買了什麼。
 // 封盤後:雙方與觀眾全部看得到,並自動發一則 Discord 公告。
 // 這條界線由伺服器守,不是前端隱藏。
+//
+// 本服務沒有例外。裁判要在封盤前看內容(場上規則要他看)走的是
+// JudgeService.ReviewHandicap —— 那是另一支需要裁判權限的 RPC,
+// 不是在這裡多一個參數。
 
 package activityv1
 
@@ -550,6 +556,94 @@ func (x *GetMatchHandicapsResponse) GetHandicaps() *MatchHandicaps {
 	return nil
 }
 
+type ListMyViolationsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	MatchPublicId string                 `protobuf:"bytes,1,opt,name=match_public_id,json=matchPublicId,proto3" json:"match_public_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListMyViolationsRequest) Reset() {
+	*x = ListMyViolationsRequest{}
+	mi := &file_hestia_activity_v1_handicap_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListMyViolationsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListMyViolationsRequest) ProtoMessage() {}
+
+func (x *ListMyViolationsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_activity_v1_handicap_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListMyViolationsRequest.ProtoReflect.Descriptor instead.
+func (*ListMyViolationsRequest) Descriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_handicap_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *ListMyViolationsRequest) GetMatchPublicId() string {
+	if x != nil {
+		return x.MatchPublicId
+	}
+	return ""
+}
+
+type ListMyViolationsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Violations    []*Violation           `protobuf:"bytes,1,rep,name=violations,proto3" json:"violations,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListMyViolationsResponse) Reset() {
+	*x = ListMyViolationsResponse{}
+	mi := &file_hestia_activity_v1_handicap_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListMyViolationsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListMyViolationsResponse) ProtoMessage() {}
+
+func (x *ListMyViolationsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_activity_v1_handicap_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListMyViolationsResponse.ProtoReflect.Descriptor instead.
+func (*ListMyViolationsResponse) Descriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_handicap_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *ListMyViolationsResponse) GetViolations() []*Violation {
+	if x != nil {
+		return x.Violations
+	}
+	return nil
+}
+
 var File_hestia_activity_v1_handicap_proto protoreflect.FileDescriptor
 
 const file_hestia_activity_v1_handicap_proto_rawDesc = "" +
@@ -584,13 +678,20 @@ const file_hestia_activity_v1_handicap_proto_rawDesc = "" +
 	"\x18GetMatchHandicapsRequest\x12&\n" +
 	"\x0fmatch_public_id\x18\x01 \x01(\tR\rmatchPublicId\"]\n" +
 	"\x19GetMatchHandicapsResponse\x12@\n" +
-	"\thandicaps\x18\x01 \x01(\v2\".hestia.activity.v1.MatchHandicapsR\thandicaps2\xfe\x03\n" +
+	"\thandicaps\x18\x01 \x01(\v2\".hestia.activity.v1.MatchHandicapsR\thandicaps\"A\n" +
+	"\x17ListMyViolationsRequest\x12&\n" +
+	"\x0fmatch_public_id\x18\x01 \x01(\tR\rmatchPublicId\"Y\n" +
+	"\x18ListMyViolationsResponse\x12=\n" +
+	"\n" +
+	"violations\x18\x01 \x03(\v2\x1d.hestia.activity.v1.ViolationR\n" +
+	"violations2\xef\x04\n" +
 	"\x0fHandicapService\x12Z\n" +
 	"\tListItems\x12$.hestia.activity.v1.ListItemsRequest\x1a%.hestia.activity.v1.ListItemsResponse\"\x00\x12`\n" +
 	"\vGetMyBudget\x12&.hestia.activity.v1.GetMyBudgetRequest\x1a'.hestia.activity.v1.GetMyBudgetResponse\"\x00\x12Q\n" +
 	"\x06Select\x12!.hestia.activity.v1.SelectRequest\x1a\".hestia.activity.v1.SelectResponse\"\x00\x12f\n" +
 	"\rVoidSelection\x12(.hestia.activity.v1.VoidSelectionRequest\x1a).hestia.activity.v1.VoidSelectionResponse\"\x00\x12r\n" +
-	"\x11GetMatchHandicaps\x12,.hestia.activity.v1.GetMatchHandicapsRequest\x1a-.hestia.activity.v1.GetMatchHandicapsResponse\"\x00B@Z>github.com/danicotech/hestia/gen/hestia/activity/v1;activityv1b\x06proto3"
+	"\x11GetMatchHandicaps\x12,.hestia.activity.v1.GetMatchHandicapsRequest\x1a-.hestia.activity.v1.GetMatchHandicapsResponse\"\x00\x12o\n" +
+	"\x10ListMyViolations\x12+.hestia.activity.v1.ListMyViolationsRequest\x1a,.hestia.activity.v1.ListMyViolationsResponse\"\x00B@Z>github.com/danicotech/hestia/gen/hestia/activity/v1;activityv1b\x06proto3"
 
 var (
 	file_hestia_activity_v1_handicap_proto_rawDescOnce sync.Once
@@ -604,7 +705,7 @@ func file_hestia_activity_v1_handicap_proto_rawDescGZIP() []byte {
 	return file_hestia_activity_v1_handicap_proto_rawDescData
 }
 
-var file_hestia_activity_v1_handicap_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
+var file_hestia_activity_v1_handicap_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_hestia_activity_v1_handicap_proto_goTypes = []any{
 	(*ListItemsRequest)(nil),          // 0: hestia.activity.v1.ListItemsRequest
 	(*ListItemsResponse)(nil),         // 1: hestia.activity.v1.ListItemsResponse
@@ -616,34 +717,40 @@ var file_hestia_activity_v1_handicap_proto_goTypes = []any{
 	(*VoidSelectionResponse)(nil),     // 7: hestia.activity.v1.VoidSelectionResponse
 	(*GetMatchHandicapsRequest)(nil),  // 8: hestia.activity.v1.GetMatchHandicapsRequest
 	(*GetMatchHandicapsResponse)(nil), // 9: hestia.activity.v1.GetMatchHandicapsResponse
-	(*HandicapItem)(nil),              // 10: hestia.activity.v1.HandicapItem
-	(*BpBudget)(nil),                  // 11: hestia.activity.v1.BpBudget
-	(*HandicapSelection)(nil),         // 12: hestia.activity.v1.HandicapSelection
-	(*MatchHandicaps)(nil),            // 13: hestia.activity.v1.MatchHandicaps
+	(*ListMyViolationsRequest)(nil),   // 10: hestia.activity.v1.ListMyViolationsRequest
+	(*ListMyViolationsResponse)(nil),  // 11: hestia.activity.v1.ListMyViolationsResponse
+	(*HandicapItem)(nil),              // 12: hestia.activity.v1.HandicapItem
+	(*BpBudget)(nil),                  // 13: hestia.activity.v1.BpBudget
+	(*HandicapSelection)(nil),         // 14: hestia.activity.v1.HandicapSelection
+	(*MatchHandicaps)(nil),            // 15: hestia.activity.v1.MatchHandicaps
+	(*Violation)(nil),                 // 16: hestia.activity.v1.Violation
 }
 var file_hestia_activity_v1_handicap_proto_depIdxs = []int32{
-	10, // 0: hestia.activity.v1.ListItemsResponse.items:type_name -> hestia.activity.v1.HandicapItem
-	11, // 1: hestia.activity.v1.GetMyBudgetResponse.budget:type_name -> hestia.activity.v1.BpBudget
-	12, // 2: hestia.activity.v1.GetMyBudgetResponse.selections:type_name -> hestia.activity.v1.HandicapSelection
-	12, // 3: hestia.activity.v1.SelectResponse.selection:type_name -> hestia.activity.v1.HandicapSelection
-	11, // 4: hestia.activity.v1.SelectResponse.budget:type_name -> hestia.activity.v1.BpBudget
-	11, // 5: hestia.activity.v1.VoidSelectionResponse.budget:type_name -> hestia.activity.v1.BpBudget
-	13, // 6: hestia.activity.v1.GetMatchHandicapsResponse.handicaps:type_name -> hestia.activity.v1.MatchHandicaps
-	0,  // 7: hestia.activity.v1.HandicapService.ListItems:input_type -> hestia.activity.v1.ListItemsRequest
-	2,  // 8: hestia.activity.v1.HandicapService.GetMyBudget:input_type -> hestia.activity.v1.GetMyBudgetRequest
-	4,  // 9: hestia.activity.v1.HandicapService.Select:input_type -> hestia.activity.v1.SelectRequest
-	6,  // 10: hestia.activity.v1.HandicapService.VoidSelection:input_type -> hestia.activity.v1.VoidSelectionRequest
-	8,  // 11: hestia.activity.v1.HandicapService.GetMatchHandicaps:input_type -> hestia.activity.v1.GetMatchHandicapsRequest
-	1,  // 12: hestia.activity.v1.HandicapService.ListItems:output_type -> hestia.activity.v1.ListItemsResponse
-	3,  // 13: hestia.activity.v1.HandicapService.GetMyBudget:output_type -> hestia.activity.v1.GetMyBudgetResponse
-	5,  // 14: hestia.activity.v1.HandicapService.Select:output_type -> hestia.activity.v1.SelectResponse
-	7,  // 15: hestia.activity.v1.HandicapService.VoidSelection:output_type -> hestia.activity.v1.VoidSelectionResponse
-	9,  // 16: hestia.activity.v1.HandicapService.GetMatchHandicaps:output_type -> hestia.activity.v1.GetMatchHandicapsResponse
-	12, // [12:17] is the sub-list for method output_type
-	7,  // [7:12] is the sub-list for method input_type
-	7,  // [7:7] is the sub-list for extension type_name
-	7,  // [7:7] is the sub-list for extension extendee
-	0,  // [0:7] is the sub-list for field type_name
+	12, // 0: hestia.activity.v1.ListItemsResponse.items:type_name -> hestia.activity.v1.HandicapItem
+	13, // 1: hestia.activity.v1.GetMyBudgetResponse.budget:type_name -> hestia.activity.v1.BpBudget
+	14, // 2: hestia.activity.v1.GetMyBudgetResponse.selections:type_name -> hestia.activity.v1.HandicapSelection
+	14, // 3: hestia.activity.v1.SelectResponse.selection:type_name -> hestia.activity.v1.HandicapSelection
+	13, // 4: hestia.activity.v1.SelectResponse.budget:type_name -> hestia.activity.v1.BpBudget
+	13, // 5: hestia.activity.v1.VoidSelectionResponse.budget:type_name -> hestia.activity.v1.BpBudget
+	15, // 6: hestia.activity.v1.GetMatchHandicapsResponse.handicaps:type_name -> hestia.activity.v1.MatchHandicaps
+	16, // 7: hestia.activity.v1.ListMyViolationsResponse.violations:type_name -> hestia.activity.v1.Violation
+	0,  // 8: hestia.activity.v1.HandicapService.ListItems:input_type -> hestia.activity.v1.ListItemsRequest
+	2,  // 9: hestia.activity.v1.HandicapService.GetMyBudget:input_type -> hestia.activity.v1.GetMyBudgetRequest
+	4,  // 10: hestia.activity.v1.HandicapService.Select:input_type -> hestia.activity.v1.SelectRequest
+	6,  // 11: hestia.activity.v1.HandicapService.VoidSelection:input_type -> hestia.activity.v1.VoidSelectionRequest
+	8,  // 12: hestia.activity.v1.HandicapService.GetMatchHandicaps:input_type -> hestia.activity.v1.GetMatchHandicapsRequest
+	10, // 13: hestia.activity.v1.HandicapService.ListMyViolations:input_type -> hestia.activity.v1.ListMyViolationsRequest
+	1,  // 14: hestia.activity.v1.HandicapService.ListItems:output_type -> hestia.activity.v1.ListItemsResponse
+	3,  // 15: hestia.activity.v1.HandicapService.GetMyBudget:output_type -> hestia.activity.v1.GetMyBudgetResponse
+	5,  // 16: hestia.activity.v1.HandicapService.Select:output_type -> hestia.activity.v1.SelectResponse
+	7,  // 17: hestia.activity.v1.HandicapService.VoidSelection:output_type -> hestia.activity.v1.VoidSelectionResponse
+	9,  // 18: hestia.activity.v1.HandicapService.GetMatchHandicaps:output_type -> hestia.activity.v1.GetMatchHandicapsResponse
+	11, // 19: hestia.activity.v1.HandicapService.ListMyViolations:output_type -> hestia.activity.v1.ListMyViolationsResponse
+	14, // [14:20] is the sub-list for method output_type
+	8,  // [8:14] is the sub-list for method input_type
+	8,  // [8:8] is the sub-list for extension type_name
+	8,  // [8:8] is the sub-list for extension extendee
+	0,  // [0:8] is the sub-list for field type_name
 }
 
 func init() { file_hestia_activity_v1_handicap_proto_init() }
@@ -658,7 +765,7 @@ func file_hestia_activity_v1_handicap_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_hestia_activity_v1_handicap_proto_rawDesc), len(file_hestia_activity_v1_handicap_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   10,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

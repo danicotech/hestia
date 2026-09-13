@@ -11,6 +11,7 @@ import (
 	"github.com/danicotech/hestia/gen/hestia/activity/v1/activityv1connect"
 	"github.com/danicotech/hestia/internal/core/activity/bp"
 	"github.com/danicotech/hestia/internal/core/activity/handicap"
+	"github.com/danicotech/hestia/internal/core/activity/match"
 )
 
 type fakeActivityHandicap struct {
@@ -32,6 +33,11 @@ type fakeActivityHandicap struct {
 
 	viewers    []int64
 	matchHcaps *handicap.MatchHandicaps
+
+	// refereeViews 記下裁判端檢視被呼叫過幾次、查的是哪一場。
+	// 分開記是為了測得出「ReviewHandicap 走的是另一支方法」——
+	// 兩支共用一個計數器的話,走錯方法也看不出來。
+	refereeViews []string
 }
 
 func (f *fakeActivityHandicap) ListItems(_ context.Context, tournamentID int64) ([]handicap.Item, error) {
@@ -66,10 +72,29 @@ func (f *fakeActivityHandicap) VoidSelection(
 	return f.voidRes, nil
 }
 
+// MatchHandicaps 模擬領域層的揭露界線:封盤前只對施加者本人給內容。
+//
+// 假物件照著真規則過濾,不是多此一舉 —— 少了它,「裁判看得到而觀眾看不到」
+// 這件事在入口層就無從驗起(兩支方法會回同一份東西,測試永遠綠)。
 func (f *fakeActivityHandicap) MatchHandicaps(
 	_ context.Context, _ string, viewerPlayerID int64,
 ) (*handicap.MatchHandicaps, error) {
 	f.viewers = append(f.viewers, viewerPlayerID)
+	if f.matchHcaps == nil {
+		return nil, nil
+	}
+	v := *f.matchHcaps
+	if !v.Revealed && (v.Budget == nil || viewerPlayerID != v.Budget.PlayerID) {
+		v.Budget, v.Selections = nil, nil
+	}
+	return &v, nil
+}
+
+// RefereeMatchHandicaps 不套用那條界線 —— 這正是它與上面那支的唯一差別。
+func (f *fakeActivityHandicap) RefereeMatchHandicaps(
+	_ context.Context, matchPublicID string,
+) (*handicap.MatchHandicaps, error) {
+	f.refereeViews = append(f.refereeViews, matchPublicID)
 	return f.matchHcaps, nil
 }
 
@@ -406,5 +431,52 @@ func TestListItemsWithoutSlugStillNeedsIdentity(t *testing.T) {
 	requireCode(t, err, connect.CodeUnauthenticated)
 	if len(svc.itemsFor) != 0 {
 		t.Fatal("問不出是哪一屆就不該碰領域層")
+	}
+}
+
+// 選手只看得到自己的違規:清單是整場的,對手那幾筆不能出現在回應裡。
+func TestListMyViolationsOnlyMine(t *testing.T) {
+	deps, _, _ := handicapDeps()
+	deps.Matches = &fakeActivityMatches{violationsOf: []match.Violation{
+		{PublicID: "01VA", MatchPublicID: testMatchID, PlayerPublicID: testPlayerAID,
+			Ruling: match.RulingWarning, Note: "越線", CreatedAt: time.Now()},
+		{PublicID: "01VB", MatchPublicID: testMatchID, PlayerPublicID: testPlayerBID,
+			Ruling: match.RulingRoundLoss, Note: "用了禁用的奇術", CreatedAt: time.Now()},
+	}}
+	srv := newActivityServer(t, deps)
+	client := activityv1connect.NewHandicapServiceClient(srv.Client(), srv.URL)
+	ctx := context.Background()
+
+	_, err := client.ListMyViolations(ctx, connect.NewRequest(&activityv1.ListMyViolationsRequest{
+		MatchPublicId: testMatchID,
+	}))
+	requireCode(t, err, connect.CodeUnauthenticated)
+
+	got, err := client.ListMyViolations(ctx, withPlayerSession(connect.NewRequest(
+		&activityv1.ListMyViolationsRequest{MatchPublicId: testMatchID}), testSessionTok))
+	if err != nil {
+		t.Fatalf("ListMyViolations: %v", err)
+	}
+	vs := got.Msg.GetViolations()
+	if len(vs) != 1 || vs[0].GetPublicId() != "01VA" || vs[0].GetPlayerPublicId() != testPlayerAID {
+		t.Fatalf("違規 = %v,只該有選手 A 自己那一筆", vs)
+	}
+	if vs[0].GetRuling() != activityv1.ViolationRuling_VIOLATION_RULING_WARNING || vs[0].GetNote() != "越線" {
+		t.Errorf("判決與備註沒帶到:%v", vs[0])
+	}
+}
+
+// 執行說明只走裁判端:同一筆選擇,選手端的回應永遠是空字串。
+func TestRefereeNoteOnlyOnJudgeSide(t *testing.T) {
+	sel := handicap.Selection{PublicID: "01S", ItemName: "禁用奇術", ItemRefereeNote: "開賽前確認技能欄"}
+	if got := handicapSelectionToProto(sel).GetRefereeNote(); got != "" {
+		t.Fatalf("選手端不該帶 referee_note,got %q", got)
+	}
+	mh := &handicap.MatchHandicaps{MatchPublicID: testMatchID, Selections: []handicap.Selection{sel}}
+	if got := refereeMatchHandicapsToProto(mh).GetSelections()[0].GetRefereeNote(); got != "開賽前確認技能欄" {
+		t.Fatalf("裁判端要帶 referee_note,got %q", got)
+	}
+	if got := matchHandicapsToProto(mh).GetSelections()[0].GetRefereeNote(); got != "" {
+		t.Fatalf("公開版本不該帶 referee_note,got %q", got)
 	}
 }

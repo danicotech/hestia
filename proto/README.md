@@ -229,13 +229,24 @@ catch (e) {
 | `handicap_selection_not_found` | not_found | 讓武選擇不存在 |
 | `handicap_selection_already_voided` | already_exists | 這筆讓武選擇已經退掉了 |
 | `handicap_budget_inconsistent` | internal | 已花費金額與選擇總和對不起來(不變量壞了) |
+| `handicap_invalid_item_params` | internal | 讓武項目的 params 不合契約(目錄或 DB 資料壞了) |
+| `handicap_draw_pool_empty` | failed_precondition | 封盤要抽選,但這屆 config 的抽選池是空的 |
+| `handicap_already_drawn` | internal | 同一筆讓武選擇被抽了兩次(封盤路徑有 bug) |
+| `handicap_catalogue_in_use` | failed_precondition | 已有讓武選擇引用目錄,不能再同步覆蓋 |
+| `handicap_catalogue_mismatch` | failed_precondition | 目錄與 DB 的項目 key 對不上,同步中止 |
 | `bet_invalid_request` | invalid_argument | 下注 / 投票參數不合法 |
 | `bet_self_bet` | permission_denied | 選手不得對自己參與的場次下注(別場可以) |
 | `bet_closed` | failed_precondition | 這場已封盤,不能再下注 |
 | `vote_closed` | failed_precondition | 這場已不開放投票 |
 | `bet_odds_moved` | aborted | 賠率已變動 → **重新取賠率後讓使用者再確認一次**,不要靜默重送 |
 | `bet_stake_too_large` | failed_precondition | 超過單筆下注上限 |
-| `bet_duplicate_leg` | invalid_argument | 同一注單不可重複押同一場 |
+| `bet_duplicate_match_in_parlay` | invalid_argument | 同一注單同一場只能一腿(不同盤口也不行) |
+| `market_not_found` | not_found | 盤口不存在,或不屬於指定的場次 |
+| `market_closed` | failed_precondition | 盤口已關閉(該回合已開打) |
+| `bet_outcome_invalid` | invalid_argument | 結果代碼不屬於這個盤口(如對時長盤投 p1) |
+| `markets_exist` | already_exists | 這場已經建過盤口 |
+| `market_settled` | failed_precondition | 盤口已結算過 |
+| `round_not_finished` | failed_precondition | 回合尚未結束,不能結算該回合的盤口 |
 | `bet_too_many_legs` | invalid_argument | 串關腿數過多 |
 | `bet_match_not_in_tournament` | invalid_argument | 這場不屬於這屆賽事 |
 | `bet_match_not_decided` | failed_precondition | 場次尚未分出勝負,不能結算 |
@@ -256,8 +267,18 @@ catch (e) {
 | `match_players_not_set` | failed_precondition | 場次雙方尚未確定(等上一輪),還不能開盤 |
 | `activity_bracket_missing` | internal | 這屆賽事尚未抽籤卻走到需要對戰表的路徑 |
 | `activity_advance_target_missing` | internal | 晉級目標場次不存在(對戰表壞了) |
+| `match_setup_not_confirmed` | failed_precondition | 開賽前設定尚未確認,不能開打 |
+| `match_setup_already_confirmed` | already_exists | 開賽前設定已確認過 |
+| `match_decided` | failed_precondition | 這場已分出勝負,不能再開回合 |
+| `round_in_progress` | failed_precondition | 上一回合還沒結束,不能開下一回合 |
+| `round_not_found` | not_found | 指定的回合不存在 |
+| `round_already_finished` | failed_precondition | 這個回合已經結束 |
+| `rounds_inconsistent` | internal | 回合紀錄與場次狀態矛盾(資料壞了) |
+| `match_multi_round` | failed_precondition | 多回合制的場次要走 FinishRound,不能用 ReportResult 一次判 |
+| `player_not_in_match` | invalid_argument | 指定的選手不在這場上 |
+| `violation_invalid_ruling` | invalid_argument | 違規的判決值不合法 |
 | `prize_invalid_request` | invalid_argument | 發獎參數不合法 |
-| `prize_third_place_undecidable` | failed_precondition | 設定了季軍獎金,但單淘汰沒有季軍賽推不出季軍 → **一毛不發**,要發得先加季軍賽 |
+| `prize_third_place_undecidable` | failed_precondition | 設定了季軍獎金,但這屆沒有打完的季軍戰 → **一毛不發**,要開 `format.third_place_match` 並打完季軍戰 |
 | `prize_final_not_decided` | failed_precondition | 決賽尚未分出勝負,名次不成立 |
 | `prize_bracket_broken` | internal | 對戰表資料異常,無法決定名次 |
 | `prize_ledger_state_conflict` | internal | 帳本回應與預期不符 |

@@ -7,13 +7,25 @@
 // ── 為什麼是投票驅動而不是彩池 ──────────────────────────────────
 //
 // 彩池做不了串關:彩池的賠率要等封盤後才算得出來,而串關必須在下注當下就
-// 知道每一腿的賠率才能乘起來。所以改成投票推導隱含機率:
+// 知道每一腿的賠率才能乘起來。所以改成投票推導隱含機率(n 路,schemas/21):
 //
-//	隱含機率 = (該方票數 + SMOOTHING) / (總票數 + 2×SMOOTHING)
-//	賠率     = (1 − VIG) / 隱含機率,夾在 [MIN_ODDS, MAX_ODDS]
+//	p_i    = (票_i + SMOOTHING) / (總票數 + n×SMOOTHING)     n = 該盤口的結果數
+//	賠率_i = (1 − VIG) / p_i,夾在 [MIN_ODDS, MAX_ODDS]
+//
+// 這是標準運彩邏輯:Σp_i = 1,Σ(1/賠率_i) = 1/(1−VIG) —— 那多出來的就是抽水。
+// 兩路(勝負)是 n=2 的特例;比分盤(三局兩勝)是 n=4。
 //
 // **賠率在下注當下鎖定**寫進注單。之後票數再怎麼跑都不影響已成立的注單,
 // 派彩也直接發下注當下算定的金額 —— 選手看到的「可能贏得 X」必須等於實際入帳。
+//
+// ── 盤口(2026-09-13)──────────────────────────────────────────
+//
+// 一場比賽有多個盤口:整場勝敗、單回合勝敗、時長、比分。哪些存在由該屆的
+// 規則設定決定(schemas/28),場次開盤時建。每個盤口各自投票、各自結算。
+//
+// **串關的各腿必須落在不同場次**(同一場只能一腿):押「A 贏整場」+「比分 2:0」
+// 是同一件事押兩次,賠率卻相乘 —— 沒有莊家在對面收錢,超額派彩直接從代幣供給出。
+// 跨場串不同盤口完全可以:第 1 場押時長 + 第 2 場押比分 + 第 3 場押勝負。
 //
 // ── 這裡全部是真錢 ──────────────────────────────────────────────
 //
@@ -73,9 +85,9 @@ const (
 
 // BettingServiceClient is a client for the hestia.activity.v1.BettingService service.
 type BettingServiceClient interface {
-	// 投票給某一方。一場一票,再投即改票。
+	// 對某個盤口投一個結果。一場每盤口一票,再投即改票。
 	Vote(context.Context, *connect.Request[v1.VoteRequest]) (*connect.Response[v1.VoteResponse], error)
-	// 取得目前賠率與票數。匿名可讀。
+	// 取得目前各盤口的賠率與票數。匿名可讀。
 	GetOdds(context.Context, *connect.Request[v1.GetOddsRequest]) (*connect.Response[v1.GetOddsResponse], error)
 	// 下注。單場或串關都走這支。
 	PlaceBet(context.Context, *connect.Request[v1.PlaceBetRequest]) (*connect.Response[v1.PlaceBetResponse], error)
@@ -151,9 +163,9 @@ func (c *bettingServiceClient) ListMyBets(ctx context.Context, req *connect.Requ
 
 // BettingServiceHandler is an implementation of the hestia.activity.v1.BettingService service.
 type BettingServiceHandler interface {
-	// 投票給某一方。一場一票,再投即改票。
+	// 對某個盤口投一個結果。一場每盤口一票,再投即改票。
 	Vote(context.Context, *connect.Request[v1.VoteRequest]) (*connect.Response[v1.VoteResponse], error)
-	// 取得目前賠率與票數。匿名可讀。
+	// 取得目前各盤口的賠率與票數。匿名可讀。
 	GetOdds(context.Context, *connect.Request[v1.GetOddsRequest]) (*connect.Response[v1.GetOddsResponse], error)
 	// 下注。單場或串關都走這支。
 	PlaceBet(context.Context, *connect.Request[v1.PlaceBetRequest]) (*connect.Response[v1.PlaceBetResponse], error)

@@ -70,18 +70,28 @@ const (
 	// 賽事裁判(activity)。逐條列是因為 privilegedServices 的前綴只決定
 	// 「要不要授權」,「需要哪個權限」仍然在這張表裡 —— 而啟動時的
 	// verifyProcedureCoverage 會走一遍 proto descriptor,漏掉一支直接開不起來。
-	ProcJudgeCreateTournament   = "/hestia.activity.v1.JudgeService/CreateTournament"
-	ProcJudgeAdvancePhase       = "/hestia.activity.v1.JudgeService/AdvancePhase"
-	ProcJudgeAssignRank         = "/hestia.activity.v1.JudgeService/AssignRank"
-	ProcJudgeListUnranked       = "/hestia.activity.v1.JudgeService/ListUnranked"
-	ProcJudgeDrawBracket        = "/hestia.activity.v1.JudgeService/DrawBracket"
-	ProcJudgeSwapSeeds          = "/hestia.activity.v1.JudgeService/SwapSeeds"
-	ProcJudgeConfirmBracket     = "/hestia.activity.v1.JudgeService/ConfirmBracket"
-	ProcJudgeOpenHandicap       = "/hestia.activity.v1.JudgeService/OpenHandicap"
-	ProcJudgeLockHandicap       = "/hestia.activity.v1.JudgeService/LockHandicap"
-	ProcJudgeSetStreamUrl       = "/hestia.activity.v1.JudgeService/SetStreamUrl"
-	ProcJudgeStartMatch         = "/hestia.activity.v1.JudgeService/StartMatch"
+	ProcJudgeCreateTournament = "/hestia.activity.v1.JudgeService/CreateTournament"
+	ProcJudgeAdvancePhase     = "/hestia.activity.v1.JudgeService/AdvancePhase"
+	ProcJudgeAssignRank       = "/hestia.activity.v1.JudgeService/AssignRank"
+	ProcJudgeListUnranked     = "/hestia.activity.v1.JudgeService/ListUnranked"
+	ProcJudgeDrawBracket      = "/hestia.activity.v1.JudgeService/DrawBracket"
+	ProcJudgeSwapSeeds        = "/hestia.activity.v1.JudgeService/SwapSeeds"
+	ProcJudgeConfirmBracket   = "/hestia.activity.v1.JudgeService/ConfirmBracket"
+	ProcJudgeOpenHandicap     = "/hestia.activity.v1.JudgeService/OpenHandicap"
+	ProcJudgeReviewHandicap   = "/hestia.activity.v1.JudgeService/ReviewHandicap"
+	ProcJudgeRefundSelection  = "/hestia.activity.v1.JudgeService/RefundSelection"
+	ProcJudgeLockHandicap     = "/hestia.activity.v1.JudgeService/LockHandicap"
+	ProcJudgeSetStreamUrl     = "/hestia.activity.v1.JudgeService/SetStreamUrl"
+	// 多回合制的裁判動線(schemas/20「裁判動線」,2026-09-13)。StartMatch 已由
+	// StartRound 取代:第 1 回合的 StartRound 就是「開打」,兩個名字指同一件事的話
+	// 就是兩個權威位置。
+	ProcJudgeReviewSetup        = "/hestia.activity.v1.JudgeService/ReviewSetup"
+	ProcJudgeConfirmSetup       = "/hestia.activity.v1.JudgeService/ConfirmSetup"
+	ProcJudgeStartRound         = "/hestia.activity.v1.JudgeService/StartRound"
+	ProcJudgeFinishRound        = "/hestia.activity.v1.JudgeService/FinishRound"
 	ProcJudgeReportResult       = "/hestia.activity.v1.JudgeService/ReportResult"
+	ProcJudgeRecordViolation    = "/hestia.activity.v1.JudgeService/RecordViolation"
+	ProcJudgeListViolations     = "/hestia.activity.v1.JudgeService/ListViolations"
 	ProcJudgeWithdrawPlayer     = "/hestia.activity.v1.JudgeService/WithdrawPlayer"
 	ProcJudgeRegeneratePasscode = "/hestia.activity.v1.JudgeService/RegeneratePasscode"
 	ProcJudgeAwardPrizes        = "/hestia.activity.v1.JudgeService/AwardPrizes"
@@ -102,18 +112,30 @@ var procedurePermissions = map[string]Permission{
 	// 發獎走 economy.grant:它動的是平台代幣,而「能發錢」這個概念已經有權限了。
 	// 裁判要發獎就得另外拿到那個權限 —— 判勝負與發錢是兩件事,
 	// 同一個人能做不代表該用同一把鑰匙。
-	ProcJudgeCreateTournament:   PermTournamentJudge,
-	ProcJudgeAdvancePhase:       PermTournamentJudge,
-	ProcJudgeAssignRank:         PermTournamentJudge,
-	ProcJudgeListUnranked:       PermTournamentJudge,
-	ProcJudgeDrawBracket:        PermTournamentJudge,
-	ProcJudgeSwapSeeds:          PermTournamentJudge,
-	ProcJudgeConfirmBracket:     PermTournamentJudge,
-	ProcJudgeOpenHandicap:       PermTournamentJudge,
-	ProcJudgeLockHandicap:       PermTournamentJudge,
-	ProcJudgeSetStreamUrl:       PermTournamentJudge,
-	ProcJudgeStartMatch:         PermTournamentJudge,
+	ProcJudgeCreateTournament: PermTournamentJudge,
+	ProcJudgeAdvancePhase:     PermTournamentJudge,
+	ProcJudgeAssignRank:       PermTournamentJudge,
+	ProcJudgeListUnranked:     PermTournamentJudge,
+	ProcJudgeDrawBracket:      PermTournamentJudge,
+	ProcJudgeSwapSeeds:        PermTournamentJudge,
+	ProcJudgeConfirmBracket:   PermTournamentJudge,
+	ProcJudgeOpenHandicap:     PermTournamentJudge,
+	// 檢視讓武要裁判權限,理由與其他幾支不同:它讀的是**封盤前只有施加者
+	// 本人看得到**的內容。漏登記在這裡不是「少一道手續」,是把對手還沒公開的
+	// 限制清單開放給任何登入使用者。
+	ProcJudgeReviewHandicap:  PermTournamentJudge,
+	ProcJudgeRefundSelection: PermTournamentJudge,
+	ProcJudgeLockHandicap:    PermTournamentJudge,
+	ProcJudgeSetStreamUrl:    PermTournamentJudge,
+	// ReviewSetup 與 ListViolations 是純讀取,但讀的是裁判端才該看的東西
+	// (執行說明從不離開裁判端;違規紀錄的 item 會間接洩漏封盤前誰買了什麼)。
+	ProcJudgeReviewSetup:        PermTournamentJudge,
+	ProcJudgeConfirmSetup:       PermTournamentJudge,
+	ProcJudgeStartRound:         PermTournamentJudge,
+	ProcJudgeFinishRound:        PermTournamentJudge,
 	ProcJudgeReportResult:       PermTournamentJudge,
+	ProcJudgeRecordViolation:    PermTournamentJudge,
+	ProcJudgeListViolations:     PermTournamentJudge,
 	ProcJudgeWithdrawPlayer:     PermTournamentJudge,
 	ProcJudgeRegeneratePasscode: PermTournamentJudge,
 	ProcJudgeAwardPrizes:        PermEconomyGrant,

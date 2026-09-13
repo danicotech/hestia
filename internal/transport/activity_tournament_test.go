@@ -170,6 +170,7 @@ type fakeActivityReader struct {
 	matchErr           error
 	currentMatch       *match.Match
 	fencers            map[int64]signup.Fencer
+	rounds             map[int64][]match.Round
 }
 
 func (f *fakeActivityReader) TournamentByID(context.Context, int64) (tournament.Tournament, error) {
@@ -217,6 +218,10 @@ func (f *fakeActivityReader) MatchByPublicID(_ context.Context, publicID string)
 		return match.Match{}, activityerr.ErrMatchNotFound
 	}
 	return m, nil
+}
+
+func (f *fakeActivityReader) RoundsByMatches(context.Context, []int64) (map[int64][]match.Round, error) {
+	return f.rounds, nil
 }
 
 func (f *fakeActivityReader) CurrentMatchOfPlayer(context.Context, int64) (*match.Match, error) {

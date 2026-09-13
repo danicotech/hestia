@@ -8,21 +8,33 @@
 //
 // ── 這個服務的權限與留痕 ────────────────────────────────────────
 //
-// 全部 RPC 需要平台帳號 + 裁判權限,而且**每一支都寫 admin_audit_logs**。
-// 不是挑幾支寫 —— 賽事的公正性完全建立在「誰在什麼時候改了什麼」查得到。
-// 改段位、重抽籤、交換籤位、封盤、判賽果,每一項都有人會不服氣。
+// 全部 RPC 需要平台帳號 + 裁判權限,而且**每一支會動到資料的都寫
+// admin_audit_logs**。不是挑幾支寫 —— 賽事的公正性完全建立在「誰在什麼時候
+// 改了什麼」查得到。改段位、重抽籤、交換籤位、封盤、代退讓武、判賽果,
+// 每一項都有人會不服氣。
+//
+// 純讀取的兩支(ListUnranked、ReviewHandicap)不寫稽核:它們沒有「改了什麼」
+// 可記,而把裁判每一次查看都記成一列,只會讓真正要查的那幾列被淹掉。
 //
 // ── 為什麼賽果只能裁判填 ────────────────────────────────────────
 //
 // 因為有下注。選手自報會直接變成派彩爭議,而派彩一旦發出去就很難收回。
 // 單一權威來源是這裡唯一可行的設計。
 //
-// ── 不可逆的兩個動作 ────────────────────────────────────────────
+// ── 不可逆的動作 ────────────────────────────────────────────────
 //
-//   LockHandicap  封盤後選手不能再改讓武,且立刻公開並發 Discord 公告。
-//   ReportResult  判定勝負會觸發下注結算與派彩。
+//   LockHandicap  封盤後選手不能再改讓武,且立刻公開並發 Discord 公告;
+//                 隨機抽選也在這一刻做完。
+//   FinishRound   填回合勝者;達到勝場數的那一次會定案整場、觸發晉級與派彩。
+//   ReportResult  單場定勝負(best_of = 1)時的同一件事。
 //
-// 兩者都要求 confirm = true 作為二次確認。誤觸的代價由人承擔,不由系統吞掉。
+// 都要求 confirm = true 作為二次確認。誤觸的代價由人承擔,不由系統吞掉。
+//
+// ── 多回合制的裁判動線(schemas/20「裁判動線」)──────────────────
+//
+//   一場一次:開盤 → 封盤前檢視/代退 → 封盤 → ReviewSetup → ConfirmSetup
+//   每回合一次:StartRound(第 1 回合 = 正式開打,關下注)→ FinishRound
+//   一場一次:整場勝者由回合推導 → 晉級 / 派彩 / 季軍戰
 
 package activityv1
 
@@ -140,8 +152,8 @@ type TournamentPrizeSettings struct {
 	state    protoimpl.MessageState `protogen:"open.v1"`
 	Champion int64                  `protobuf:"varint,1,opt,name=champion,proto3" json:"champion,omitempty"`
 	RunnerUp int64                  `protobuf:"varint,2,opt,name=runner_up,json=runnerUp,proto3" json:"runner_up,omitempty"`
-	// 單淘汰沒有季軍賽,季軍推不出來。**填 0 以外的值會在發獎時被拒絕**,
-	// 那是刻意的 —— 不是 bug。
+	// 季軍。只有 format.third_place_match = true 的賽事才推得出季軍(季軍戰的勝者);
+	// 沒打季軍戰卻填了金額,發獎時會被拒絕 —— 那是刻意的,不是 bug。
 	Third int64 `protobuf:"varint,3,opt,name=third,proto3" json:"third,omitempty"`
 	// 參加獎,發給每一位報名並綁定平台帳號的選手。
 	Participation int64 `protobuf:"varint,4,opt,name=participation,proto3" json:"participation,omitempty"`
@@ -240,8 +252,10 @@ type CreateTournamentRequest struct {
 	Prizes *TournamentPrizeSettings `protobuf:"bytes,7,opt,name=prizes,proto3" json:"prizes,omitempty"`
 	// 單一讓武項目的重複購買上限。**0 = 不限制**,這是目前的定案值。
 	HandicapItemMaxQty int32 `protobuf:"varint,8,opt,name=handicap_item_max_qty,json=handicapItemMaxQty,proto3" json:"handicap_item_max_qty,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// 賽制。整包留空 = 單場定勝負、無季軍戰。
+	Format        *TournamentFormatSettings `protobuf:"bytes,9,opt,name=format,proto3" json:"format,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *CreateTournamentRequest) Reset() {
@@ -330,6 +344,68 @@ func (x *CreateTournamentRequest) GetHandicapItemMaxQty() int32 {
 	return 0
 }
 
+func (x *CreateTournamentRequest) GetFormat() *TournamentFormatSettings {
+	if x != nil {
+		return x.Format
+	}
+	return nil
+}
+
+// TournamentFormatSettings 是賽制(schemas/28 的 config.format)。
+type TournamentFormatSettings struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 幾局幾勝,必須是正奇數。0 = 預設 1(單場定勝負)。第一屆是 3。
+	BestOf int32 `protobuf:"varint,1,opt,name=best_of,json=bestOf,proto3" json:"best_of,omitempty"`
+	// 準決賽敗者是否加打季軍戰。
+	ThirdPlaceMatch bool `protobuf:"varint,2,opt,name=third_place_match,json=thirdPlaceMatch,proto3" json:"third_place_match,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *TournamentFormatSettings) Reset() {
+	*x = TournamentFormatSettings{}
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TournamentFormatSettings) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TournamentFormatSettings) ProtoMessage() {}
+
+func (x *TournamentFormatSettings) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TournamentFormatSettings.ProtoReflect.Descriptor instead.
+func (*TournamentFormatSettings) Descriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *TournamentFormatSettings) GetBestOf() int32 {
+	if x != nil {
+		return x.BestOf
+	}
+	return 0
+}
+
+func (x *TournamentFormatSettings) GetThirdPlaceMatch() bool {
+	if x != nil {
+		return x.ThirdPlaceMatch
+	}
+	return false
+}
+
 type CreateTournamentResponse struct {
 	state      protoimpl.MessageState `protogen:"open.v1"`
 	Tournament *Tournament            `protobuf:"bytes,1,opt,name=tournament,proto3" json:"tournament,omitempty"`
@@ -344,7 +420,7 @@ type CreateTournamentResponse struct {
 
 func (x *CreateTournamentResponse) Reset() {
 	*x = CreateTournamentResponse{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[3]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -356,7 +432,7 @@ func (x *CreateTournamentResponse) String() string {
 func (*CreateTournamentResponse) ProtoMessage() {}
 
 func (x *CreateTournamentResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[3]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -369,7 +445,7 @@ func (x *CreateTournamentResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateTournamentResponse.ProtoReflect.Descriptor instead.
 func (*CreateTournamentResponse) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{3}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *CreateTournamentResponse) GetTournament() *Tournament {
@@ -399,7 +475,7 @@ type AdvancePhaseRequest struct {
 
 func (x *AdvancePhaseRequest) Reset() {
 	*x = AdvancePhaseRequest{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[4]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -411,7 +487,7 @@ func (x *AdvancePhaseRequest) String() string {
 func (*AdvancePhaseRequest) ProtoMessage() {}
 
 func (x *AdvancePhaseRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[4]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -424,7 +500,7 @@ func (x *AdvancePhaseRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AdvancePhaseRequest.ProtoReflect.Descriptor instead.
 func (*AdvancePhaseRequest) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{4}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *AdvancePhaseRequest) GetTournamentSlug() string {
@@ -457,7 +533,7 @@ type AdvancePhaseResponse struct {
 
 func (x *AdvancePhaseResponse) Reset() {
 	*x = AdvancePhaseResponse{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[5]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -469,7 +545,7 @@ func (x *AdvancePhaseResponse) String() string {
 func (*AdvancePhaseResponse) ProtoMessage() {}
 
 func (x *AdvancePhaseResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[5]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -482,7 +558,7 @@ func (x *AdvancePhaseResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AdvancePhaseResponse.ProtoReflect.Descriptor instead.
 func (*AdvancePhaseResponse) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{5}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *AdvancePhaseResponse) GetTournament() *Tournament {
@@ -504,7 +580,7 @@ type AssignRankRequest struct {
 
 func (x *AssignRankRequest) Reset() {
 	*x = AssignRankRequest{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[6]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -516,7 +592,7 @@ func (x *AssignRankRequest) String() string {
 func (*AssignRankRequest) ProtoMessage() {}
 
 func (x *AssignRankRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[6]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -529,7 +605,7 @@ func (x *AssignRankRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AssignRankRequest.ProtoReflect.Descriptor instead.
 func (*AssignRankRequest) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{6}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *AssignRankRequest) GetPlayerPublicId() string {
@@ -562,7 +638,7 @@ type AssignRankResponse struct {
 
 func (x *AssignRankResponse) Reset() {
 	*x = AssignRankResponse{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[7]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -574,7 +650,7 @@ func (x *AssignRankResponse) String() string {
 func (*AssignRankResponse) ProtoMessage() {}
 
 func (x *AssignRankResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[7]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -587,7 +663,7 @@ func (x *AssignRankResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AssignRankResponse.ProtoReflect.Descriptor instead.
 func (*AssignRankResponse) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{7}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *AssignRankResponse) GetPlayer() *Player {
@@ -608,7 +684,7 @@ type ListUnrankedRequest struct {
 
 func (x *ListUnrankedRequest) Reset() {
 	*x = ListUnrankedRequest{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[8]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -620,7 +696,7 @@ func (x *ListUnrankedRequest) String() string {
 func (*ListUnrankedRequest) ProtoMessage() {}
 
 func (x *ListUnrankedRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[8]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -633,7 +709,7 @@ func (x *ListUnrankedRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListUnrankedRequest.ProtoReflect.Descriptor instead.
 func (*ListUnrankedRequest) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{8}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ListUnrankedRequest) GetTournamentSlug() string {
@@ -673,7 +749,7 @@ type PlayerDossier struct {
 
 func (x *PlayerDossier) Reset() {
 	*x = PlayerDossier{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[9]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -685,7 +761,7 @@ func (x *PlayerDossier) String() string {
 func (*PlayerDossier) ProtoMessage() {}
 
 func (x *PlayerDossier) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[9]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -698,7 +774,7 @@ func (x *PlayerDossier) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PlayerDossier.ProtoReflect.Descriptor instead.
 func (*PlayerDossier) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{9}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *PlayerDossier) GetPlayer() *Player {
@@ -787,7 +863,7 @@ type ListUnrankedResponse struct {
 
 func (x *ListUnrankedResponse) Reset() {
 	*x = ListUnrankedResponse{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[10]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -799,7 +875,7 @@ func (x *ListUnrankedResponse) String() string {
 func (*ListUnrankedResponse) ProtoMessage() {}
 
 func (x *ListUnrankedResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[10]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -812,7 +888,7 @@ func (x *ListUnrankedResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListUnrankedResponse.ProtoReflect.Descriptor instead.
 func (*ListUnrankedResponse) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{10}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *ListUnrankedResponse) GetPlayers() []*PlayerDossier {
@@ -834,7 +910,7 @@ type DrawBracketRequest struct {
 
 func (x *DrawBracketRequest) Reset() {
 	*x = DrawBracketRequest{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[11]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -846,7 +922,7 @@ func (x *DrawBracketRequest) String() string {
 func (*DrawBracketRequest) ProtoMessage() {}
 
 func (x *DrawBracketRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[11]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -859,7 +935,7 @@ func (x *DrawBracketRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DrawBracketRequest.ProtoReflect.Descriptor instead.
 func (*DrawBracketRequest) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{11}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *DrawBracketRequest) GetTournamentSlug() string {
@@ -889,7 +965,7 @@ type DrawBracketResponse struct {
 
 func (x *DrawBracketResponse) Reset() {
 	*x = DrawBracketResponse{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[12]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -901,7 +977,7 @@ func (x *DrawBracketResponse) String() string {
 func (*DrawBracketResponse) ProtoMessage() {}
 
 func (x *DrawBracketResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[12]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -914,7 +990,7 @@ func (x *DrawBracketResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DrawBracketResponse.ProtoReflect.Descriptor instead.
 func (*DrawBracketResponse) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{12}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *DrawBracketResponse) GetRounds() []*BracketRound {
@@ -950,7 +1026,7 @@ type SwapSeedsRequest struct {
 
 func (x *SwapSeedsRequest) Reset() {
 	*x = SwapSeedsRequest{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[13]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -962,7 +1038,7 @@ func (x *SwapSeedsRequest) String() string {
 func (*SwapSeedsRequest) ProtoMessage() {}
 
 func (x *SwapSeedsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[13]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -975,7 +1051,7 @@ func (x *SwapSeedsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SwapSeedsRequest.ProtoReflect.Descriptor instead.
 func (*SwapSeedsRequest) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{13}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *SwapSeedsRequest) GetPlayerAPublicId() string {
@@ -1008,7 +1084,7 @@ type SwapSeedsResponse struct {
 
 func (x *SwapSeedsResponse) Reset() {
 	*x = SwapSeedsResponse{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[14]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1020,7 +1096,7 @@ func (x *SwapSeedsResponse) String() string {
 func (*SwapSeedsResponse) ProtoMessage() {}
 
 func (x *SwapSeedsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[14]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1033,7 +1109,7 @@ func (x *SwapSeedsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SwapSeedsResponse.ProtoReflect.Descriptor instead.
 func (*SwapSeedsResponse) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{14}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *SwapSeedsResponse) GetRounds() []*BracketRound {
@@ -1054,7 +1130,7 @@ type ConfirmBracketRequest struct {
 
 func (x *ConfirmBracketRequest) Reset() {
 	*x = ConfirmBracketRequest{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[15]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1066,7 +1142,7 @@ func (x *ConfirmBracketRequest) String() string {
 func (*ConfirmBracketRequest) ProtoMessage() {}
 
 func (x *ConfirmBracketRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[15]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1079,7 +1155,7 @@ func (x *ConfirmBracketRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ConfirmBracketRequest.ProtoReflect.Descriptor instead.
 func (*ConfirmBracketRequest) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{15}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *ConfirmBracketRequest) GetTournamentSlug() string {
@@ -1105,7 +1181,7 @@ type ConfirmBracketResponse struct {
 
 func (x *ConfirmBracketResponse) Reset() {
 	*x = ConfirmBracketResponse{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[16]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1117,7 +1193,7 @@ func (x *ConfirmBracketResponse) String() string {
 func (*ConfirmBracketResponse) ProtoMessage() {}
 
 func (x *ConfirmBracketResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[16]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1130,7 +1206,7 @@ func (x *ConfirmBracketResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ConfirmBracketResponse.ProtoReflect.Descriptor instead.
 func (*ConfirmBracketResponse) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{16}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *ConfirmBracketResponse) GetTournament() *Tournament {
@@ -1149,7 +1225,7 @@ type OpenHandicapRequest struct {
 
 func (x *OpenHandicapRequest) Reset() {
 	*x = OpenHandicapRequest{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[17]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1161,7 +1237,7 @@ func (x *OpenHandicapRequest) String() string {
 func (*OpenHandicapRequest) ProtoMessage() {}
 
 func (x *OpenHandicapRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[17]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1174,7 +1250,7 @@ func (x *OpenHandicapRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OpenHandicapRequest.ProtoReflect.Descriptor instead.
 func (*OpenHandicapRequest) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{17}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *OpenHandicapRequest) GetMatchPublicId() string {
@@ -1193,7 +1269,7 @@ type OpenHandicapResponse struct {
 
 func (x *OpenHandicapResponse) Reset() {
 	*x = OpenHandicapResponse{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[18]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1205,7 +1281,7 @@ func (x *OpenHandicapResponse) String() string {
 func (*OpenHandicapResponse) ProtoMessage() {}
 
 func (x *OpenHandicapResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[18]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1218,12 +1294,242 @@ func (x *OpenHandicapResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use OpenHandicapResponse.ProtoReflect.Descriptor instead.
 func (*OpenHandicapResponse) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{18}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *OpenHandicapResponse) GetMatch() *Match {
 	if x != nil {
 		return x.Match
+	}
+	return nil
+}
+
+// ReviewHandicapRequest 是裁判檢視一場的讓武內容。
+//
+// 為什麼需要一支**裁判專用**的檢視:HandicapService.GetMatchHandicaps 在封盤前
+// 只對施加者本人揭露內容,而裁判不是場上的選手 —— 他走那支拿到的永遠是空清單。
+// 但要裁判執行的規則就寫在買下的項目裡(「禁用奇術」的 referee_note 要求裁判
+// 確認後返還另一項的 BP),看不到內容等於那些規則沒有人執行得了。
+//
+// 這支**不**把內容變成公開:揭露界線只對這條需要裁判權限的路徑讓開,
+// 選手與觀眾走的仍是原來那支,行為一字未改。
+type ReviewHandicapRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	MatchPublicId string                 `protobuf:"bytes,1,opt,name=match_public_id,json=matchPublicId,proto3" json:"match_public_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReviewHandicapRequest) Reset() {
+	*x = ReviewHandicapRequest{}
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReviewHandicapRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReviewHandicapRequest) ProtoMessage() {}
+
+func (x *ReviewHandicapRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReviewHandicapRequest.ProtoReflect.Descriptor instead.
+func (*ReviewHandicapRequest) Descriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *ReviewHandicapRequest) GetMatchPublicId() string {
+	if x != nil {
+		return x.MatchPublicId
+	}
+	return ""
+}
+
+type ReviewHandicapResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 形狀與 GetMatchHandicaps 完全相同(同一個 message 型別)——
+	// 裁判端與選手端顯示的是同一份東西,差別只在封盤前看不看得到。
+	//
+	// 注意 locked_at 為空時仍可能有 selections:那正是這支 RPC 的用途。
+	Handicaps     *MatchHandicaps `protobuf:"bytes,1,opt,name=handicaps,proto3" json:"handicaps,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReviewHandicapResponse) Reset() {
+	*x = ReviewHandicapResponse{}
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReviewHandicapResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReviewHandicapResponse) ProtoMessage() {}
+
+func (x *ReviewHandicapResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReviewHandicapResponse.ProtoReflect.Descriptor instead.
+func (*ReviewHandicapResponse) Descriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *ReviewHandicapResponse) GetHandicaps() *MatchHandicaps {
+	if x != nil {
+		return x.Handicaps
+	}
+	return nil
+}
+
+// RefundSelectionRequest 是裁判退掉某一筆讓武選擇。
+//
+// # 為什麼需要它
+//
+// 目錄裡的規則自己要求:「禁用奇術」的 referee_note 寫著「對手全場無法使用任何
+// 奇術,若同時買了禁用任意奇術,將經裁判確認後返還禁用任意奇術的 BP」。
+// 選手自助的 HandicapService.VoidSelection 只認選擇的本人,裁判走不了那條路。
+//
+// # 沒有 idempotency_key
+//
+// BP 不是平台代幣(每輪依段位差重發、該場有效、賽後作廢、不可交易),
+// 退點只是標 voided + 改 spent,不經帳本。重複呼叫由「已經退過」擋下來,
+// 不是靠冪等鍵去重 —— 真正動錢的 AwardPrizes 與 PlaceBet 才有那把鍵。
+//
+// # 沒有 confirm
+//
+// 退點不是不可逆:封盤前選手能拿退回來的 BP 重買同一項。
+// 二次確認由必填的 reason 承擔 —— 要打字的動作不會誤觸。
+type RefundSelectionRequest struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	SelectionPublicId string                 `protobuf:"bytes,1,opt,name=selection_public_id,json=selectionPublicId,proto3" json:"selection_public_id,omitempty"`
+	// 為什麼退。**必填**,進稽核紀錄。
+	//
+	// 這一步拿走的是選手已經買到手的東西,而它唯一的正當理由來自目錄裡的規則。
+	// 不寫理由的退點,事後沒有人分得出「依規則返還」與「把不喜歡的項目刪掉」。
+	Reason        string `protobuf:"bytes,2,opt,name=reason,proto3" json:"reason,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RefundSelectionRequest) Reset() {
+	*x = RefundSelectionRequest{}
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RefundSelectionRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RefundSelectionRequest) ProtoMessage() {}
+
+func (x *RefundSelectionRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RefundSelectionRequest.ProtoReflect.Descriptor instead.
+func (*RefundSelectionRequest) Descriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *RefundSelectionRequest) GetSelectionPublicId() string {
+	if x != nil {
+		return x.SelectionPublicId
+	}
+	return ""
+}
+
+func (x *RefundSelectionRequest) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+type RefundSelectionResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 退款後的預算,BP 已經回到裡面。
+	Budget *BpBudget `protobuf:"bytes,1,opt,name=budget,proto3" json:"budget,omitempty"`
+	// 被退掉的那一筆。回傳它是為了讓裁判端能當場確認「退掉的確實是那一項」——
+	// 請求只帶 public_id,而裁判要核對的是項目名稱與 BP。
+	Selection     *HandicapSelection `protobuf:"bytes,2,opt,name=selection,proto3" json:"selection,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RefundSelectionResponse) Reset() {
+	*x = RefundSelectionResponse{}
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RefundSelectionResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RefundSelectionResponse) ProtoMessage() {}
+
+func (x *RefundSelectionResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RefundSelectionResponse.ProtoReflect.Descriptor instead.
+func (*RefundSelectionResponse) Descriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *RefundSelectionResponse) GetBudget() *BpBudget {
+	if x != nil {
+		return x.Budget
+	}
+	return nil
+}
+
+func (x *RefundSelectionResponse) GetSelection() *HandicapSelection {
+	if x != nil {
+		return x.Selection
 	}
 	return nil
 }
@@ -1239,7 +1545,7 @@ type LockHandicapRequest struct {
 
 func (x *LockHandicapRequest) Reset() {
 	*x = LockHandicapRequest{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[19]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1251,7 +1557,7 @@ func (x *LockHandicapRequest) String() string {
 func (*LockHandicapRequest) ProtoMessage() {}
 
 func (x *LockHandicapRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[19]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1264,7 +1570,7 @@ func (x *LockHandicapRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LockHandicapRequest.ProtoReflect.Descriptor instead.
 func (*LockHandicapRequest) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{19}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *LockHandicapRequest) GetMatchPublicId() string {
@@ -1292,7 +1598,7 @@ type LockHandicapResponse struct {
 
 func (x *LockHandicapResponse) Reset() {
 	*x = LockHandicapResponse{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[20]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1304,7 +1610,7 @@ func (x *LockHandicapResponse) String() string {
 func (*LockHandicapResponse) ProtoMessage() {}
 
 func (x *LockHandicapResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[20]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1317,7 +1623,7 @@ func (x *LockHandicapResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LockHandicapResponse.ProtoReflect.Descriptor instead.
 func (*LockHandicapResponse) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{20}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *LockHandicapResponse) GetMatch() *Match {
@@ -1345,7 +1651,7 @@ type SetStreamUrlRequest struct {
 
 func (x *SetStreamUrlRequest) Reset() {
 	*x = SetStreamUrlRequest{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[21]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1357,7 +1663,7 @@ func (x *SetStreamUrlRequest) String() string {
 func (*SetStreamUrlRequest) ProtoMessage() {}
 
 func (x *SetStreamUrlRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[21]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1370,7 +1676,7 @@ func (x *SetStreamUrlRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetStreamUrlRequest.ProtoReflect.Descriptor instead.
 func (*SetStreamUrlRequest) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{21}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *SetStreamUrlRequest) GetMatchPublicId() string {
@@ -1396,7 +1702,7 @@ type SetStreamUrlResponse struct {
 
 func (x *SetStreamUrlResponse) Reset() {
 	*x = SetStreamUrlResponse{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[22]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1408,7 +1714,7 @@ func (x *SetStreamUrlResponse) String() string {
 func (*SetStreamUrlResponse) ProtoMessage() {}
 
 func (x *SetStreamUrlResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[22]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1421,7 +1727,7 @@ func (x *SetStreamUrlResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetStreamUrlResponse.ProtoReflect.Descriptor instead.
 func (*SetStreamUrlResponse) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{22}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *SetStreamUrlResponse) GetMatch() *Match {
@@ -1431,28 +1737,129 @@ func (x *SetStreamUrlResponse) GetMatch() *Match {
 	return nil
 }
 
-type StartMatchRequest struct {
+// SetupChecklistEntry 是開賽前設定確認清單的一列。
+//
+// 清單是**推導值**(該場未作廢的讓武選擇 JOIN 項目的執行說明 + 抽選結果),
+// 伺服器不另存一份;所以 referee_note 的文字本身就是清單內容 —— 御風羽審定的
+// 那 34 條正是它。只出現在裁判端(執行說明從不離開裁判端)。
+type SetupChecklistEntry struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	SelectionPublicId string                 `protobuf:"bytes,1,opt,name=selection_public_id,json=selectionPublicId,proto3" json:"selection_public_id,omitempty"`
+	ItemKey           string                 `protobuf:"bytes,2,opt,name=item_key,json=itemKey,proto3" json:"item_key,omitempty"`
+	ItemName          string                 `protobuf:"bytes,3,opt,name=item_name,json=itemName,proto3" json:"item_name,omitempty"`
+	// 給裁判看的執行說明:怎麼確認對手真的遵守了。
+	RefereeNote string `protobuf:"bytes,4,opt,name=referee_note,json=refereeNote,proto3" json:"referee_note,omitempty"`
+	// 選手填的指定內容(要改到哪個鍵位、指定哪個武學)。
+	TargetNote string `protobuf:"bytes,5,opt,name=target_note,json=targetNote,proto3" json:"target_note,omitempty"`
+	// 系統抽選的結果;空 = 這一項不需要抽。
+	DrawResult string `protobuf:"bytes,6,opt,name=draw_result,json=drawResult,proto3" json:"draw_result,omitempty"`
+	// 此項對施加方同樣生效,裁判要看兩邊。
+	AppliesToBoth bool `protobuf:"varint,7,opt,name=applies_to_both,json=appliesToBoth,proto3" json:"applies_to_both,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetupChecklistEntry) Reset() {
+	*x = SetupChecklistEntry{}
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[28]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetupChecklistEntry) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetupChecklistEntry) ProtoMessage() {}
+
+func (x *SetupChecklistEntry) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[28]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetupChecklistEntry.ProtoReflect.Descriptor instead.
+func (*SetupChecklistEntry) Descriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{28}
+}
+
+func (x *SetupChecklistEntry) GetSelectionPublicId() string {
+	if x != nil {
+		return x.SelectionPublicId
+	}
+	return ""
+}
+
+func (x *SetupChecklistEntry) GetItemKey() string {
+	if x != nil {
+		return x.ItemKey
+	}
+	return ""
+}
+
+func (x *SetupChecklistEntry) GetItemName() string {
+	if x != nil {
+		return x.ItemName
+	}
+	return ""
+}
+
+func (x *SetupChecklistEntry) GetRefereeNote() string {
+	if x != nil {
+		return x.RefereeNote
+	}
+	return ""
+}
+
+func (x *SetupChecklistEntry) GetTargetNote() string {
+	if x != nil {
+		return x.TargetNote
+	}
+	return ""
+}
+
+func (x *SetupChecklistEntry) GetDrawResult() string {
+	if x != nil {
+		return x.DrawResult
+	}
+	return ""
+}
+
+func (x *SetupChecklistEntry) GetAppliesToBoth() bool {
+	if x != nil {
+		return x.AppliesToBoth
+	}
+	return false
+}
+
+type ReviewSetupRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	MatchPublicId string                 `protobuf:"bytes,1,opt,name=match_public_id,json=matchPublicId,proto3" json:"match_public_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *StartMatchRequest) Reset() {
-	*x = StartMatchRequest{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[23]
+func (x *ReviewSetupRequest) Reset() {
+	*x = ReviewSetupRequest{}
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *StartMatchRequest) String() string {
+func (x *ReviewSetupRequest) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*StartMatchRequest) ProtoMessage() {}
+func (*ReviewSetupRequest) ProtoMessage() {}
 
-func (x *StartMatchRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[23]
+func (x *ReviewSetupRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1463,40 +1870,43 @@ func (x *StartMatchRequest) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use StartMatchRequest.ProtoReflect.Descriptor instead.
-func (*StartMatchRequest) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{23}
+// Deprecated: Use ReviewSetupRequest.ProtoReflect.Descriptor instead.
+func (*ReviewSetupRequest) Descriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{29}
 }
 
-func (x *StartMatchRequest) GetMatchPublicId() string {
+func (x *ReviewSetupRequest) GetMatchPublicId() string {
 	if x != nil {
 		return x.MatchPublicId
 	}
 	return ""
 }
 
-type StartMatchResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Match         *Match                 `protobuf:"bytes,1,opt,name=match,proto3" json:"match,omitempty"`
+type ReviewSetupResponse struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Match     *Match                 `protobuf:"bytes,1,opt,name=match,proto3" json:"match,omitempty"`
+	Checklist []*SetupChecklistEntry `protobuf:"bytes,2,rep,name=checklist,proto3" json:"checklist,omitempty"`
+	// 已記錄的違規(含開賽前的)。
+	Violations    []*Violation `protobuf:"bytes,3,rep,name=violations,proto3" json:"violations,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *StartMatchResponse) Reset() {
-	*x = StartMatchResponse{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[24]
+func (x *ReviewSetupResponse) Reset() {
+	*x = ReviewSetupResponse{}
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *StartMatchResponse) String() string {
+func (x *ReviewSetupResponse) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*StartMatchResponse) ProtoMessage() {}
+func (*ReviewSetupResponse) ProtoMessage() {}
 
-func (x *StartMatchResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[24]
+func (x *ReviewSetupResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1507,18 +1917,588 @@ func (x *StartMatchResponse) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use StartMatchResponse.ProtoReflect.Descriptor instead.
-func (*StartMatchResponse) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{24}
+// Deprecated: Use ReviewSetupResponse.ProtoReflect.Descriptor instead.
+func (*ReviewSetupResponse) Descriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{30}
 }
 
-func (x *StartMatchResponse) GetMatch() *Match {
+func (x *ReviewSetupResponse) GetMatch() *Match {
 	if x != nil {
 		return x.Match
 	}
 	return nil
 }
 
+func (x *ReviewSetupResponse) GetChecklist() []*SetupChecklistEntry {
+	if x != nil {
+		return x.Checklist
+	}
+	return nil
+}
+
+func (x *ReviewSetupResponse) GetViolations() []*Violation {
+	if x != nil {
+		return x.Violations
+	}
+	return nil
+}
+
+type ConfirmSetupRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	MatchPublicId string                 `protobuf:"bytes,1,opt,name=match_public_id,json=matchPublicId,proto3" json:"match_public_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ConfirmSetupRequest) Reset() {
+	*x = ConfirmSetupRequest{}
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[31]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ConfirmSetupRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ConfirmSetupRequest) ProtoMessage() {}
+
+func (x *ConfirmSetupRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[31]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ConfirmSetupRequest.ProtoReflect.Descriptor instead.
+func (*ConfirmSetupRequest) Descriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{31}
+}
+
+func (x *ConfirmSetupRequest) GetMatchPublicId() string {
+	if x != nil {
+		return x.MatchPublicId
+	}
+	return ""
+}
+
+type ConfirmSetupResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Match         *Match                 `protobuf:"bytes,1,opt,name=match,proto3" json:"match,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ConfirmSetupResponse) Reset() {
+	*x = ConfirmSetupResponse{}
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[32]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ConfirmSetupResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ConfirmSetupResponse) ProtoMessage() {}
+
+func (x *ConfirmSetupResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[32]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ConfirmSetupResponse.ProtoReflect.Descriptor instead.
+func (*ConfirmSetupResponse) Descriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{32}
+}
+
+func (x *ConfirmSetupResponse) GetMatch() *Match {
+	if x != nil {
+		return x.Match
+	}
+	return nil
+}
+
+type StartRoundRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	MatchPublicId string                 `protobuf:"bytes,1,opt,name=match_public_id,json=matchPublicId,proto3" json:"match_public_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StartRoundRequest) Reset() {
+	*x = StartRoundRequest{}
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[33]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StartRoundRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StartRoundRequest) ProtoMessage() {}
+
+func (x *StartRoundRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[33]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StartRoundRequest.ProtoReflect.Descriptor instead.
+func (*StartRoundRequest) Descriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{33}
+}
+
+func (x *StartRoundRequest) GetMatchPublicId() string {
+	if x != nil {
+		return x.MatchPublicId
+	}
+	return ""
+}
+
+type StartRoundResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Match *Match                 `protobuf:"bytes,1,opt,name=match,proto3" json:"match,omitempty"`
+	// 剛開始的那個回合(started_at 就是計時起點)。
+	Round         *MatchRound `protobuf:"bytes,2,opt,name=round,proto3" json:"round,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StartRoundResponse) Reset() {
+	*x = StartRoundResponse{}
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[34]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StartRoundResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StartRoundResponse) ProtoMessage() {}
+
+func (x *StartRoundResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[34]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StartRoundResponse.ProtoReflect.Descriptor instead.
+func (*StartRoundResponse) Descriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{34}
+}
+
+func (x *StartRoundResponse) GetMatch() *Match {
+	if x != nil {
+		return x.Match
+	}
+	return nil
+}
+
+func (x *StartRoundResponse) GetRound() *MatchRound {
+	if x != nil {
+		return x.Round
+	}
+	return nil
+}
+
+type FinishRoundRequest struct {
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	MatchPublicId        string                 `protobuf:"bytes,1,opt,name=match_public_id,json=matchPublicId,proto3" json:"match_public_id,omitempty"`
+	RoundNo              int32                  `protobuf:"varint,2,opt,name=round_no,json=roundNo,proto3" json:"round_no,omitempty"`
+	WinnerPlayerPublicId string                 `protobuf:"bytes,3,opt,name=winner_player_public_id,json=winnerPlayerPublicId,proto3" json:"winner_player_public_id,omitempty"`
+	// 二次確認。填的是回合勝者,但達到勝場數的那一次會定案整場、觸發晉級與派彩。
+	Confirm bool `protobuf:"varint,4,opt,name=confirm,proto3" json:"confirm,omitempty"`
+	// 備註。爭議回合的裁決理由寫這裡,進稽核紀錄。
+	Note          string `protobuf:"bytes,5,opt,name=note,proto3" json:"note,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FinishRoundRequest) Reset() {
+	*x = FinishRoundRequest{}
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[35]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FinishRoundRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FinishRoundRequest) ProtoMessage() {}
+
+func (x *FinishRoundRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[35]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FinishRoundRequest.ProtoReflect.Descriptor instead.
+func (*FinishRoundRequest) Descriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{35}
+}
+
+func (x *FinishRoundRequest) GetMatchPublicId() string {
+	if x != nil {
+		return x.MatchPublicId
+	}
+	return ""
+}
+
+func (x *FinishRoundRequest) GetRoundNo() int32 {
+	if x != nil {
+		return x.RoundNo
+	}
+	return 0
+}
+
+func (x *FinishRoundRequest) GetWinnerPlayerPublicId() string {
+	if x != nil {
+		return x.WinnerPlayerPublicId
+	}
+	return ""
+}
+
+func (x *FinishRoundRequest) GetConfirm() bool {
+	if x != nil {
+		return x.Confirm
+	}
+	return false
+}
+
+func (x *FinishRoundRequest) GetNote() string {
+	if x != nil {
+		return x.Note
+	}
+	return ""
+}
+
+type FinishRoundResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Match *Match                 `protobuf:"bytes,1,opt,name=match,proto3" json:"match,omitempty"`
+	Round *MatchRound            `protobuf:"bytes,2,opt,name=round,proto3" json:"round,omitempty"`
+	// true = 這一回合讓整場定案(winner_player_public_id 已填、派彩已觸發)。
+	MatchDecided bool `protobuf:"varint,3,opt,name=match_decided,json=matchDecided,proto3" json:"match_decided,omitempty"`
+	// 定案後下一輪因此成形的場次;含新建的季軍戰(kind = THIRD_PLACE)。
+	AdvancedMatches []*Match `protobuf:"bytes,4,rep,name=advanced_matches,json=advancedMatches,proto3" json:"advanced_matches,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *FinishRoundResponse) Reset() {
+	*x = FinishRoundResponse{}
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[36]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FinishRoundResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FinishRoundResponse) ProtoMessage() {}
+
+func (x *FinishRoundResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[36]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FinishRoundResponse.ProtoReflect.Descriptor instead.
+func (*FinishRoundResponse) Descriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{36}
+}
+
+func (x *FinishRoundResponse) GetMatch() *Match {
+	if x != nil {
+		return x.Match
+	}
+	return nil
+}
+
+func (x *FinishRoundResponse) GetRound() *MatchRound {
+	if x != nil {
+		return x.Round
+	}
+	return nil
+}
+
+func (x *FinishRoundResponse) GetMatchDecided() bool {
+	if x != nil {
+		return x.MatchDecided
+	}
+	return false
+}
+
+func (x *FinishRoundResponse) GetAdvancedMatches() []*Match {
+	if x != nil {
+		return x.AdvancedMatches
+	}
+	return nil
+}
+
+type RecordViolationRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	MatchPublicId string                 `protobuf:"bytes,1,opt,name=match_public_id,json=matchPublicId,proto3" json:"match_public_id,omitempty"`
+	// 0 = 開賽前。
+	RoundNo int32 `protobuf:"varint,2,opt,name=round_no,json=roundNo,proto3" json:"round_no,omitempty"`
+	// 違規者,可以是任一方。
+	PlayerPublicId string `protobuf:"bytes,3,opt,name=player_public_id,json=playerPublicId,proto3" json:"player_public_id,omitempty"`
+	// 違反哪一項;空 = 違反通則。
+	ItemPublicId string          `protobuf:"bytes,4,opt,name=item_public_id,json=itemPublicId,proto3" json:"item_public_id,omitempty"`
+	Ruling       ViolationRuling `protobuf:"varint,5,opt,name=ruling,proto3,enum=hestia.activity.v1.ViolationRuling" json:"ruling,omitempty"`
+	// 必填:發生了什麼、為什麼這樣判。沒有理由的紀錄事後分不出「依規則」與「裁判不喜歡」。
+	Note          string `protobuf:"bytes,6,opt,name=note,proto3" json:"note,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RecordViolationRequest) Reset() {
+	*x = RecordViolationRequest{}
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[37]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RecordViolationRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RecordViolationRequest) ProtoMessage() {}
+
+func (x *RecordViolationRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[37]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RecordViolationRequest.ProtoReflect.Descriptor instead.
+func (*RecordViolationRequest) Descriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{37}
+}
+
+func (x *RecordViolationRequest) GetMatchPublicId() string {
+	if x != nil {
+		return x.MatchPublicId
+	}
+	return ""
+}
+
+func (x *RecordViolationRequest) GetRoundNo() int32 {
+	if x != nil {
+		return x.RoundNo
+	}
+	return 0
+}
+
+func (x *RecordViolationRequest) GetPlayerPublicId() string {
+	if x != nil {
+		return x.PlayerPublicId
+	}
+	return ""
+}
+
+func (x *RecordViolationRequest) GetItemPublicId() string {
+	if x != nil {
+		return x.ItemPublicId
+	}
+	return ""
+}
+
+func (x *RecordViolationRequest) GetRuling() ViolationRuling {
+	if x != nil {
+		return x.Ruling
+	}
+	return ViolationRuling_VIOLATION_RULING_UNSPECIFIED
+}
+
+func (x *RecordViolationRequest) GetNote() string {
+	if x != nil {
+		return x.Note
+	}
+	return ""
+}
+
+type RecordViolationResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Violation     *Violation             `protobuf:"bytes,1,opt,name=violation,proto3" json:"violation,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RecordViolationResponse) Reset() {
+	*x = RecordViolationResponse{}
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[38]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RecordViolationResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RecordViolationResponse) ProtoMessage() {}
+
+func (x *RecordViolationResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[38]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RecordViolationResponse.ProtoReflect.Descriptor instead.
+func (*RecordViolationResponse) Descriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{38}
+}
+
+func (x *RecordViolationResponse) GetViolation() *Violation {
+	if x != nil {
+		return x.Violation
+	}
+	return nil
+}
+
+type ListViolationsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	MatchPublicId string                 `protobuf:"bytes,1,opt,name=match_public_id,json=matchPublicId,proto3" json:"match_public_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListViolationsRequest) Reset() {
+	*x = ListViolationsRequest{}
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[39]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListViolationsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListViolationsRequest) ProtoMessage() {}
+
+func (x *ListViolationsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[39]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListViolationsRequest.ProtoReflect.Descriptor instead.
+func (*ListViolationsRequest) Descriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{39}
+}
+
+func (x *ListViolationsRequest) GetMatchPublicId() string {
+	if x != nil {
+		return x.MatchPublicId
+	}
+	return ""
+}
+
+type ListViolationsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Violations    []*Violation           `protobuf:"bytes,1,rep,name=violations,proto3" json:"violations,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListViolationsResponse) Reset() {
+	*x = ListViolationsResponse{}
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[40]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListViolationsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListViolationsResponse) ProtoMessage() {}
+
+func (x *ListViolationsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[40]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListViolationsResponse.ProtoReflect.Descriptor instead.
+func (*ListViolationsResponse) Descriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{40}
+}
+
+func (x *ListViolationsResponse) GetViolations() []*Violation {
+	if x != nil {
+		return x.Violations
+	}
+	return nil
+}
+
+// ReportResultRequest 判定勝負。**只在 best_of = 1 時可用**:等價於「開始第 1 回合 →
+// 以該勝者結束第 1 回合」。多回合制回 FAILED_PRECONDITION,裁判要用 FinishRound ——
+// 整場勝者是回合推導出來的,不接受直接指定。
 type ReportResultRequest struct {
 	state                protoimpl.MessageState `protogen:"open.v1"`
 	MatchPublicId        string                 `protobuf:"bytes,1,opt,name=match_public_id,json=matchPublicId,proto3" json:"match_public_id,omitempty"`
@@ -1533,7 +2513,7 @@ type ReportResultRequest struct {
 
 func (x *ReportResultRequest) Reset() {
 	*x = ReportResultRequest{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[25]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1545,7 +2525,7 @@ func (x *ReportResultRequest) String() string {
 func (*ReportResultRequest) ProtoMessage() {}
 
 func (x *ReportResultRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[25]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1558,7 +2538,7 @@ func (x *ReportResultRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReportResultRequest.ProtoReflect.Descriptor instead.
 func (*ReportResultRequest) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{25}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *ReportResultRequest) GetMatchPublicId() string {
@@ -1602,7 +2582,7 @@ type ReportResultResponse struct {
 
 func (x *ReportResultResponse) Reset() {
 	*x = ReportResultResponse{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[26]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1614,7 +2594,7 @@ func (x *ReportResultResponse) String() string {
 func (*ReportResultResponse) ProtoMessage() {}
 
 func (x *ReportResultResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[26]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1627,7 +2607,7 @@ func (x *ReportResultResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReportResultResponse.ProtoReflect.Descriptor instead.
 func (*ReportResultResponse) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{26}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *ReportResultResponse) GetMatch() *Match {
@@ -1663,7 +2643,7 @@ type WithdrawPlayerRequest struct {
 
 func (x *WithdrawPlayerRequest) Reset() {
 	*x = WithdrawPlayerRequest{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[27]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1675,7 +2655,7 @@ func (x *WithdrawPlayerRequest) String() string {
 func (*WithdrawPlayerRequest) ProtoMessage() {}
 
 func (x *WithdrawPlayerRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[27]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1688,7 +2668,7 @@ func (x *WithdrawPlayerRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WithdrawPlayerRequest.ProtoReflect.Descriptor instead.
 func (*WithdrawPlayerRequest) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{27}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *WithdrawPlayerRequest) GetPlayerPublicId() string {
@@ -1725,7 +2705,7 @@ type WithdrawPlayerResponse struct {
 
 func (x *WithdrawPlayerResponse) Reset() {
 	*x = WithdrawPlayerResponse{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[28]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1737,7 +2717,7 @@ func (x *WithdrawPlayerResponse) String() string {
 func (*WithdrawPlayerResponse) ProtoMessage() {}
 
 func (x *WithdrawPlayerResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[28]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1750,7 +2730,7 @@ func (x *WithdrawPlayerResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WithdrawPlayerResponse.ProtoReflect.Descriptor instead.
 func (*WithdrawPlayerResponse) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{28}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{44}
 }
 
 func (x *WithdrawPlayerResponse) GetPlayer() *Player {
@@ -1783,7 +2763,7 @@ type RegeneratePasscodeRequest struct {
 
 func (x *RegeneratePasscodeRequest) Reset() {
 	*x = RegeneratePasscodeRequest{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[29]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1795,7 +2775,7 @@ func (x *RegeneratePasscodeRequest) String() string {
 func (*RegeneratePasscodeRequest) ProtoMessage() {}
 
 func (x *RegeneratePasscodeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[29]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1808,7 +2788,7 @@ func (x *RegeneratePasscodeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegeneratePasscodeRequest.ProtoReflect.Descriptor instead.
 func (*RegeneratePasscodeRequest) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{29}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *RegeneratePasscodeRequest) GetPlayerPublicId() string {
@@ -1829,7 +2809,7 @@ type RegeneratePasscodeResponse struct {
 
 func (x *RegeneratePasscodeResponse) Reset() {
 	*x = RegeneratePasscodeResponse{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[30]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[46]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1841,7 +2821,7 @@ func (x *RegeneratePasscodeResponse) String() string {
 func (*RegeneratePasscodeResponse) ProtoMessage() {}
 
 func (x *RegeneratePasscodeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[30]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[46]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1854,7 +2834,7 @@ func (x *RegeneratePasscodeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegeneratePasscodeResponse.ProtoReflect.Descriptor instead.
 func (*RegeneratePasscodeResponse) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{30}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{46}
 }
 
 func (x *RegeneratePasscodeResponse) GetPasscode() string {
@@ -1877,7 +2857,7 @@ type AwardPrizesRequest struct {
 
 func (x *AwardPrizesRequest) Reset() {
 	*x = AwardPrizesRequest{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[31]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[47]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1889,7 +2869,7 @@ func (x *AwardPrizesRequest) String() string {
 func (*AwardPrizesRequest) ProtoMessage() {}
 
 func (x *AwardPrizesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[31]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[47]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1902,7 +2882,7 @@ func (x *AwardPrizesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AwardPrizesRequest.ProtoReflect.Descriptor instead.
 func (*AwardPrizesRequest) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{31}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{47}
 }
 
 func (x *AwardPrizesRequest) GetTournamentSlug() string {
@@ -1944,7 +2924,7 @@ type PrizeAward struct {
 
 func (x *PrizeAward) Reset() {
 	*x = PrizeAward{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[32]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[48]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1956,7 +2936,7 @@ func (x *PrizeAward) String() string {
 func (*PrizeAward) ProtoMessage() {}
 
 func (x *PrizeAward) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[32]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[48]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1969,7 +2949,7 @@ func (x *PrizeAward) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PrizeAward.ProtoReflect.Descriptor instead.
 func (*PrizeAward) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{32}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *PrizeAward) GetPlayerPublicId() string {
@@ -2024,7 +3004,7 @@ type AwardPrizesResponse struct {
 
 func (x *AwardPrizesResponse) Reset() {
 	*x = AwardPrizesResponse{}
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[33]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2036,7 +3016,7 @@ func (x *AwardPrizesResponse) String() string {
 func (*AwardPrizesResponse) ProtoMessage() {}
 
 func (x *AwardPrizesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_judge_proto_msgTypes[33]
+	mi := &file_hestia_activity_v1_judge_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2049,7 +3029,7 @@ func (x *AwardPrizesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AwardPrizesResponse.ProtoReflect.Descriptor instead.
 func (*AwardPrizesResponse) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{33}
+	return file_hestia_activity_v1_judge_proto_rawDescGZIP(), []int{49}
 }
 
 func (x *AwardPrizesResponse) GetAwards() []*PrizeAward {
@@ -2083,7 +3063,7 @@ const file_hestia_activity_v1_judge_proto_rawDesc = "" +
 	"\bchampion\x18\x01 \x01(\x03R\bchampion\x12\x1b\n" +
 	"\trunner_up\x18\x02 \x01(\x03R\brunnerUp\x12\x14\n" +
 	"\x05third\x18\x03 \x01(\x03R\x05third\x12$\n" +
-	"\rparticipation\x18\x04 \x01(\x03R\rparticipation\"\xf3\x02\n" +
+	"\rparticipation\x18\x04 \x01(\x03R\rparticipation\"\xb9\x03\n" +
 	"\x17CreateTournamentRequest\x12.\n" +
 	"\x13community_public_id\x18\x01 \x01(\tR\x11communityPublicId\x12\x12\n" +
 	"\x04slug\x18\x02 \x01(\tR\x04slug\x12\x12\n" +
@@ -2092,7 +3072,11 @@ const file_hestia_activity_v1_judge_proto_rawDesc = "" +
 	"\x0fbp_per_rank_gap\x18\x05 \x01(\x03R\fbpPerRankGap\x12>\n" +
 	"\x04odds\x18\x06 \x01(\v2*.hestia.activity.v1.TournamentOddsSettingsR\x04odds\x12C\n" +
 	"\x06prizes\x18\a \x01(\v2+.hestia.activity.v1.TournamentPrizeSettingsR\x06prizes\x121\n" +
-	"\x15handicap_item_max_qty\x18\b \x01(\x05R\x12handicapItemMaxQty\"\x8a\x01\n" +
+	"\x15handicap_item_max_qty\x18\b \x01(\x05R\x12handicapItemMaxQty\x12D\n" +
+	"\x06format\x18\t \x01(\v2,.hestia.activity.v1.TournamentFormatSettingsR\x06format\"_\n" +
+	"\x18TournamentFormatSettings\x12\x17\n" +
+	"\abest_of\x18\x01 \x01(\x05R\x06bestOf\x12*\n" +
+	"\x11third_place_match\x18\x02 \x01(\bR\x0fthirdPlaceMatch\"\x8a\x01\n" +
 	"\x18CreateTournamentResponse\x12>\n" +
 	"\n" +
 	"tournament\x18\x01 \x01(\v2\x1e.hestia.activity.v1.TournamentR\n" +
@@ -2154,7 +3138,17 @@ const file_hestia_activity_v1_judge_proto_rawDesc = "" +
 	"\x13OpenHandicapRequest\x12&\n" +
 	"\x0fmatch_public_id\x18\x01 \x01(\tR\rmatchPublicId\"G\n" +
 	"\x14OpenHandicapResponse\x12/\n" +
-	"\x05match\x18\x01 \x01(\v2\x19.hestia.activity.v1.MatchR\x05match\"W\n" +
+	"\x05match\x18\x01 \x01(\v2\x19.hestia.activity.v1.MatchR\x05match\"?\n" +
+	"\x15ReviewHandicapRequest\x12&\n" +
+	"\x0fmatch_public_id\x18\x01 \x01(\tR\rmatchPublicId\"Z\n" +
+	"\x16ReviewHandicapResponse\x12@\n" +
+	"\thandicaps\x18\x01 \x01(\v2\".hestia.activity.v1.MatchHandicapsR\thandicaps\"`\n" +
+	"\x16RefundSelectionRequest\x12.\n" +
+	"\x13selection_public_id\x18\x01 \x01(\tR\x11selectionPublicId\x12\x16\n" +
+	"\x06reason\x18\x02 \x01(\tR\x06reason\"\x94\x01\n" +
+	"\x17RefundSelectionResponse\x124\n" +
+	"\x06budget\x18\x01 \x01(\v2\x1c.hestia.activity.v1.BpBudgetR\x06budget\x12C\n" +
+	"\tselection\x18\x02 \x01(\v2%.hestia.activity.v1.HandicapSelectionR\tselection\"W\n" +
 	"\x13LockHandicapRequest\x12&\n" +
 	"\x0fmatch_public_id\x18\x01 \x01(\tR\rmatchPublicId\x12\x18\n" +
 	"\aconfirm\x18\x02 \x01(\bR\aconfirm\"\x89\x01\n" +
@@ -2166,11 +3160,60 @@ const file_hestia_activity_v1_judge_proto_rawDesc = "" +
 	"\n" +
 	"stream_url\x18\x02 \x01(\tR\tstreamUrl\"G\n" +
 	"\x14SetStreamUrlResponse\x12/\n" +
+	"\x05match\x18\x01 \x01(\v2\x19.hestia.activity.v1.MatchR\x05match\"\x8a\x02\n" +
+	"\x13SetupChecklistEntry\x12.\n" +
+	"\x13selection_public_id\x18\x01 \x01(\tR\x11selectionPublicId\x12\x19\n" +
+	"\bitem_key\x18\x02 \x01(\tR\aitemKey\x12\x1b\n" +
+	"\titem_name\x18\x03 \x01(\tR\bitemName\x12!\n" +
+	"\freferee_note\x18\x04 \x01(\tR\vrefereeNote\x12\x1f\n" +
+	"\vtarget_note\x18\x05 \x01(\tR\n" +
+	"targetNote\x12\x1f\n" +
+	"\vdraw_result\x18\x06 \x01(\tR\n" +
+	"drawResult\x12&\n" +
+	"\x0fapplies_to_both\x18\a \x01(\bR\rappliesToBoth\"<\n" +
+	"\x12ReviewSetupRequest\x12&\n" +
+	"\x0fmatch_public_id\x18\x01 \x01(\tR\rmatchPublicId\"\xcc\x01\n" +
+	"\x13ReviewSetupResponse\x12/\n" +
+	"\x05match\x18\x01 \x01(\v2\x19.hestia.activity.v1.MatchR\x05match\x12E\n" +
+	"\tchecklist\x18\x02 \x03(\v2'.hestia.activity.v1.SetupChecklistEntryR\tchecklist\x12=\n" +
+	"\n" +
+	"violations\x18\x03 \x03(\v2\x1d.hestia.activity.v1.ViolationR\n" +
+	"violations\"=\n" +
+	"\x13ConfirmSetupRequest\x12&\n" +
+	"\x0fmatch_public_id\x18\x01 \x01(\tR\rmatchPublicId\"G\n" +
+	"\x14ConfirmSetupResponse\x12/\n" +
 	"\x05match\x18\x01 \x01(\v2\x19.hestia.activity.v1.MatchR\x05match\";\n" +
-	"\x11StartMatchRequest\x12&\n" +
-	"\x0fmatch_public_id\x18\x01 \x01(\tR\rmatchPublicId\"E\n" +
-	"\x12StartMatchResponse\x12/\n" +
-	"\x05match\x18\x01 \x01(\v2\x19.hestia.activity.v1.MatchR\x05match\"\xa2\x01\n" +
+	"\x11StartRoundRequest\x12&\n" +
+	"\x0fmatch_public_id\x18\x01 \x01(\tR\rmatchPublicId\"{\n" +
+	"\x12StartRoundResponse\x12/\n" +
+	"\x05match\x18\x01 \x01(\v2\x19.hestia.activity.v1.MatchR\x05match\x124\n" +
+	"\x05round\x18\x02 \x01(\v2\x1e.hestia.activity.v1.MatchRoundR\x05round\"\xbc\x01\n" +
+	"\x12FinishRoundRequest\x12&\n" +
+	"\x0fmatch_public_id\x18\x01 \x01(\tR\rmatchPublicId\x12\x19\n" +
+	"\bround_no\x18\x02 \x01(\x05R\aroundNo\x125\n" +
+	"\x17winner_player_public_id\x18\x03 \x01(\tR\x14winnerPlayerPublicId\x12\x18\n" +
+	"\aconfirm\x18\x04 \x01(\bR\aconfirm\x12\x12\n" +
+	"\x04note\x18\x05 \x01(\tR\x04note\"\xe7\x01\n" +
+	"\x13FinishRoundResponse\x12/\n" +
+	"\x05match\x18\x01 \x01(\v2\x19.hestia.activity.v1.MatchR\x05match\x124\n" +
+	"\x05round\x18\x02 \x01(\v2\x1e.hestia.activity.v1.MatchRoundR\x05round\x12#\n" +
+	"\rmatch_decided\x18\x03 \x01(\bR\fmatchDecided\x12D\n" +
+	"\x10advanced_matches\x18\x04 \x03(\v2\x19.hestia.activity.v1.MatchR\x0fadvancedMatches\"\xfc\x01\n" +
+	"\x16RecordViolationRequest\x12&\n" +
+	"\x0fmatch_public_id\x18\x01 \x01(\tR\rmatchPublicId\x12\x19\n" +
+	"\bround_no\x18\x02 \x01(\x05R\aroundNo\x12(\n" +
+	"\x10player_public_id\x18\x03 \x01(\tR\x0eplayerPublicId\x12$\n" +
+	"\x0eitem_public_id\x18\x04 \x01(\tR\fitemPublicId\x12;\n" +
+	"\x06ruling\x18\x05 \x01(\x0e2#.hestia.activity.v1.ViolationRulingR\x06ruling\x12\x12\n" +
+	"\x04note\x18\x06 \x01(\tR\x04note\"V\n" +
+	"\x17RecordViolationResponse\x12;\n" +
+	"\tviolation\x18\x01 \x01(\v2\x1d.hestia.activity.v1.ViolationR\tviolation\"?\n" +
+	"\x15ListViolationsRequest\x12&\n" +
+	"\x0fmatch_public_id\x18\x01 \x01(\tR\rmatchPublicId\"W\n" +
+	"\x16ListViolationsResponse\x12=\n" +
+	"\n" +
+	"violations\x18\x01 \x03(\v2\x1d.hestia.activity.v1.ViolationR\n" +
+	"violations\"\xa2\x01\n" +
 	"\x13ReportResultRequest\x12&\n" +
 	"\x0fmatch_public_id\x18\x01 \x01(\tR\rmatchPublicId\x125\n" +
 	"\x17winner_player_public_id\x18\x02 \x01(\tR\x14winnerPlayerPublicId\x12\x18\n" +
@@ -2207,7 +3250,7 @@ const file_hestia_activity_v1_judge_proto_rawDesc = "" +
 	"\x0eskipped_reason\x18\x06 \x01(\tR\rskippedReason\"i\n" +
 	"\x13AwardPrizesResponse\x126\n" +
 	"\x06awards\x18\x01 \x03(\v2\x1e.hestia.activity.v1.PrizeAwardR\x06awards\x12\x1a\n" +
-	"\breplayed\x18\x02 \x01(\bR\breplayed2\x88\f\n" +
+	"\breplayed\x18\x02 \x01(\bR\breplayed2\xe3\x11\n" +
 	"\fJudgeService\x12o\n" +
 	"\x10CreateTournament\x12+.hestia.activity.v1.CreateTournamentRequest\x1a,.hestia.activity.v1.CreateTournamentResponse\"\x00\x12c\n" +
 	"\fAdvancePhase\x12'.hestia.activity.v1.AdvancePhaseRequest\x1a(.hestia.activity.v1.AdvancePhaseResponse\"\x00\x12]\n" +
@@ -2217,12 +3260,19 @@ const file_hestia_activity_v1_judge_proto_rawDesc = "" +
 	"\vDrawBracket\x12&.hestia.activity.v1.DrawBracketRequest\x1a'.hestia.activity.v1.DrawBracketResponse\"\x00\x12Z\n" +
 	"\tSwapSeeds\x12$.hestia.activity.v1.SwapSeedsRequest\x1a%.hestia.activity.v1.SwapSeedsResponse\"\x00\x12i\n" +
 	"\x0eConfirmBracket\x12).hestia.activity.v1.ConfirmBracketRequest\x1a*.hestia.activity.v1.ConfirmBracketResponse\"\x00\x12c\n" +
-	"\fOpenHandicap\x12'.hestia.activity.v1.OpenHandicapRequest\x1a(.hestia.activity.v1.OpenHandicapResponse\"\x00\x12c\n" +
+	"\fOpenHandicap\x12'.hestia.activity.v1.OpenHandicapRequest\x1a(.hestia.activity.v1.OpenHandicapResponse\"\x00\x12i\n" +
+	"\x0eReviewHandicap\x12).hestia.activity.v1.ReviewHandicapRequest\x1a*.hestia.activity.v1.ReviewHandicapResponse\"\x00\x12l\n" +
+	"\x0fRefundSelection\x12*.hestia.activity.v1.RefundSelectionRequest\x1a+.hestia.activity.v1.RefundSelectionResponse\"\x00\x12c\n" +
 	"\fLockHandicap\x12'.hestia.activity.v1.LockHandicapRequest\x1a(.hestia.activity.v1.LockHandicapResponse\"\x00\x12c\n" +
-	"\fSetStreamUrl\x12'.hestia.activity.v1.SetStreamUrlRequest\x1a(.hestia.activity.v1.SetStreamUrlResponse\"\x00\x12]\n" +
+	"\fSetStreamUrl\x12'.hestia.activity.v1.SetStreamUrlRequest\x1a(.hestia.activity.v1.SetStreamUrlResponse\"\x00\x12`\n" +
+	"\vReviewSetup\x12&.hestia.activity.v1.ReviewSetupRequest\x1a'.hestia.activity.v1.ReviewSetupResponse\"\x00\x12c\n" +
+	"\fConfirmSetup\x12'.hestia.activity.v1.ConfirmSetupRequest\x1a(.hestia.activity.v1.ConfirmSetupResponse\"\x00\x12]\n" +
 	"\n" +
-	"StartMatch\x12%.hestia.activity.v1.StartMatchRequest\x1a&.hestia.activity.v1.StartMatchResponse\"\x00\x12c\n" +
-	"\fReportResult\x12'.hestia.activity.v1.ReportResultRequest\x1a(.hestia.activity.v1.ReportResultResponse\"\x00\x12i\n" +
+	"StartRound\x12%.hestia.activity.v1.StartRoundRequest\x1a&.hestia.activity.v1.StartRoundResponse\"\x00\x12`\n" +
+	"\vFinishRound\x12&.hestia.activity.v1.FinishRoundRequest\x1a'.hestia.activity.v1.FinishRoundResponse\"\x00\x12c\n" +
+	"\fReportResult\x12'.hestia.activity.v1.ReportResultRequest\x1a(.hestia.activity.v1.ReportResultResponse\"\x00\x12l\n" +
+	"\x0fRecordViolation\x12*.hestia.activity.v1.RecordViolationRequest\x1a+.hestia.activity.v1.RecordViolationResponse\"\x00\x12i\n" +
+	"\x0eListViolations\x12).hestia.activity.v1.ListViolationsRequest\x1a*.hestia.activity.v1.ListViolationsResponse\"\x00\x12i\n" +
 	"\x0eWithdrawPlayer\x12).hestia.activity.v1.WithdrawPlayerRequest\x1a*.hestia.activity.v1.WithdrawPlayerResponse\"\x00\x12u\n" +
 	"\x12RegeneratePasscode\x12-.hestia.activity.v1.RegeneratePasscodeRequest\x1a..hestia.activity.v1.RegeneratePasscodeResponse\"\x00\x12`\n" +
 	"\vAwardPrizes\x12&.hestia.activity.v1.AwardPrizesRequest\x1a'.hestia.activity.v1.AwardPrizesResponse\"\x00B@Z>github.com/danicotech/hestia/gen/hestia/activity/v1;activityv1b\x06proto3"
@@ -2239,110 +3289,160 @@ func file_hestia_activity_v1_judge_proto_rawDescGZIP() []byte {
 	return file_hestia_activity_v1_judge_proto_rawDescData
 }
 
-var file_hestia_activity_v1_judge_proto_msgTypes = make([]protoimpl.MessageInfo, 34)
+var file_hestia_activity_v1_judge_proto_msgTypes = make([]protoimpl.MessageInfo, 50)
 var file_hestia_activity_v1_judge_proto_goTypes = []any{
 	(*TournamentOddsSettings)(nil),     // 0: hestia.activity.v1.TournamentOddsSettings
 	(*TournamentPrizeSettings)(nil),    // 1: hestia.activity.v1.TournamentPrizeSettings
 	(*CreateTournamentRequest)(nil),    // 2: hestia.activity.v1.CreateTournamentRequest
-	(*CreateTournamentResponse)(nil),   // 3: hestia.activity.v1.CreateTournamentResponse
-	(*AdvancePhaseRequest)(nil),        // 4: hestia.activity.v1.AdvancePhaseRequest
-	(*AdvancePhaseResponse)(nil),       // 5: hestia.activity.v1.AdvancePhaseResponse
-	(*AssignRankRequest)(nil),          // 6: hestia.activity.v1.AssignRankRequest
-	(*AssignRankResponse)(nil),         // 7: hestia.activity.v1.AssignRankResponse
-	(*ListUnrankedRequest)(nil),        // 8: hestia.activity.v1.ListUnrankedRequest
-	(*PlayerDossier)(nil),              // 9: hestia.activity.v1.PlayerDossier
-	(*ListUnrankedResponse)(nil),       // 10: hestia.activity.v1.ListUnrankedResponse
-	(*DrawBracketRequest)(nil),         // 11: hestia.activity.v1.DrawBracketRequest
-	(*DrawBracketResponse)(nil),        // 12: hestia.activity.v1.DrawBracketResponse
-	(*SwapSeedsRequest)(nil),           // 13: hestia.activity.v1.SwapSeedsRequest
-	(*SwapSeedsResponse)(nil),          // 14: hestia.activity.v1.SwapSeedsResponse
-	(*ConfirmBracketRequest)(nil),      // 15: hestia.activity.v1.ConfirmBracketRequest
-	(*ConfirmBracketResponse)(nil),     // 16: hestia.activity.v1.ConfirmBracketResponse
-	(*OpenHandicapRequest)(nil),        // 17: hestia.activity.v1.OpenHandicapRequest
-	(*OpenHandicapResponse)(nil),       // 18: hestia.activity.v1.OpenHandicapResponse
-	(*LockHandicapRequest)(nil),        // 19: hestia.activity.v1.LockHandicapRequest
-	(*LockHandicapResponse)(nil),       // 20: hestia.activity.v1.LockHandicapResponse
-	(*SetStreamUrlRequest)(nil),        // 21: hestia.activity.v1.SetStreamUrlRequest
-	(*SetStreamUrlResponse)(nil),       // 22: hestia.activity.v1.SetStreamUrlResponse
-	(*StartMatchRequest)(nil),          // 23: hestia.activity.v1.StartMatchRequest
-	(*StartMatchResponse)(nil),         // 24: hestia.activity.v1.StartMatchResponse
-	(*ReportResultRequest)(nil),        // 25: hestia.activity.v1.ReportResultRequest
-	(*ReportResultResponse)(nil),       // 26: hestia.activity.v1.ReportResultResponse
-	(*WithdrawPlayerRequest)(nil),      // 27: hestia.activity.v1.WithdrawPlayerRequest
-	(*WithdrawPlayerResponse)(nil),     // 28: hestia.activity.v1.WithdrawPlayerResponse
-	(*RegeneratePasscodeRequest)(nil),  // 29: hestia.activity.v1.RegeneratePasscodeRequest
-	(*RegeneratePasscodeResponse)(nil), // 30: hestia.activity.v1.RegeneratePasscodeResponse
-	(*AwardPrizesRequest)(nil),         // 31: hestia.activity.v1.AwardPrizesRequest
-	(*PrizeAward)(nil),                 // 32: hestia.activity.v1.PrizeAward
-	(*AwardPrizesResponse)(nil),        // 33: hestia.activity.v1.AwardPrizesResponse
-	(*Tournament)(nil),                 // 34: hestia.activity.v1.Tournament
-	(TournamentPhase)(0),               // 35: hestia.activity.v1.TournamentPhase
-	(Rank)(0),                          // 36: hestia.activity.v1.Rank
-	(*Player)(nil),                     // 37: hestia.activity.v1.Player
-	(*BracketRound)(nil),               // 38: hestia.activity.v1.BracketRound
-	(*Match)(nil),                      // 39: hestia.activity.v1.Match
-	(*MatchHandicaps)(nil),             // 40: hestia.activity.v1.MatchHandicaps
+	(*TournamentFormatSettings)(nil),   // 3: hestia.activity.v1.TournamentFormatSettings
+	(*CreateTournamentResponse)(nil),   // 4: hestia.activity.v1.CreateTournamentResponse
+	(*AdvancePhaseRequest)(nil),        // 5: hestia.activity.v1.AdvancePhaseRequest
+	(*AdvancePhaseResponse)(nil),       // 6: hestia.activity.v1.AdvancePhaseResponse
+	(*AssignRankRequest)(nil),          // 7: hestia.activity.v1.AssignRankRequest
+	(*AssignRankResponse)(nil),         // 8: hestia.activity.v1.AssignRankResponse
+	(*ListUnrankedRequest)(nil),        // 9: hestia.activity.v1.ListUnrankedRequest
+	(*PlayerDossier)(nil),              // 10: hestia.activity.v1.PlayerDossier
+	(*ListUnrankedResponse)(nil),       // 11: hestia.activity.v1.ListUnrankedResponse
+	(*DrawBracketRequest)(nil),         // 12: hestia.activity.v1.DrawBracketRequest
+	(*DrawBracketResponse)(nil),        // 13: hestia.activity.v1.DrawBracketResponse
+	(*SwapSeedsRequest)(nil),           // 14: hestia.activity.v1.SwapSeedsRequest
+	(*SwapSeedsResponse)(nil),          // 15: hestia.activity.v1.SwapSeedsResponse
+	(*ConfirmBracketRequest)(nil),      // 16: hestia.activity.v1.ConfirmBracketRequest
+	(*ConfirmBracketResponse)(nil),     // 17: hestia.activity.v1.ConfirmBracketResponse
+	(*OpenHandicapRequest)(nil),        // 18: hestia.activity.v1.OpenHandicapRequest
+	(*OpenHandicapResponse)(nil),       // 19: hestia.activity.v1.OpenHandicapResponse
+	(*ReviewHandicapRequest)(nil),      // 20: hestia.activity.v1.ReviewHandicapRequest
+	(*ReviewHandicapResponse)(nil),     // 21: hestia.activity.v1.ReviewHandicapResponse
+	(*RefundSelectionRequest)(nil),     // 22: hestia.activity.v1.RefundSelectionRequest
+	(*RefundSelectionResponse)(nil),    // 23: hestia.activity.v1.RefundSelectionResponse
+	(*LockHandicapRequest)(nil),        // 24: hestia.activity.v1.LockHandicapRequest
+	(*LockHandicapResponse)(nil),       // 25: hestia.activity.v1.LockHandicapResponse
+	(*SetStreamUrlRequest)(nil),        // 26: hestia.activity.v1.SetStreamUrlRequest
+	(*SetStreamUrlResponse)(nil),       // 27: hestia.activity.v1.SetStreamUrlResponse
+	(*SetupChecklistEntry)(nil),        // 28: hestia.activity.v1.SetupChecklistEntry
+	(*ReviewSetupRequest)(nil),         // 29: hestia.activity.v1.ReviewSetupRequest
+	(*ReviewSetupResponse)(nil),        // 30: hestia.activity.v1.ReviewSetupResponse
+	(*ConfirmSetupRequest)(nil),        // 31: hestia.activity.v1.ConfirmSetupRequest
+	(*ConfirmSetupResponse)(nil),       // 32: hestia.activity.v1.ConfirmSetupResponse
+	(*StartRoundRequest)(nil),          // 33: hestia.activity.v1.StartRoundRequest
+	(*StartRoundResponse)(nil),         // 34: hestia.activity.v1.StartRoundResponse
+	(*FinishRoundRequest)(nil),         // 35: hestia.activity.v1.FinishRoundRequest
+	(*FinishRoundResponse)(nil),        // 36: hestia.activity.v1.FinishRoundResponse
+	(*RecordViolationRequest)(nil),     // 37: hestia.activity.v1.RecordViolationRequest
+	(*RecordViolationResponse)(nil),    // 38: hestia.activity.v1.RecordViolationResponse
+	(*ListViolationsRequest)(nil),      // 39: hestia.activity.v1.ListViolationsRequest
+	(*ListViolationsResponse)(nil),     // 40: hestia.activity.v1.ListViolationsResponse
+	(*ReportResultRequest)(nil),        // 41: hestia.activity.v1.ReportResultRequest
+	(*ReportResultResponse)(nil),       // 42: hestia.activity.v1.ReportResultResponse
+	(*WithdrawPlayerRequest)(nil),      // 43: hestia.activity.v1.WithdrawPlayerRequest
+	(*WithdrawPlayerResponse)(nil),     // 44: hestia.activity.v1.WithdrawPlayerResponse
+	(*RegeneratePasscodeRequest)(nil),  // 45: hestia.activity.v1.RegeneratePasscodeRequest
+	(*RegeneratePasscodeResponse)(nil), // 46: hestia.activity.v1.RegeneratePasscodeResponse
+	(*AwardPrizesRequest)(nil),         // 47: hestia.activity.v1.AwardPrizesRequest
+	(*PrizeAward)(nil),                 // 48: hestia.activity.v1.PrizeAward
+	(*AwardPrizesResponse)(nil),        // 49: hestia.activity.v1.AwardPrizesResponse
+	(*Tournament)(nil),                 // 50: hestia.activity.v1.Tournament
+	(TournamentPhase)(0),               // 51: hestia.activity.v1.TournamentPhase
+	(Rank)(0),                          // 52: hestia.activity.v1.Rank
+	(*Player)(nil),                     // 53: hestia.activity.v1.Player
+	(*BracketRound)(nil),               // 54: hestia.activity.v1.BracketRound
+	(*Match)(nil),                      // 55: hestia.activity.v1.Match
+	(*MatchHandicaps)(nil),             // 56: hestia.activity.v1.MatchHandicaps
+	(*BpBudget)(nil),                   // 57: hestia.activity.v1.BpBudget
+	(*HandicapSelection)(nil),          // 58: hestia.activity.v1.HandicapSelection
+	(*Violation)(nil),                  // 59: hestia.activity.v1.Violation
+	(*MatchRound)(nil),                 // 60: hestia.activity.v1.MatchRound
+	(ViolationRuling)(0),               // 61: hestia.activity.v1.ViolationRuling
 }
 var file_hestia_activity_v1_judge_proto_depIdxs = []int32{
 	0,  // 0: hestia.activity.v1.CreateTournamentRequest.odds:type_name -> hestia.activity.v1.TournamentOddsSettings
 	1,  // 1: hestia.activity.v1.CreateTournamentRequest.prizes:type_name -> hestia.activity.v1.TournamentPrizeSettings
-	34, // 2: hestia.activity.v1.CreateTournamentResponse.tournament:type_name -> hestia.activity.v1.Tournament
-	35, // 3: hestia.activity.v1.AdvancePhaseRequest.to_phase:type_name -> hestia.activity.v1.TournamentPhase
-	34, // 4: hestia.activity.v1.AdvancePhaseResponse.tournament:type_name -> hestia.activity.v1.Tournament
-	36, // 5: hestia.activity.v1.AssignRankRequest.rank:type_name -> hestia.activity.v1.Rank
-	37, // 6: hestia.activity.v1.AssignRankResponse.player:type_name -> hestia.activity.v1.Player
-	37, // 7: hestia.activity.v1.PlayerDossier.player:type_name -> hestia.activity.v1.Player
-	36, // 8: hestia.activity.v1.PlayerDossier.self_rated_rank:type_name -> hestia.activity.v1.Rank
-	36, // 9: hestia.activity.v1.PlayerDossier.previous_rank:type_name -> hestia.activity.v1.Rank
-	9,  // 10: hestia.activity.v1.ListUnrankedResponse.players:type_name -> hestia.activity.v1.PlayerDossier
-	38, // 11: hestia.activity.v1.DrawBracketResponse.rounds:type_name -> hestia.activity.v1.BracketRound
-	38, // 12: hestia.activity.v1.SwapSeedsResponse.rounds:type_name -> hestia.activity.v1.BracketRound
-	34, // 13: hestia.activity.v1.ConfirmBracketResponse.tournament:type_name -> hestia.activity.v1.Tournament
-	39, // 14: hestia.activity.v1.OpenHandicapResponse.match:type_name -> hestia.activity.v1.Match
-	39, // 15: hestia.activity.v1.LockHandicapResponse.match:type_name -> hestia.activity.v1.Match
-	40, // 16: hestia.activity.v1.LockHandicapResponse.handicaps:type_name -> hestia.activity.v1.MatchHandicaps
-	39, // 17: hestia.activity.v1.SetStreamUrlResponse.match:type_name -> hestia.activity.v1.Match
-	39, // 18: hestia.activity.v1.StartMatchResponse.match:type_name -> hestia.activity.v1.Match
-	39, // 19: hestia.activity.v1.ReportResultResponse.match:type_name -> hestia.activity.v1.Match
-	39, // 20: hestia.activity.v1.ReportResultResponse.advanced_matches:type_name -> hestia.activity.v1.Match
-	37, // 21: hestia.activity.v1.WithdrawPlayerResponse.player:type_name -> hestia.activity.v1.Player
-	39, // 22: hestia.activity.v1.WithdrawPlayerResponse.walkover_matches:type_name -> hestia.activity.v1.Match
-	32, // 23: hestia.activity.v1.AwardPrizesResponse.awards:type_name -> hestia.activity.v1.PrizeAward
-	2,  // 24: hestia.activity.v1.JudgeService.CreateTournament:input_type -> hestia.activity.v1.CreateTournamentRequest
-	4,  // 25: hestia.activity.v1.JudgeService.AdvancePhase:input_type -> hestia.activity.v1.AdvancePhaseRequest
-	6,  // 26: hestia.activity.v1.JudgeService.AssignRank:input_type -> hestia.activity.v1.AssignRankRequest
-	8,  // 27: hestia.activity.v1.JudgeService.ListUnranked:input_type -> hestia.activity.v1.ListUnrankedRequest
-	11, // 28: hestia.activity.v1.JudgeService.DrawBracket:input_type -> hestia.activity.v1.DrawBracketRequest
-	13, // 29: hestia.activity.v1.JudgeService.SwapSeeds:input_type -> hestia.activity.v1.SwapSeedsRequest
-	15, // 30: hestia.activity.v1.JudgeService.ConfirmBracket:input_type -> hestia.activity.v1.ConfirmBracketRequest
-	17, // 31: hestia.activity.v1.JudgeService.OpenHandicap:input_type -> hestia.activity.v1.OpenHandicapRequest
-	19, // 32: hestia.activity.v1.JudgeService.LockHandicap:input_type -> hestia.activity.v1.LockHandicapRequest
-	21, // 33: hestia.activity.v1.JudgeService.SetStreamUrl:input_type -> hestia.activity.v1.SetStreamUrlRequest
-	23, // 34: hestia.activity.v1.JudgeService.StartMatch:input_type -> hestia.activity.v1.StartMatchRequest
-	25, // 35: hestia.activity.v1.JudgeService.ReportResult:input_type -> hestia.activity.v1.ReportResultRequest
-	27, // 36: hestia.activity.v1.JudgeService.WithdrawPlayer:input_type -> hestia.activity.v1.WithdrawPlayerRequest
-	29, // 37: hestia.activity.v1.JudgeService.RegeneratePasscode:input_type -> hestia.activity.v1.RegeneratePasscodeRequest
-	31, // 38: hestia.activity.v1.JudgeService.AwardPrizes:input_type -> hestia.activity.v1.AwardPrizesRequest
-	3,  // 39: hestia.activity.v1.JudgeService.CreateTournament:output_type -> hestia.activity.v1.CreateTournamentResponse
-	5,  // 40: hestia.activity.v1.JudgeService.AdvancePhase:output_type -> hestia.activity.v1.AdvancePhaseResponse
-	7,  // 41: hestia.activity.v1.JudgeService.AssignRank:output_type -> hestia.activity.v1.AssignRankResponse
-	10, // 42: hestia.activity.v1.JudgeService.ListUnranked:output_type -> hestia.activity.v1.ListUnrankedResponse
-	12, // 43: hestia.activity.v1.JudgeService.DrawBracket:output_type -> hestia.activity.v1.DrawBracketResponse
-	14, // 44: hestia.activity.v1.JudgeService.SwapSeeds:output_type -> hestia.activity.v1.SwapSeedsResponse
-	16, // 45: hestia.activity.v1.JudgeService.ConfirmBracket:output_type -> hestia.activity.v1.ConfirmBracketResponse
-	18, // 46: hestia.activity.v1.JudgeService.OpenHandicap:output_type -> hestia.activity.v1.OpenHandicapResponse
-	20, // 47: hestia.activity.v1.JudgeService.LockHandicap:output_type -> hestia.activity.v1.LockHandicapResponse
-	22, // 48: hestia.activity.v1.JudgeService.SetStreamUrl:output_type -> hestia.activity.v1.SetStreamUrlResponse
-	24, // 49: hestia.activity.v1.JudgeService.StartMatch:output_type -> hestia.activity.v1.StartMatchResponse
-	26, // 50: hestia.activity.v1.JudgeService.ReportResult:output_type -> hestia.activity.v1.ReportResultResponse
-	28, // 51: hestia.activity.v1.JudgeService.WithdrawPlayer:output_type -> hestia.activity.v1.WithdrawPlayerResponse
-	30, // 52: hestia.activity.v1.JudgeService.RegeneratePasscode:output_type -> hestia.activity.v1.RegeneratePasscodeResponse
-	33, // 53: hestia.activity.v1.JudgeService.AwardPrizes:output_type -> hestia.activity.v1.AwardPrizesResponse
-	39, // [39:54] is the sub-list for method output_type
-	24, // [24:39] is the sub-list for method input_type
-	24, // [24:24] is the sub-list for extension type_name
-	24, // [24:24] is the sub-list for extension extendee
-	0,  // [0:24] is the sub-list for field type_name
+	3,  // 2: hestia.activity.v1.CreateTournamentRequest.format:type_name -> hestia.activity.v1.TournamentFormatSettings
+	50, // 3: hestia.activity.v1.CreateTournamentResponse.tournament:type_name -> hestia.activity.v1.Tournament
+	51, // 4: hestia.activity.v1.AdvancePhaseRequest.to_phase:type_name -> hestia.activity.v1.TournamentPhase
+	50, // 5: hestia.activity.v1.AdvancePhaseResponse.tournament:type_name -> hestia.activity.v1.Tournament
+	52, // 6: hestia.activity.v1.AssignRankRequest.rank:type_name -> hestia.activity.v1.Rank
+	53, // 7: hestia.activity.v1.AssignRankResponse.player:type_name -> hestia.activity.v1.Player
+	53, // 8: hestia.activity.v1.PlayerDossier.player:type_name -> hestia.activity.v1.Player
+	52, // 9: hestia.activity.v1.PlayerDossier.self_rated_rank:type_name -> hestia.activity.v1.Rank
+	52, // 10: hestia.activity.v1.PlayerDossier.previous_rank:type_name -> hestia.activity.v1.Rank
+	10, // 11: hestia.activity.v1.ListUnrankedResponse.players:type_name -> hestia.activity.v1.PlayerDossier
+	54, // 12: hestia.activity.v1.DrawBracketResponse.rounds:type_name -> hestia.activity.v1.BracketRound
+	54, // 13: hestia.activity.v1.SwapSeedsResponse.rounds:type_name -> hestia.activity.v1.BracketRound
+	50, // 14: hestia.activity.v1.ConfirmBracketResponse.tournament:type_name -> hestia.activity.v1.Tournament
+	55, // 15: hestia.activity.v1.OpenHandicapResponse.match:type_name -> hestia.activity.v1.Match
+	56, // 16: hestia.activity.v1.ReviewHandicapResponse.handicaps:type_name -> hestia.activity.v1.MatchHandicaps
+	57, // 17: hestia.activity.v1.RefundSelectionResponse.budget:type_name -> hestia.activity.v1.BpBudget
+	58, // 18: hestia.activity.v1.RefundSelectionResponse.selection:type_name -> hestia.activity.v1.HandicapSelection
+	55, // 19: hestia.activity.v1.LockHandicapResponse.match:type_name -> hestia.activity.v1.Match
+	56, // 20: hestia.activity.v1.LockHandicapResponse.handicaps:type_name -> hestia.activity.v1.MatchHandicaps
+	55, // 21: hestia.activity.v1.SetStreamUrlResponse.match:type_name -> hestia.activity.v1.Match
+	55, // 22: hestia.activity.v1.ReviewSetupResponse.match:type_name -> hestia.activity.v1.Match
+	28, // 23: hestia.activity.v1.ReviewSetupResponse.checklist:type_name -> hestia.activity.v1.SetupChecklistEntry
+	59, // 24: hestia.activity.v1.ReviewSetupResponse.violations:type_name -> hestia.activity.v1.Violation
+	55, // 25: hestia.activity.v1.ConfirmSetupResponse.match:type_name -> hestia.activity.v1.Match
+	55, // 26: hestia.activity.v1.StartRoundResponse.match:type_name -> hestia.activity.v1.Match
+	60, // 27: hestia.activity.v1.StartRoundResponse.round:type_name -> hestia.activity.v1.MatchRound
+	55, // 28: hestia.activity.v1.FinishRoundResponse.match:type_name -> hestia.activity.v1.Match
+	60, // 29: hestia.activity.v1.FinishRoundResponse.round:type_name -> hestia.activity.v1.MatchRound
+	55, // 30: hestia.activity.v1.FinishRoundResponse.advanced_matches:type_name -> hestia.activity.v1.Match
+	61, // 31: hestia.activity.v1.RecordViolationRequest.ruling:type_name -> hestia.activity.v1.ViolationRuling
+	59, // 32: hestia.activity.v1.RecordViolationResponse.violation:type_name -> hestia.activity.v1.Violation
+	59, // 33: hestia.activity.v1.ListViolationsResponse.violations:type_name -> hestia.activity.v1.Violation
+	55, // 34: hestia.activity.v1.ReportResultResponse.match:type_name -> hestia.activity.v1.Match
+	55, // 35: hestia.activity.v1.ReportResultResponse.advanced_matches:type_name -> hestia.activity.v1.Match
+	53, // 36: hestia.activity.v1.WithdrawPlayerResponse.player:type_name -> hestia.activity.v1.Player
+	55, // 37: hestia.activity.v1.WithdrawPlayerResponse.walkover_matches:type_name -> hestia.activity.v1.Match
+	48, // 38: hestia.activity.v1.AwardPrizesResponse.awards:type_name -> hestia.activity.v1.PrizeAward
+	2,  // 39: hestia.activity.v1.JudgeService.CreateTournament:input_type -> hestia.activity.v1.CreateTournamentRequest
+	5,  // 40: hestia.activity.v1.JudgeService.AdvancePhase:input_type -> hestia.activity.v1.AdvancePhaseRequest
+	7,  // 41: hestia.activity.v1.JudgeService.AssignRank:input_type -> hestia.activity.v1.AssignRankRequest
+	9,  // 42: hestia.activity.v1.JudgeService.ListUnranked:input_type -> hestia.activity.v1.ListUnrankedRequest
+	12, // 43: hestia.activity.v1.JudgeService.DrawBracket:input_type -> hestia.activity.v1.DrawBracketRequest
+	14, // 44: hestia.activity.v1.JudgeService.SwapSeeds:input_type -> hestia.activity.v1.SwapSeedsRequest
+	16, // 45: hestia.activity.v1.JudgeService.ConfirmBracket:input_type -> hestia.activity.v1.ConfirmBracketRequest
+	18, // 46: hestia.activity.v1.JudgeService.OpenHandicap:input_type -> hestia.activity.v1.OpenHandicapRequest
+	20, // 47: hestia.activity.v1.JudgeService.ReviewHandicap:input_type -> hestia.activity.v1.ReviewHandicapRequest
+	22, // 48: hestia.activity.v1.JudgeService.RefundSelection:input_type -> hestia.activity.v1.RefundSelectionRequest
+	24, // 49: hestia.activity.v1.JudgeService.LockHandicap:input_type -> hestia.activity.v1.LockHandicapRequest
+	26, // 50: hestia.activity.v1.JudgeService.SetStreamUrl:input_type -> hestia.activity.v1.SetStreamUrlRequest
+	29, // 51: hestia.activity.v1.JudgeService.ReviewSetup:input_type -> hestia.activity.v1.ReviewSetupRequest
+	31, // 52: hestia.activity.v1.JudgeService.ConfirmSetup:input_type -> hestia.activity.v1.ConfirmSetupRequest
+	33, // 53: hestia.activity.v1.JudgeService.StartRound:input_type -> hestia.activity.v1.StartRoundRequest
+	35, // 54: hestia.activity.v1.JudgeService.FinishRound:input_type -> hestia.activity.v1.FinishRoundRequest
+	41, // 55: hestia.activity.v1.JudgeService.ReportResult:input_type -> hestia.activity.v1.ReportResultRequest
+	37, // 56: hestia.activity.v1.JudgeService.RecordViolation:input_type -> hestia.activity.v1.RecordViolationRequest
+	39, // 57: hestia.activity.v1.JudgeService.ListViolations:input_type -> hestia.activity.v1.ListViolationsRequest
+	43, // 58: hestia.activity.v1.JudgeService.WithdrawPlayer:input_type -> hestia.activity.v1.WithdrawPlayerRequest
+	45, // 59: hestia.activity.v1.JudgeService.RegeneratePasscode:input_type -> hestia.activity.v1.RegeneratePasscodeRequest
+	47, // 60: hestia.activity.v1.JudgeService.AwardPrizes:input_type -> hestia.activity.v1.AwardPrizesRequest
+	4,  // 61: hestia.activity.v1.JudgeService.CreateTournament:output_type -> hestia.activity.v1.CreateTournamentResponse
+	6,  // 62: hestia.activity.v1.JudgeService.AdvancePhase:output_type -> hestia.activity.v1.AdvancePhaseResponse
+	8,  // 63: hestia.activity.v1.JudgeService.AssignRank:output_type -> hestia.activity.v1.AssignRankResponse
+	11, // 64: hestia.activity.v1.JudgeService.ListUnranked:output_type -> hestia.activity.v1.ListUnrankedResponse
+	13, // 65: hestia.activity.v1.JudgeService.DrawBracket:output_type -> hestia.activity.v1.DrawBracketResponse
+	15, // 66: hestia.activity.v1.JudgeService.SwapSeeds:output_type -> hestia.activity.v1.SwapSeedsResponse
+	17, // 67: hestia.activity.v1.JudgeService.ConfirmBracket:output_type -> hestia.activity.v1.ConfirmBracketResponse
+	19, // 68: hestia.activity.v1.JudgeService.OpenHandicap:output_type -> hestia.activity.v1.OpenHandicapResponse
+	21, // 69: hestia.activity.v1.JudgeService.ReviewHandicap:output_type -> hestia.activity.v1.ReviewHandicapResponse
+	23, // 70: hestia.activity.v1.JudgeService.RefundSelection:output_type -> hestia.activity.v1.RefundSelectionResponse
+	25, // 71: hestia.activity.v1.JudgeService.LockHandicap:output_type -> hestia.activity.v1.LockHandicapResponse
+	27, // 72: hestia.activity.v1.JudgeService.SetStreamUrl:output_type -> hestia.activity.v1.SetStreamUrlResponse
+	30, // 73: hestia.activity.v1.JudgeService.ReviewSetup:output_type -> hestia.activity.v1.ReviewSetupResponse
+	32, // 74: hestia.activity.v1.JudgeService.ConfirmSetup:output_type -> hestia.activity.v1.ConfirmSetupResponse
+	34, // 75: hestia.activity.v1.JudgeService.StartRound:output_type -> hestia.activity.v1.StartRoundResponse
+	36, // 76: hestia.activity.v1.JudgeService.FinishRound:output_type -> hestia.activity.v1.FinishRoundResponse
+	42, // 77: hestia.activity.v1.JudgeService.ReportResult:output_type -> hestia.activity.v1.ReportResultResponse
+	38, // 78: hestia.activity.v1.JudgeService.RecordViolation:output_type -> hestia.activity.v1.RecordViolationResponse
+	40, // 79: hestia.activity.v1.JudgeService.ListViolations:output_type -> hestia.activity.v1.ListViolationsResponse
+	44, // 80: hestia.activity.v1.JudgeService.WithdrawPlayer:output_type -> hestia.activity.v1.WithdrawPlayerResponse
+	46, // 81: hestia.activity.v1.JudgeService.RegeneratePasscode:output_type -> hestia.activity.v1.RegeneratePasscodeResponse
+	49, // 82: hestia.activity.v1.JudgeService.AwardPrizes:output_type -> hestia.activity.v1.AwardPrizesResponse
+	61, // [61:83] is the sub-list for method output_type
+	39, // [39:61] is the sub-list for method input_type
+	39, // [39:39] is the sub-list for extension type_name
+	39, // [39:39] is the sub-list for extension extendee
+	0,  // [0:39] is the sub-list for field type_name
 }
 
 func init() { file_hestia_activity_v1_judge_proto_init() }
@@ -2358,7 +3458,7 @@ func file_hestia_activity_v1_judge_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_hestia_activity_v1_judge_proto_rawDesc), len(file_hestia_activity_v1_judge_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   34,
+			NumMessages:   50,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

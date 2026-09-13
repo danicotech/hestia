@@ -8,6 +8,7 @@ import (
 
 	activityv1 "github.com/danicotech/hestia/gen/hestia/activity/v1"
 	"github.com/danicotech/hestia/gen/hestia/activity/v1/activityv1connect"
+	"github.com/danicotech/hestia/internal/core/activity/handicap"
 	"github.com/danicotech/hestia/internal/core/activity/match"
 	"github.com/danicotech/hestia/internal/core/activity/signup"
 	"github.com/danicotech/hestia/internal/core/activity/tournament"
@@ -50,10 +51,18 @@ import (
 type ActivityMatches interface {
 	OpenHandicap(ctx context.Context, p match.OpenHandicapParams) (*match.OpenHandicapResult, error)
 	LockHandicap(ctx context.Context, p match.LockHandicapParams) (*match.LockHandicapResult, error)
-	StartMatch(ctx context.Context, p match.StartMatchParams) (*match.Match, error)
+	// 多回合制的裁判動線(schemas/20「裁判動線」,2026-09-13)。StartMatch 已由
+	// StartRound 取代:第 1 回合的 StartRound 就是「開打」。
+	ReviewSetup(ctx context.Context, matchPublicID string) (*match.SetupReview, error)
+	ConfirmSetup(ctx context.Context, matchPublicID string, actorUserID int64) (*match.Match, error)
+	StartRound(ctx context.Context, matchPublicID string, actorUserID int64) (*match.RoundStart, error)
+	FinishRound(ctx context.Context, p match.FinishRoundParams) (*match.RoundFinish, error)
+	RecordViolation(ctx context.Context, p match.RecordViolationParams) (*match.Violation, error)
+	ListMatchViolations(ctx context.Context, matchPublicID string) ([]match.Violation, error)
 	ReportResult(ctx context.Context, p match.ReportResultParams) (*match.ReportResultOutcome, error)
 	WithdrawPlayer(ctx context.Context, p match.WithdrawPlayerParams) (*match.WithdrawResult, error)
 	SetStreamURL(ctx context.Context, p match.SetStreamURLParams) (*match.Match, error)
+	RefundSelection(ctx context.Context, p match.RefundSelectionParams) (*match.RefundSelectionResult, error)
 }
 
 // ActivityTournamentCreator 是「開一屆新賽事」的能力。
@@ -115,6 +124,17 @@ type activityJudgeHandler struct {
 	directory   Directory
 	authz       Authorizer
 	creator     ActivityTournamentCreator
+	// handicap 只給 ReviewHandicap 用,而且是同一個 *handicap.Service
+	// (與 HandicapService 持有的那個值相同)。
+	//
+	// 為什麼不走 matches:檢視是純讀取,不需要 transaction、不寫稽核、
+	// 沒有任何連帶動作 —— 把它塞進 match.Service 只是為了經過同一個型別,
+	// 而代價是那一層要多一個與「帶比賽走完生命週期」無關的方法。
+	// 裁判的另一支純讀取 RPC(ListUnranked)也是直接走讀取側,同一個道理。
+	//
+	// 代退(RefundSelection)則必須走 matches:它要寫稽核紀錄,而稽核與退點
+	// 必須同 tx。那條路不在這裡。
+	handicap ActivityHandicap
 }
 
 // requireJudge 是本服務取裁判身分的統一入口。
@@ -208,6 +228,18 @@ func configOverridesFromProto(msg *activityv1.CreateTournamentRequest) tournamen
 		o.MinOddsMilli = optInt64(odds.GetMinOddsMilli())
 		o.MaxOddsMilli = optInt64(odds.GetMaxOddsMilli())
 		o.MaxParlayMilli = optInt64(odds.GetMaxParlayMilli())
+	}
+	// 賽制:0 / false = 沒填 = 用預設(單場定勝負、不打季軍戰)。best_of 的合法性
+	// (正奇數)同樣交給 NewConfig 那一份驗證。
+	if f := msg.GetFormat(); f != nil {
+		if f.GetBestOf() != 0 {
+			v := int(f.GetBestOf())
+			o.BestOf = &v
+		}
+		if f.GetThirdPlaceMatch() {
+			v := true
+			o.ThirdPlaceMatch = &v
+		}
 	}
 	if pz := msg.GetPrizes(); pz != nil {
 		o.Prizes = &tournament.Prizes{
@@ -518,6 +550,82 @@ func (h activityJudgeHandler) OpenHandicap(
 	}), nil
 }
 
+// ReviewHandicap 裁判檢視一場的讓武內容,**不受封盤前的揭露限制**。
+//
+// # 為什麼不能用 HandicapService.GetMatchHandicaps
+//
+// 那一支在封盤前只對施加者本人揭露內容,而裁判不是場上的選手 ——
+// 他的 viewerPlayerID 恆為 0,拿到的永遠是空清單。但場上要裁判執行的規則
+// 就寫在買下的項目裡(「禁用奇術」的 referee_note 要求裁判確認後返還另一項
+// 的 BP),看不到內容等於那條規則沒有人執行得了。
+//
+// # 界線沒有被打破
+//
+// 讓開的只有這一條路:它需要平台帳號 + 裁判權限(requireJudge),
+// 而選手與觀眾走的那一支一行都沒有改。領域層也是兩個不同的方法,
+// 不是同一個方法多一個 bool —— 那種參數遲早會被複製貼上到選手那條路上。
+//
+// 純讀取,不寫稽核:與 ListUnranked 同一個判斷,把裁判每一次查看都記一列,
+// 只會讓真正要查的那幾列(代退、封盤、判賽果)被淹掉。
+func (h activityJudgeHandler) ReviewHandicap(
+	ctx context.Context, req *connect.Request[activityv1.ReviewHandicapRequest],
+) (*connect.Response[activityv1.ReviewHandicapResponse], error) {
+	if h.handicap == nil {
+		return nil, unimplemented("JudgeService.ReviewHandicap")
+	}
+	if _, err := h.requireJudge(ctx, req.Spec().Procedure); err != nil {
+		return nil, err
+	}
+	matchID := strings.TrimSpace(req.Msg.GetMatchPublicId())
+	if matchID == "" {
+		return nil, invalidArgument("match_public_id 必填")
+	}
+	mh, err := h.handicap.RefereeMatchHandicaps(ctx, matchID)
+	if err != nil {
+		return nil, toConnectError(err)
+	}
+	return connect.NewResponse(&activityv1.ReviewHandicapResponse{
+		Handicaps: refereeMatchHandicapsToProto(mh),
+	}), nil
+}
+
+// RefundSelection 退掉某一筆讓武選擇,BP 退回該場預算。
+//
+// 封盤後拒絕(handicap.ErrHandicapLocked),那條線由領域層守 ——
+// 入口層再判一次會是第二個權威位置,而兩份條件裡遲早有一份比較寬鬆。
+//
+// reason 必填也由領域層擋(match.ErrInvalidRequest),理由同上:
+// 「這筆退點為什麼成立」是稽核紀錄的內容,不是入口層的表單驗證。
+func (h activityJudgeHandler) RefundSelection(
+	ctx context.Context, req *connect.Request[activityv1.RefundSelectionRequest],
+) (*connect.Response[activityv1.RefundSelectionResponse], error) {
+	if h.matches == nil {
+		return nil, unimplemented("JudgeService.RefundSelection")
+	}
+	actorID, err := h.requireJudge(ctx, req.Spec().Procedure)
+	if err != nil {
+		return nil, err
+	}
+	selectionID := strings.TrimSpace(req.Msg.GetSelectionPublicId())
+	if selectionID == "" {
+		return nil, invalidArgument("selection_public_id 必填")
+	}
+	res, err := h.matches.RefundSelection(ctx, match.RefundSelectionParams{
+		SelectionPublicID: selectionID,
+		ActorUserID:       actorID,
+		Reason:            req.Msg.GetReason(),
+	})
+	if err != nil {
+		return nil, toConnectError(err)
+	}
+	// 這裡填得出 match_public_id(VoidSelection 那支填不出來):領域層的
+	// RefundResult 帶著它回來,不必為了組回應再猜一個或再查一次。
+	return connect.NewResponse(&activityv1.RefundSelectionResponse{
+		Budget:    bpBudgetToProto(res.MatchPublicID, res.Budget),
+		Selection: handicapSelectionToProto(res.Selection),
+	}), nil
+}
+
 // LockHandicap 封盤。**不可逆**:選手不能再改,內容立刻公開並發 Discord 公告。
 //
 // confirm 原樣往下傳 —— 二次確認的權威在 match.Service(它回
@@ -546,7 +654,7 @@ func (h activityJudgeHandler) LockHandicap(
 	}
 	return connect.NewResponse(&activityv1.LockHandicapResponse{
 		Match:     matchToProto(res.Match),
-		Handicaps: matchHandicapsToProto(res.Handicaps),
+		Handicaps: refereeMatchHandicapsToProto(res.Handicaps),
 	}), nil
 }
 
@@ -576,12 +684,45 @@ func (h activityJudgeHandler) SetStreamUrl(
 	return connect.NewResponse(&activityv1.SetStreamUrlResponse{Match: matchToProto(*m)}), nil
 }
 
-// StartMatch 標記開打。這一步同時關閉下注。
-func (h activityJudgeHandler) StartMatch(
-	ctx context.Context, req *connect.Request[activityv1.StartMatchRequest],
-) (*connect.Response[activityv1.StartMatchResponse], error) {
+// ReviewSetup 開賽前設定確認清單 + 目前回合狀態 + 已記錄的違規。純讀取,不寫稽核。
+//
+// 清單是推導值(該場未作廢的讓武項目的 referee_note + 抽選結果),由領域層組;
+// 入口層只做轉換。執行說明從不離開裁判端 —— 這支有 requireJudge。
+func (h activityJudgeHandler) ReviewSetup(
+	ctx context.Context, req *connect.Request[activityv1.ReviewSetupRequest],
+) (*connect.Response[activityv1.ReviewSetupResponse], error) {
 	if h.matches == nil {
-		return nil, unimplemented("JudgeService.StartMatch")
+		return nil, unimplemented("JudgeService.ReviewSetup")
+	}
+	if _, err := h.requireJudge(ctx, req.Spec().Procedure); err != nil {
+		return nil, err
+	}
+	matchID := strings.TrimSpace(req.Msg.GetMatchPublicId())
+	if matchID == "" {
+		return nil, invalidArgument("match_public_id 必填")
+	}
+	rv, err := h.matches.ReviewSetup(ctx, matchID)
+	if err != nil {
+		return nil, toConnectError(err)
+	}
+	violations, err := h.matches.ListMatchViolations(ctx, matchID)
+	if err != nil {
+		return nil, toConnectError(err)
+	}
+	return connect.NewResponse(&activityv1.ReviewSetupResponse{
+		Match:      matchWithRoundsToProto(rv.Match, rv.Rounds),
+		Checklist:  checklistToProto(rv.Checklist),
+		Violations: violationsToProto(violations),
+	}), nil
+}
+
+// ConfirmSetup 裁判確認開賽前設定都做了。整體一次確認,不逐項(grill Q9)。
+// 確認完才能開打:StartRound 在應用層擋,matches_started_requires_setup_check 在 DB 擋。
+func (h activityJudgeHandler) ConfirmSetup(
+	ctx context.Context, req *connect.Request[activityv1.ConfirmSetupRequest],
+) (*connect.Response[activityv1.ConfirmSetupResponse], error) {
+	if h.matches == nil {
+		return nil, unimplemented("JudgeService.ConfirmSetup")
 	}
 	actorID, err := h.requireJudge(ctx, req.Spec().Procedure)
 	if err != nil {
@@ -591,13 +732,151 @@ func (h activityJudgeHandler) StartMatch(
 	if matchID == "" {
 		return nil, invalidArgument("match_public_id 必填")
 	}
-	m, err := h.matches.StartMatch(ctx, match.StartMatchParams{
-		MatchPublicID: matchID, ActorUserID: actorID,
+	m, err := h.matches.ConfirmSetup(ctx, matchID, actorID)
+	if err != nil {
+		return nil, toConnectError(err)
+	}
+	return connect.NewResponse(&activityv1.ConfirmSetupResponse{Match: matchToProto(*m)}), nil
+}
+
+// StartRound 開始下一回合。第 1 回合 = 正式開打:關下注、啟動計時(grill Q11/Q20)。
+// 回傳的 round.started_at 就是計時起點;計時器是衍生值,前端自己算 now() − started_at。
+func (h activityJudgeHandler) StartRound(
+	ctx context.Context, req *connect.Request[activityv1.StartRoundRequest],
+) (*connect.Response[activityv1.StartRoundResponse], error) {
+	if h.matches == nil {
+		return nil, unimplemented("JudgeService.StartRound")
+	}
+	actorID, err := h.requireJudge(ctx, req.Spec().Procedure)
+	if err != nil {
+		return nil, err
+	}
+	matchID := strings.TrimSpace(req.Msg.GetMatchPublicId())
+	if matchID == "" {
+		return nil, invalidArgument("match_public_id 必填")
+	}
+	out, err := h.matches.StartRound(ctx, matchID, actorID)
+	if err != nil {
+		return nil, toConnectError(err)
+	}
+	out.Match.ResolveRoundWinners(out.Rounds)
+	return connect.NewResponse(&activityv1.StartRoundResponse{
+		Match: matchWithRoundsToProto(out.Match, out.Rounds),
+		Round: roundToProto(out.Round),
+	}), nil
+}
+
+// FinishRound 結束一個回合並填勝者。**不可逆**:達到勝場數的那一次會定案整場、
+// 觸發晉級與派彩(領域層在同一個 tx 內做完,含季軍戰的成形)。
+func (h activityJudgeHandler) FinishRound(
+	ctx context.Context, req *connect.Request[activityv1.FinishRoundRequest],
+) (*connect.Response[activityv1.FinishRoundResponse], error) {
+	if h.matches == nil {
+		return nil, unimplemented("JudgeService.FinishRound")
+	}
+	actorID, err := h.requireJudge(ctx, req.Spec().Procedure)
+	if err != nil {
+		return nil, err
+	}
+	matchID := strings.TrimSpace(req.Msg.GetMatchPublicId())
+	if matchID == "" {
+		return nil, invalidArgument("match_public_id 必填")
+	}
+	if req.Msg.GetRoundNo() <= 0 {
+		return nil, invalidArgument("round_no 必須是正整數")
+	}
+	winnerID := strings.TrimSpace(req.Msg.GetWinnerPlayerPublicId())
+	if winnerID == "" {
+		return nil, invalidArgument("winner_player_public_id 必填")
+	}
+	// confirm 原樣傳下去:二次確認的權威在 match.Service(ErrConfirmationRequired),
+	// 這裡不另擋一次 —— 兩份規則遲早有一份比另一份寬鬆。
+	out, err := h.matches.FinishRound(ctx, match.FinishRoundParams{
+		MatchPublicID:  matchID,
+		RoundNo:        int(req.Msg.GetRoundNo()),
+		WinnerPublicID: winnerID,
+		ActorUserID:    actorID,
+		Note:           req.Msg.GetNote(),
+		Confirm:        req.Msg.GetConfirm(),
 	})
 	if err != nil {
 		return nil, toConnectError(err)
 	}
-	return connect.NewResponse(&activityv1.StartMatchResponse{Match: matchToProto(*m)}), nil
+	out.Match.ResolveRoundWinners(out.Rounds)
+	res := &activityv1.FinishRoundResponse{
+		Match:        matchWithRoundsToProto(out.Match, out.Rounds),
+		Round:        roundToProto(out.Round),
+		MatchDecided: out.Decided,
+	}
+	if out.Outcome != nil {
+		res.AdvancedMatches = advancedMatchesToProto(out.Outcome)
+	}
+	return connect.NewResponse(res), nil
+}
+
+// RecordViolation 記一筆違規。只記事實與裁判的判決,**不觸發任何後果**(schemas/27):
+// 判該回合 = 裁判把該回合勝者填成對方(FinishRound);判整場 = 走正常的回合路徑。
+func (h activityJudgeHandler) RecordViolation(
+	ctx context.Context, req *connect.Request[activityv1.RecordViolationRequest],
+) (*connect.Response[activityv1.RecordViolationResponse], error) {
+	if h.matches == nil {
+		return nil, unimplemented("JudgeService.RecordViolation")
+	}
+	actorID, err := h.requireJudge(ctx, req.Spec().Procedure)
+	if err != nil {
+		return nil, err
+	}
+	matchID := strings.TrimSpace(req.Msg.GetMatchPublicId())
+	if matchID == "" {
+		return nil, invalidArgument("match_public_id 必填")
+	}
+	playerID := strings.TrimSpace(req.Msg.GetPlayerPublicId())
+	if playerID == "" {
+		return nil, invalidArgument("player_public_id 必填")
+	}
+	ruling, ok := rulingFromProto(req.Msg.GetRuling())
+	if !ok {
+		return nil, invalidArgument("ruling 必填")
+	}
+	p := match.RecordViolationParams{
+		MatchPublicID:  matchID,
+		PlayerPublicID: playerID,
+		ItemPublicID:   strings.TrimSpace(req.Msg.GetItemPublicId()),
+		Ruling:         ruling,
+		Note:           req.Msg.GetNote(),
+		ActorUserID:    actorID,
+	}
+	// 0 = 開賽前;領域型別用 nil 表達同一件事,proto 沒有 optional int 的必要。
+	if n := int(req.Msg.GetRoundNo()); n > 0 {
+		p.RoundNo = &n
+	}
+	v, err := h.matches.RecordViolation(ctx, p)
+	if err != nil {
+		return nil, toConnectError(err)
+	}
+	return connect.NewResponse(&activityv1.RecordViolationResponse{Violation: violationToProto(*v)}), nil
+}
+
+// ListViolations 列出一場的違規紀錄。純讀取。裁判端才看得到:違規紀錄的 item
+// 會間接洩漏封盤前誰買了什麼(選手端「看自己的」另有路徑)。
+func (h activityJudgeHandler) ListViolations(
+	ctx context.Context, req *connect.Request[activityv1.ListViolationsRequest],
+) (*connect.Response[activityv1.ListViolationsResponse], error) {
+	if h.matches == nil {
+		return nil, unimplemented("JudgeService.ListViolations")
+	}
+	if _, err := h.requireJudge(ctx, req.Spec().Procedure); err != nil {
+		return nil, err
+	}
+	matchID := strings.TrimSpace(req.Msg.GetMatchPublicId())
+	if matchID == "" {
+		return nil, invalidArgument("match_public_id 必填")
+	}
+	vs, err := h.matches.ListMatchViolations(ctx, matchID)
+	if err != nil {
+		return nil, toConnectError(err)
+	}
+	return connect.NewResponse(&activityv1.ListViolationsResponse{Violations: violationsToProto(vs)}), nil
 }
 
 // ReportResult 判定勝負。**不可逆**:觸發晉級與下注結算。
@@ -631,7 +910,7 @@ func (h activityJudgeHandler) ReportResult(
 	}
 	return connect.NewResponse(&activityv1.ReportResultResponse{
 		Match:           matchToProto(out.Match),
-		AdvancedMatches: matchesToProto(out.AdvancedMatches),
+		AdvancedMatches: advancedMatchesToProto(out),
 		SettledBetCount: int32(out.SettledBetCount),
 	}), nil
 }
@@ -782,7 +1061,11 @@ func (h activityJudgeHandler) bracketRounds(
 	if err != nil {
 		return nil, toConnectError(err)
 	}
-	return bracketRoundsToProto(matches), nil
+	rounds, err := h.reader.RoundsByMatches(ctx, matchIDs(matches))
+	if err != nil {
+		return nil, toConnectError(err)
+	}
+	return bracketRoundsToProto(matches, rounds), nil
 }
 
 func (h activityJudgeHandler) tournamentToProto(
@@ -852,3 +1135,105 @@ var (
 	_ activityv1connect.BettingServiceHandler    = activityBettingHandler{}
 	_ activityv1connect.JudgeServiceHandler      = activityJudgeHandler{}
 )
+
+// ── 多回合制的轉換 ──────────────────────────────────────────────
+
+// advancedMatchesToProto 把定案後成形的場次攤平:晉級鏈上的場次 + 季軍戰。
+// proto 只有一個 advanced_matches 欄位(季軍戰以 kind = THIRD_PLACE 區分),
+// 領域型別把季軍戰分開放是因為它的成形條件不同;對前端而言都是「多出來的場次」。
+func advancedMatchesToProto(out *match.ReportResultOutcome) []*activityv1.Match {
+	pbs := matchesToProto(out.AdvancedMatches)
+	if out.ThirdPlaceMatch != nil {
+		pbs = append(pbs, matchToProto(*out.ThirdPlaceMatch))
+	}
+	return pbs
+}
+
+func roundToProto(r match.Round) *activityv1.MatchRound {
+	return &activityv1.MatchRound{
+		RoundNo:              int32(r.RoundNo),
+		StartedAt:            tsPB(r.StartedAt),
+		FinishedAt:           optTS(r.FinishedAt),
+		WinnerPlayerPublicId: r.WinnerPublicID,
+	}
+}
+
+func roundsToProto(rs []match.Round) []*activityv1.MatchRound {
+	out := make([]*activityv1.MatchRound, 0, len(rs))
+	for _, r := range rs {
+		out = append(out, roundToProto(r))
+	}
+	return out
+}
+
+func violationToProto(v match.Violation) *activityv1.Violation {
+	out := &activityv1.Violation{
+		PublicId:          v.PublicID,
+		MatchPublicId:     v.MatchPublicID,
+		PlayerPublicId:    v.PlayerPublicID,
+		PlayerDisplayName: v.PlayerDisplayName,
+		ItemPublicId:      v.ItemPublicID,
+		ItemName:          v.ItemName,
+		Ruling:            rulingToProto(v.Ruling),
+		Note:              v.Note,
+		CreatedAt:         tsPB(v.CreatedAt),
+	}
+	if v.RoundNo != nil {
+		out.RoundNo = int32(*v.RoundNo)
+	}
+	return out
+}
+
+func violationsToProto(vs []match.Violation) []*activityv1.Violation {
+	out := make([]*activityv1.Violation, 0, len(vs))
+	for _, v := range vs {
+		out = append(out, violationToProto(v))
+	}
+	return out
+}
+
+func rulingToProto(r match.Ruling) activityv1.ViolationRuling {
+	switch r {
+	case match.RulingWarning:
+		return activityv1.ViolationRuling_VIOLATION_RULING_WARNING
+	case match.RulingRoundLoss:
+		return activityv1.ViolationRuling_VIOLATION_RULING_ROUND_LOSS
+	case match.RulingMatchLoss:
+		return activityv1.ViolationRuling_VIOLATION_RULING_MATCH_LOSS
+	case match.RulingNone:
+		return activityv1.ViolationRuling_VIOLATION_RULING_NONE
+	default:
+		return activityv1.ViolationRuling_VIOLATION_RULING_UNSPECIFIED
+	}
+}
+
+func rulingFromProto(r activityv1.ViolationRuling) (match.Ruling, bool) {
+	switch r {
+	case activityv1.ViolationRuling_VIOLATION_RULING_WARNING:
+		return match.RulingWarning, true
+	case activityv1.ViolationRuling_VIOLATION_RULING_ROUND_LOSS:
+		return match.RulingRoundLoss, true
+	case activityv1.ViolationRuling_VIOLATION_RULING_MATCH_LOSS:
+		return match.RulingMatchLoss, true
+	case activityv1.ViolationRuling_VIOLATION_RULING_NONE:
+		return match.RulingNone, true
+	default:
+		return "", false
+	}
+}
+
+func checklistToProto(entries []handicap.ChecklistEntry) []*activityv1.SetupChecklistEntry {
+	out := make([]*activityv1.SetupChecklistEntry, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, &activityv1.SetupChecklistEntry{
+			SelectionPublicId: e.SelectionPublicID,
+			ItemKey:           e.ItemKey,
+			ItemName:          e.ItemName,
+			RefereeNote:       e.RefereeNote,
+			TargetNote:        e.TargetNote,
+			DrawResult:        derefString(e.DrawResult),
+			AppliesToBoth:     e.AppliesToBoth,
+		})
+	}
+	return out
+}

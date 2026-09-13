@@ -38,7 +38,7 @@ import (
 // 而不是具體型別:*betting.Service[pgx.Tx] 直接滿足它,而 transport 一行
 // pgx 都不必寫。
 type ActivityBetting interface {
-	Vote(ctx context.Context, p betting.VoteParams) (*betting.MatchOdds, error)
+	Vote(ctx context.Context, p betting.VoteParams) (*betting.MarketOdds, error)
 	GetOdds(ctx context.Context, p betting.GetOddsParams) ([]betting.MatchOdds, error)
 	PlaceBet(ctx context.Context, p betting.PlaceBetParams) (*betting.PlaceBetResult, error)
 	ListMyBets(ctx context.Context, p betting.ListMyBetsParams) ([]betting.Bet, error)
@@ -55,7 +55,7 @@ type activityBettingHandler struct {
 	svc ActivityBetting
 }
 
-// Vote 投票給某一方。一場一票,再投即改票。
+// Vote 對一個盤口投一個結果。每盤口一票,再投即改票(grill Q19)。
 func (h activityBettingHandler) Vote(
 	ctx context.Context, req *connect.Request[activityv1.VoteRequest],
 ) (*connect.Response[activityv1.VoteResponse], error) {
@@ -66,23 +66,23 @@ func (h activityBettingHandler) Vote(
 	if err != nil {
 		return nil, err
 	}
-	matchID := strings.TrimSpace(req.Msg.GetMatchPublicId())
-	if matchID == "" {
-		return nil, invalidArgument("match_public_id 必填")
+	marketID := strings.TrimSpace(req.Msg.GetMarketPublicId())
+	if marketID == "" {
+		return nil, invalidArgument("market_public_id 必填")
 	}
-	side, err := sideFromProto(req.Msg.GetSide())
+	outcome, err := outcomeFromProto(req.Msg.GetOutcome())
 	if err != nil {
 		return nil, err
 	}
 	odds, err := h.svc.Vote(ctx, betting.VoteParams{
-		UserID: userID, MatchPublicID: matchID, Side: side,
+		UserID: userID, MarketPublicID: marketID, Outcome: outcome,
 	})
 	if err != nil {
 		return nil, toConnectError(err)
 	}
 	// 一併回賠率:票數變了賠率就會變,讓前端再打一次 GetOdds 只會讓它
 	// 顯示一個「投票前」與「投票後」中間的狀態。
-	return connect.NewResponse(&activityv1.VoteResponse{Odds: matchOddsToProto(*odds)}), nil
+	return connect.NewResponse(&activityv1.VoteResponse{Odds: marketOddsToProto(*odds, true)}), nil
 }
 
 // GetOdds 取目前賠率與票數。**匿名可讀** —— 觀眾不必登入就看得到盤口。
@@ -149,17 +149,18 @@ func (h activityBettingHandler) PlaceBet(
 	}
 	in := make([]betting.LegInput, 0, len(legs))
 	for i, leg := range legs {
-		matchID := strings.TrimSpace(leg.GetMatchPublicId())
-		if matchID == "" {
-			return nil, invalidArgument(fmt.Sprintf("legs[%d].match_public_id 必填", i))
+		marketID := strings.TrimSpace(leg.GetMarketPublicId())
+		if marketID == "" {
+			return nil, invalidArgument(fmt.Sprintf("legs[%d].market_public_id 必填", i))
 		}
-		side, err := sideFromProto(leg.GetSide())
+		outcome, err := outcomeFromProto(leg.GetOutcome())
 		if err != nil {
-			return nil, err
+			return nil, invalidArgument(fmt.Sprintf("legs[%d].%s", i, connect.CodeOf(err).String()))
 		}
-		in = append(in, betting.LegInput{MatchPublicID: matchID, Side: side})
+		in = append(in, betting.LegInput{MarketPublicID: marketID, Outcome: outcome})
 	}
-	// 腿數上限、重複押同一場、stake 範圍、選手賭自己 —— 全部在領域層擋。
+	// 腿數上限、同一場只能一腿、盤口是否開著、結果是否屬於盤口、stake 範圍、
+	// 選手賭自己 —— 全部在領域層擋。
 	// 入口層只擋「請求本身組不起來」的情況。
 	res, err := h.svc.PlaceBet(ctx, betting.PlaceBetParams{
 		UserID:         userID,
@@ -207,17 +208,48 @@ func (h activityBettingHandler) ListMyBets(
 
 // ── betting.proto 的轉換 ──────────────────────────────────────
 
-// sideFromProto 把 1/2 轉成領域的 Side。
+// outcomeFromProto 把結果代碼收成領域型別。
 //
-// 在入口層擋掉 0 與其他值是刻意的:proto3 沒有 required,side 沒填會是 0,
-// 而 0 在領域層是「未投票」的合法值。不擋的話,一個漏填 side 的請求會變成
-// 一個語意不明的呼叫,而不是一個清楚的 400。
-func sideFromProto(v int32) (betting.Side, error) {
-	s := betting.Side(v)
-	if !s.Valid() {
-		return 0, invalidArgument("side 必須是 1(p1)或 2(p2)")
+// 入口層只擋空字串:proto3 沒有 required,outcome 沒填會是 "",而 "" 在領域層
+// 是「未投票」的合法值(OutcomeNone)。不擋的話,一個漏填的請求會變成一個
+// 語意不明的呼叫,而不是一個清楚的 400。「結果屬不屬於這個盤口」要看盤口的
+// kind 與 best_of,那是領域層的事(ErrOutcomeInvalid)。
+func outcomeFromProto(v string) (betting.Outcome, error) {
+	o := betting.Outcome(strings.TrimSpace(v))
+	if o == betting.OutcomeNone {
+		return "", invalidArgument("outcome 必填(p1 / p2 / over / under / p1_2_0 …)")
 	}
-	return s, nil
+	return o, nil
+}
+
+func marketKindToProto(k betting.MarketKind) activityv1.MarketKind {
+	switch k {
+	case betting.MarketMatchWinner:
+		return activityv1.MarketKind_MARKET_KIND_MATCH_WINNER
+	case betting.MarketRoundWinner:
+		return activityv1.MarketKind_MARKET_KIND_ROUND_WINNER
+	case betting.MarketDuration:
+		return activityv1.MarketKind_MARKET_KIND_DURATION
+	case betting.MarketScore:
+		return activityv1.MarketKind_MARKET_KIND_SCORE
+	default:
+		return activityv1.MarketKind_MARKET_KIND_UNSPECIFIED
+	}
+}
+
+func marketStatusToProto(s betting.MarketStatus) activityv1.MarketStatus {
+	switch s {
+	case betting.MarketOpen:
+		return activityv1.MarketStatus_MARKET_STATUS_OPEN
+	case betting.MarketClosed:
+		return activityv1.MarketStatus_MARKET_STATUS_CLOSED
+	case betting.MarketSettled:
+		return activityv1.MarketStatus_MARKET_STATUS_SETTLED
+	case betting.MarketVoid:
+		return activityv1.MarketStatus_MARKET_STATUS_VOID
+	default:
+		return activityv1.MarketStatus_MARKET_STATUS_UNSPECIFIED
+	}
 }
 
 func betStatusToProto(s betting.BetStatus) activityv1.BetStatus {
@@ -250,15 +282,40 @@ func legResultToProto(r betting.LegResult) activityv1.LegResult {
 	}
 }
 
+// matchOddsToProto 轉一場的全部盤口。
+//
+// open_for_bets 是兩層 AND:場次層的窗口(ready / locked)與盤口自己的 status。
+// 一場開打後個別回合的盤口會先被關,場次層的窗口也關了 —— 前端只看一個布林。
 func matchOddsToProto(o betting.MatchOdds) *activityv1.MatchOdds {
-	return &activityv1.MatchOdds{
-		MatchPublicId: o.MatchPublicID,
-		P1Votes:       clampInt32(o.P1Votes),
-		P2Votes:       clampInt32(o.P2Votes),
-		P1OddsMilli:   o.P1OddsMilli,
-		P2OddsMilli:   o.P2OddsMilli,
-		OpenForBets:   o.OpenForBets,
-		MyVote:        int32(o.MyVote),
+	markets := make([]*activityv1.MarketOdds, 0, len(o.Markets))
+	for _, m := range o.Markets {
+		markets = append(markets, marketOddsToProto(m, o.OpenForBets))
+	}
+	return &activityv1.MatchOdds{MatchPublicId: o.MatchPublicID, Markets: markets}
+}
+
+// marketOddsToProto 轉一個盤口。matchOpen 是場次層的窗口;Vote 的回應只有
+// 一個盤口、沒有場次資訊,但投票能成功就表示場次還開著,傳 true。
+func marketOddsToProto(m betting.MarketOdds, matchOpen bool) *activityv1.MarketOdds {
+	outcomes := make([]*activityv1.OutcomeOdds, 0, len(m.Outcomes))
+	for _, oc := range m.Outcomes {
+		outcomes = append(outcomes, &activityv1.OutcomeOdds{
+			Outcome:   string(oc),
+			Label:     m.Labels[oc],
+			Votes:     clampInt32(m.Votes[oc]),
+			OddsMilli: m.Odds[oc],
+		})
+	}
+	return &activityv1.MarketOdds{
+		MarketPublicId: m.PublicID,
+		MatchPublicId:  m.MatchPublicID,
+		Kind:           marketKindToProto(m.Kind),
+		RoundNo:        int32(m.RoundNo),
+		LineSeconds:    m.LineSeconds,
+		Status:         marketStatusToProto(m.Status),
+		Outcomes:       outcomes,
+		OpenForBets:    matchOpen && m.Status == betting.MarketOpen,
+		MyVote:         string(m.MyVote),
 	}
 }
 
@@ -283,18 +340,21 @@ func betToProto(b betting.Bet) *activityv1.Bet {
 
 // betLegToProto 轉一腿。
 //
-// match_label 目前只組得出輪次與場次序號:bet_legs 存的是 round/slot 與
-// **押的那一方**的名字快照,沒有對手的名字,所以做不出 proto 註解舉例的
+// match_label 目前只組得出輪次與場次序號:列注單的查詢 join 的是盤口與
+// 押的結果的顯示名,沒有兩位選手的名字,所以做不出 proto 註解舉例的
 // 「首輪 · 李璃 vs A冷」。這是領域層的缺口,不是這裡偷懶 —— 硬要組的話
 // 得在列注單時回查每一場,而那正是快照欄位要避免的事。
 func betLegToProto(l betting.Leg) *activityv1.BetLeg {
 	return &activityv1.BetLeg{
-		MatchPublicId:   l.MatchPublicID,
-		MatchLabel:      betLegLabel(l),
-		Side:            int32(l.Side),
-		SideDisplayName: l.SideDisplayName,
-		OddsMilli:       l.OddsMilli,
-		Result:          legResultToProto(l.Result),
+		MatchPublicId:  l.MatchPublicID,
+		MatchLabel:     betLegLabel(l),
+		MarketPublicId: l.MarketPublicID,
+		Kind:           marketKindToProto(l.MarketKind),
+		RoundNo:        int32(l.MarketRoundNo),
+		Outcome:        string(l.Outcome),
+		OutcomeLabel:   l.OutcomeLabel,
+		OddsMilli:      l.OddsMilli,
+		Result:         legResultToProto(l.Result),
 	}
 }
 

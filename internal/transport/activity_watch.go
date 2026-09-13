@@ -191,12 +191,18 @@ func watchHeartbeatMsg() *activityv1.WatchTournamentResponse {
 func watchUpdateToProto(u watch.Update) *activityv1.WatchTournamentResponse {
 	out := &activityv1.WatchTournamentResponse{EmittedAt: tsPB(u.EmittedAt)}
 	switch u.Kind {
-	case watch.KindMatch:
+	case watch.KindMatch, watch.KindRound:
+		// 回合開始 / 結束走同一則 MatchUpdate(watch.proto):Match.rounds 帶全部回合,
+		// 前端拿最後一筆的 started_at 跑計時器、拿勝場數顯示比數。
 		if u.Match == nil {
 			return nil
 		}
+		m := matchToProto(*u.Match)
+		if u.Rounds != nil {
+			m = matchWithRoundsToProto(*u.Match, u.Rounds.Rounds)
+		}
 		out.Update = &activityv1.WatchTournamentResponse_Match{
-			Match: &activityv1.MatchUpdate{Match: matchToProto(*u.Match)},
+			Match: &activityv1.MatchUpdate{Match: m},
 		}
 	case watch.KindHandicapLocked:
 		if u.Handicaps == nil {
@@ -215,7 +221,9 @@ func watchUpdateToProto(u watch.Update) *activityv1.WatchTournamentResponse {
 		// 推播是廣播,my_vote 不可能因人而異。解析端本來就不填它,這裡再
 		// 明確歸零一次 —— 這是「不要把某個人的投票送給所有人」的最後一道
 		// 保險,成本只有一行。
-		odds.MyVote = 0
+		for _, mk := range odds.GetMarkets() {
+			mk.MyVote = ""
+		}
 		out.Update = &activityv1.WatchTournamentResponse_Odds{
 			Odds: &activityv1.OddsUpdate{Odds: odds},
 		}

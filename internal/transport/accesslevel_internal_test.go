@@ -148,3 +148,31 @@ func TestServiceOnlyServicesStillMatchNamePrefixes(t *testing.T) {
 		}
 	}
 }
+
+// 需要授權、卻沒指定要哪個權限 → 啟動就要炸。
+//
+// 這條守的是一個**沉默的功能故障**:privilegedServices 用服務前綴,所以
+// 裁判後台新增的 RPC 自動落在「需要授權」那一側(fail closed,很好),
+// 但那只回答了「要不要授權」。authz 的映射表漏登記時 PermissionFor 回 false,
+// 攔截器一律拒絕 —— 結果是那支 RPC 對**合法的裁判**永遠回 PermissionDenied,
+// 而線索不會指向 authz.go。
+//
+// 用 MeService 當道具:它的每一支都沒有權限映射(本來就不需要授權),
+// 把它塞進 privilegedServices 就製造出「需要授權但沒指定權限」的狀態。
+func TestVerifyRejectsPrivilegedServiceWithoutPermission(t *testing.T) {
+	defer swapStrings(&privilegedServices, append(
+		append([]string{}, privilegedServices...),
+		platformv1connect.MeServiceName,
+	))()
+
+	err := verifyProcedureCoverage()
+	if err == nil {
+		t.Fatal("需要授權卻沒登記權限,居然通過了 —— 這道斷言就是為它存在的")
+	}
+	// 比對到 procedure 這一層。MeService 同時會踩到「代打與需要授權矛盾」那條
+	// 斷言,只查 "authz" 兩個字會分不出炸的是哪一條。
+	want := platformv1connect.MeServiceGetProfileProcedure + " 需要授權,但 authz"
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("炸的不是這條斷言。期望訊息含 %q,實際:%v", want, err)
+	}
+}

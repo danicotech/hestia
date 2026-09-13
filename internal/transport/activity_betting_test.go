@@ -12,9 +12,11 @@ import (
 	"github.com/danicotech/hestia/internal/core/activity/betting"
 )
 
+const testMarketID = "01MARKETWINNER0000000000"
+
 type fakeActivityBetting struct {
 	votes   []betting.VoteParams
-	voteRes *betting.MatchOdds
+	voteRes *betting.MarketOdds
 	voteErr error
 
 	oddsQueries []betting.GetOddsParams
@@ -28,7 +30,7 @@ type fakeActivityBetting struct {
 	myBets []betting.Bet
 }
 
-func (f *fakeActivityBetting) Vote(_ context.Context, p betting.VoteParams) (*betting.MatchOdds, error) {
+func (f *fakeActivityBetting) Vote(_ context.Context, p betting.VoteParams) (*betting.MarketOdds, error) {
 	f.votes = append(f.votes, p)
 	if f.voteErr != nil {
 		return nil, f.voteErr
@@ -60,17 +62,44 @@ func (f *fakeActivityBetting) ListMyBets(
 	return f.myBets, nil
 }
 
+// testMarketOdds 是一場的兩個盤口:整場勝負(開著)與第 2 回合時長(已關)。
+// 兩種狀態並存,轉換層的 open_for_bets 才驗得出「場次開著 ≠ 盤口開著」。
+func testMarketOdds() betting.MatchOdds {
+	winner := betting.MarketOdds{
+		Market: betting.Market{
+			ID: 1, PublicID: testMarketID, MatchID: 1,
+			Kind: betting.MarketMatchWinner, Status: betting.MarketOpen,
+		},
+		MatchPublicID: testMatchID,
+		Outcomes:      []betting.Outcome{betting.OutcomeP1, betting.OutcomeP2},
+		Odds:          map[betting.Outcome]int64{betting.OutcomeP1: 1430, betting.OutcomeP2: 2860},
+		Votes:         map[betting.Outcome]int64{betting.OutcomeP1: 7, betting.OutcomeP2: 3},
+		Labels:        map[betting.Outcome]string{betting.OutcomeP1: "選手A", betting.OutcomeP2: "選手B"},
+		MyVote:        betting.OutcomeP1,
+	}
+	duration := betting.MarketOdds{
+		Market: betting.Market{
+			ID: 2, PublicID: "01MARKETDURATION00000000", MatchID: 1,
+			Kind: betting.MarketDuration, RoundNo: 2, LineSeconds: 90, Status: betting.MarketClosed,
+		},
+		MatchPublicID: testMatchID,
+		Outcomes:      []betting.Outcome{betting.OutcomeOver, betting.OutcomeUnder},
+		Odds:          map[betting.Outcome]int64{betting.OutcomeOver: 1840, betting.OutcomeUnder: 1840},
+		Votes:         map[betting.Outcome]int64{},
+		Labels:        map[betting.Outcome]string{betting.OutcomeOver: "超過 90 秒", betting.OutcomeUnder: "90 秒內"},
+	}
+	return betting.MatchOdds{
+		MatchPublicID: testMatchID, OpenForBets: true,
+		Markets: []betting.MarketOdds{winner, duration},
+	}
+}
+
 func bettingDeps() (ActivityDeps, *fakeActivityBetting) {
 	deps, _, _ := baseActivityDeps()
-	odds := betting.MatchOdds{
-		MatchPublicID: testMatchID,
-		P1Votes:       7, P2Votes: 3,
-		P1OddsMilli: 1430, P2OddsMilli: 2860,
-		OpenForBets: true, MyVote: betting.SideP1,
-	}
+	odds := testMarketOdds()
 	settled := time.Date(2026, 9, 12, 10, 0, 0, 0, time.UTC)
 	svc := &fakeActivityBetting{
-		voteRes: &odds,
+		voteRes: &odds.Markets[0],
 		odds:    []betting.MatchOdds{odds},
 		placeRes: &betting.PlaceBetResult{
 			Bet: betting.Bet{
@@ -78,7 +107,8 @@ func bettingDeps() (ActivityDeps, *fakeActivityBetting) {
 				Status: betting.BetOpen,
 				Legs: []betting.Leg{{
 					MatchPublicID: testMatchID, Round: 1, Slot: 0,
-					Side: betting.SideP2, SideDisplayName: "選手B",
+					MarketPublicID: testMarketID, MarketKind: betting.MarketMatchWinner,
+					Outcome: betting.OutcomeP2, OutcomeLabel: "選手B",
 					OddsMilli: 2860, Result: betting.LegPending,
 				}},
 				CreatedAt: time.Date(2026, 9, 12, 9, 0, 0, 0, time.UTC),
@@ -110,8 +140,28 @@ func TestGetOddsIsAnonymousReadable(t *testing.T) {
 	if len(got.Msg.GetOdds()) != 1 {
 		t.Fatalf("賠率筆數 = %d", len(got.Msg.GetOdds()))
 	}
-	if got.Msg.GetOdds()[0].GetP1OddsMilli() != 1430 {
-		t.Fatalf("p1_odds_milli = %d", got.Msg.GetOdds()[0].GetP1OddsMilli())
+	markets := got.Msg.GetOdds()[0].GetMarkets()
+	if len(markets) != 2 {
+		t.Fatalf("盤口數 = %d,want 2", len(markets))
+	}
+	winner := markets[0]
+	if winner.GetKind() != activityv1.MarketKind_MARKET_KIND_MATCH_WINNER || winner.GetMarketPublicId() != testMarketID {
+		t.Fatalf("第一個盤口:%v", winner)
+	}
+	if got := winner.GetOutcomes(); len(got) != 2 || got[0].GetOutcome() != "p1" ||
+		got[0].GetOddsMilli() != 1430 || got[0].GetVotes() != 7 || got[0].GetLabel() != "選手A" {
+		t.Fatalf("結果列表:%v", got)
+	}
+	if !winner.GetOpenForBets() {
+		t.Fatal("開著的盤口 + 開著的場次 → open_for_bets 應為 true")
+	}
+	// 場次開著但盤口已關:open_for_bets 看的是兩層 AND。
+	duration := markets[1]
+	if duration.GetOpenForBets() || duration.GetStatus() != activityv1.MarketStatus_MARKET_STATUS_CLOSED {
+		t.Fatalf("已關的盤口不該可下注:%v", duration)
+	}
+	if duration.GetRoundNo() != 2 || duration.GetLineSeconds() != 90 {
+		t.Fatalf("時長盤的回合與線:%v", duration)
 	}
 	if svc.oddsQueries[0].ViewerUserID != 0 {
 		t.Fatalf("匿名查詢的 viewer = %d,want 0", svc.oddsQueries[0].ViewerUserID)
@@ -164,19 +214,19 @@ func TestBettingWritesRequirePlatformAccount(t *testing.T) {
 	ctx := context.Background()
 
 	_, err := client.Vote(ctx, connect.NewRequest(&activityv1.VoteRequest{
-		MatchPublicId: testMatchID, Side: 1,
+		MarketPublicId: testMarketID, Outcome: "p1",
 	}))
 	requireCode(t, err, connect.CodeUnauthenticated)
 
 	// 只有選手 session 也不行。
 	_, err = client.Vote(ctx, withPlayerSession(connect.NewRequest(&activityv1.VoteRequest{
-		MatchPublicId: testMatchID, Side: 1,
+		MarketPublicId: testMarketID, Outcome: "p1",
 	}), testSessionTok))
 	requireCode(t, err, connect.CodeUnauthenticated)
 
 	_, err = client.PlaceBet(ctx, connect.NewRequest(&activityv1.PlaceBetRequest{
 		TournamentSlug: testSlug, Stake: 100,
-		Legs:           []*activityv1.BetLegInput{{MatchPublicId: testMatchID, Side: 1}},
+		Legs:           []*activityv1.BetLegInput{{MarketPublicId: testMarketID, Outcome: "p1"}},
 		IdempotencyKey: "k1",
 	}))
 	requireCode(t, err, connect.CodeUnauthenticated)
@@ -191,47 +241,71 @@ func TestBettingWritesRequirePlatformAccount(t *testing.T) {
 	}
 }
 
-func TestVoteRequiresValidSide(t *testing.T) {
+func TestVoteRequiresMarketAndOutcome(t *testing.T) {
 	deps, svc := bettingDeps()
 	srv := newActivityServer(t, deps)
 	client := activityv1connect.NewBettingServiceClient(srv.Client(), srv.URL)
 	ctx := context.Background()
 
-	// side 沒填(proto3 沒有 required,漏填就是 0)。
+	// outcome 沒填(proto3 沒有 required,漏填就是空字串 = 領域層的「未投票」)。
 	_, err := client.Vote(ctx, withUser(connect.NewRequest(&activityv1.VoteRequest{
-		MatchPublicId: testMatchID,
+		MarketPublicId: testMarketID,
 	}), testUserID))
 	requireCode(t, err, connect.CodeInvalidArgument)
 
 	_, err = client.Vote(ctx, withUser(connect.NewRequest(&activityv1.VoteRequest{
-		MatchPublicId: testMatchID, Side: 3,
+		MarketPublicId: testMarketID, Outcome: "   ",
 	}), testUserID))
 	requireCode(t, err, connect.CodeInvalidArgument)
 
 	_, err = client.Vote(ctx, withUser(connect.NewRequest(&activityv1.VoteRequest{
-		Side: 1,
+		Outcome: "p1",
 	}), testUserID))
 	requireCode(t, err, connect.CodeInvalidArgument)
 
 	if len(svc.votes) != 0 {
-		t.Fatal("不合法的 side 不該進到領域層")
+		t.Fatal("組不起來的請求不該進到領域層")
 	}
 
 	got, err := client.Vote(ctx, withUser(connect.NewRequest(&activityv1.VoteRequest{
-		MatchPublicId: testMatchID, Side: 2,
+		MarketPublicId: testMarketID, Outcome: " p2 ",
 	}), testUserID))
 	if err != nil {
 		t.Fatalf("Vote: %v", err)
 	}
-	if svc.votes[0].Side != betting.SideP2 || svc.votes[0].UserID != testUserID {
+	if svc.votes[0].Outcome != betting.OutcomeP2 || svc.votes[0].UserID != testUserID ||
+		svc.votes[0].MarketPublicID != testMarketID {
 		t.Fatalf("投票參數錯誤:%+v", svc.votes[0])
 	}
-	// 投完一併回賠率:票數變了賠率就會變。
-	if got.Msg.GetOdds().GetP1Votes() != 7 {
-		t.Fatalf("p1_votes = %d", got.Msg.GetOdds().GetP1Votes())
+	// 投完一併回該盤口的賠率:票數變了賠率就會變。
+	odds := got.Msg.GetOdds()
+	if odds.GetMarketPublicId() != testMarketID || odds.GetMatchPublicId() != testMatchID {
+		t.Fatalf("回的盤口:%v", odds)
 	}
-	if got.Msg.GetOdds().GetMyVote() != int32(betting.SideP1) {
-		t.Fatalf("my_vote = %d", got.Msg.GetOdds().GetMyVote())
+	if odds.GetOutcomes()[0].GetVotes() != 7 {
+		t.Fatalf("p1 votes = %d", odds.GetOutcomes()[0].GetVotes())
+	}
+	if odds.GetMyVote() != "p1" {
+		t.Fatalf("my_vote = %q", odds.GetMyVote())
+	}
+	if !odds.GetOpenForBets() {
+		t.Fatal("投票能成功就表示場次還開著;盤口 open → open_for_bets 應為 true")
+	}
+}
+
+// 「結果屬不屬於這個盤口」是領域層的判斷(要看 kind 與 best_of),入口層放行。
+func TestVoteLeavesOutcomeValidationToDomain(t *testing.T) {
+	deps, svc := bettingDeps()
+	svc.voteErr = betting.ErrOutcomeInvalid
+	srv := newActivityServer(t, deps)
+	client := activityv1connect.NewBettingServiceClient(srv.Client(), srv.URL)
+
+	_, err := client.Vote(context.Background(), withUser(connect.NewRequest(&activityv1.VoteRequest{
+		MarketPublicId: testMarketID, Outcome: "over",
+	}), testUserID))
+	requireCode(t, err, connect.CodeInvalidArgument)
+	if len(svc.votes) != 1 {
+		t.Fatalf("領域層應被呼叫一次,實際 %d 次", len(svc.votes))
 	}
 }
 
@@ -244,7 +318,7 @@ func TestPlaceBetRequiresIdempotencyKey(t *testing.T) {
 	_, err := client.PlaceBet(context.Background(), withUser(connect.NewRequest(
 		&activityv1.PlaceBetRequest{
 			TournamentSlug: testSlug, Stake: 100,
-			Legs: []*activityv1.BetLegInput{{MatchPublicId: testMatchID, Side: 1}},
+			Legs: []*activityv1.BetLegInput{{MarketPublicId: testMarketID, Outcome: "p1"}},
 		}), testUserID))
 	requireCode(t, err, connect.CodeInvalidArgument)
 	if len(svc.placed) != 0 {
@@ -264,18 +338,18 @@ func TestPlaceBetRejectsMalformedRequests(t *testing.T) {
 	}{
 		{"沒有 slug", &activityv1.PlaceBetRequest{
 			Stake: 100, IdempotencyKey: "k",
-			Legs: []*activityv1.BetLegInput{{MatchPublicId: testMatchID, Side: 1}},
+			Legs: []*activityv1.BetLegInput{{MarketPublicId: testMarketID, Outcome: "p1"}},
 		}},
 		{"沒有腿", &activityv1.PlaceBetRequest{
 			TournamentSlug: testSlug, Stake: 100, IdempotencyKey: "k",
 		}},
-		{"某一腿缺 match", &activityv1.PlaceBetRequest{
+		{"某一腿缺盤口", &activityv1.PlaceBetRequest{
 			TournamentSlug: testSlug, Stake: 100, IdempotencyKey: "k",
-			Legs: []*activityv1.BetLegInput{{Side: 1}},
+			Legs: []*activityv1.BetLegInput{{Outcome: "p1"}},
 		}},
-		{"某一腿的 side 不合法", &activityv1.PlaceBetRequest{
+		{"某一腿缺結果", &activityv1.PlaceBetRequest{
 			TournamentSlug: testSlug, Stake: 100, IdempotencyKey: "k",
-			Legs: []*activityv1.BetLegInput{{MatchPublicId: testMatchID, Side: 9}},
+			Legs: []*activityv1.BetLegInput{{MarketPublicId: testMarketID}},
 		}},
 	}
 	for _, c := range cases {
@@ -295,7 +369,7 @@ func TestPlaceBetPassesEverythingDown(t *testing.T) {
 		&activityv1.PlaceBetRequest{
 			TournamentSlug: testSlug, Stake: 100,
 			Legs: []*activityv1.BetLegInput{
-				{MatchPublicId: testMatchID, Side: 2},
+				{MarketPublicId: " " + testMarketID + " ", Outcome: "p2"},
 			},
 			IdempotencyKey: " key-1 ",
 			ExpectedPayout: 286,
@@ -310,7 +384,7 @@ func TestPlaceBetPassesEverythingDown(t *testing.T) {
 	if p.IdempotencyKey != "key-1" {
 		t.Fatalf("冪等鍵應去掉前後空白:%q", p.IdempotencyKey)
 	}
-	if len(p.Legs) != 1 || p.Legs[0].Side != betting.SideP2 {
+	if len(p.Legs) != 1 || p.Legs[0].Outcome != betting.OutcomeP2 || p.Legs[0].MarketPublicID != testMarketID {
 		t.Fatalf("腿轉換錯誤:%+v", p.Legs)
 	}
 	if !got.Msg.GetReplayed() {
@@ -319,6 +393,10 @@ func TestPlaceBetPassesEverythingDown(t *testing.T) {
 	leg := got.Msg.GetBet().GetLegs()[0]
 	if leg.GetOddsMilli() != 2860 {
 		t.Fatalf("odds_milli = %d(必須是下注當下鎖定的值)", leg.GetOddsMilli())
+	}
+	if leg.GetMarketPublicId() != testMarketID || leg.GetKind() != activityv1.MarketKind_MARKET_KIND_MATCH_WINNER ||
+		leg.GetOutcome() != "p2" || leg.GetOutcomeLabel() != "選手B" {
+		t.Fatalf("腿的盤口與結果:%v", leg)
 	}
 	if leg.GetMatchLabel() == "" {
 		t.Fatal("match_label 應該有東西可顯示")

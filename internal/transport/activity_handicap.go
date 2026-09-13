@@ -40,6 +40,12 @@ type ActivityHandicap interface {
 	Select(ctx context.Context, p handicap.SelectParams) (*handicap.SelectResult, error)
 	VoidSelection(ctx context.Context, p handicap.VoidParams) (*handicap.Budget, error)
 	MatchHandicaps(ctx context.Context, matchPublicID string, viewerPlayerID int64) (*handicap.MatchHandicaps, error)
+	// RefereeMatchHandicaps 是裁判端的檢視:封盤前也看得到內容。
+	//
+	// 它**不**掛在 HandicapService 的任何一支 RPC 上 —— 這個介面同時被
+	// JudgeService.ReviewHandicap 用,而那支有 requireJudge 把關。
+	// 選手端的五支 handler 沒有任何一個呼叫它,那是刻意的。
+	RefereeMatchHandicaps(ctx context.Context, matchPublicID string) (*handicap.MatchHandicaps, error)
 }
 
 // errActivitySessionWrongTournament 是「這個 session 不屬於你請求的那一屆」。
@@ -53,6 +59,9 @@ type activityHandicapHandler struct {
 	tournaments ActivityTournament
 	reader      ActivityReader
 	sessions    ActivitySessions
+	// matches 只為了 ListMyViolations:違規清單由裁判端同一支查詢讀出,
+	// 這裡依 session 的選手過濾(核心層刻意不另開一支,見 match.ListMatchViolations)。
+	matches ActivityMatches
 }
 
 // ListItems 列出本屆所有可購買的讓武項目。
@@ -140,7 +149,7 @@ func (h activityHandicapHandler) GetMyBudget(
 // Select 買一項讓武。
 //
 // 刻意沒有 idempotency_key:BP 不是代幣(每輪重發、賽後作廢、不可交易),
-// 重複扣一次的後果是使用者看到數字不對,裁判封盤前退掉即可 ——
+// 重複扣一次的後果是使用者看到數字不對,選手自己封盤前退掉即可 ——
 // 不是對不上帳。動真錢的 PlaceBet 與 AwardPrizes 才有冪等鍵。
 func (h activityHandicapHandler) Select(
 	ctx context.Context, req *connect.Request[activityv1.SelectRequest],
@@ -245,6 +254,35 @@ func (h activityHandicapHandler) GetMatchHandicaps(
 // 內部 id 不在 token 裡(鐵則 5),所以每次都要用 public_id 反查。
 // 那不只是為了守鐵則:選手被刪、棄賽、或換了一屆之後,舊 token 會在
 // 這一步自然失效,不需要另一張撤銷清單。
+// ListMyViolations 列出我在某場被記的違規。只回本人的:清單是整場的,
+// 過濾條件是 session 裡的選手 public_id —— 對手那幾筆連轉換都不做。
+func (h activityHandicapHandler) ListMyViolations(
+	ctx context.Context, req *connect.Request[activityv1.ListMyViolationsRequest],
+) (*connect.Response[activityv1.ListMyViolationsResponse], error) {
+	if h.matches == nil {
+		return nil, unimplemented("HandicapService.ListMyViolations")
+	}
+	matchID := strings.TrimSpace(req.Msg.GetMatchPublicId())
+	if matchID == "" {
+		return nil, invalidArgument("match_public_id 必填")
+	}
+	id, err := requireActivityIdentity(ctx, h.sessions, req.Header())
+	if err != nil {
+		return nil, err
+	}
+	all, err := h.matches.ListMatchViolations(ctx, matchID)
+	if err != nil {
+		return nil, toConnectError(err)
+	}
+	mine := make([]*activityv1.Violation, 0, len(all))
+	for _, v := range all {
+		if v.PlayerPublicID == id.PlayerPublicID {
+			mine = append(mine, violationToProto(v))
+		}
+	}
+	return connect.NewResponse(&activityv1.ListMyViolationsResponse{Violations: mine}), nil
+}
+
 func (h activityHandicapHandler) currentPlayerID(ctx context.Context, header http.Header) (int64, error) {
 	id, err := requireActivityIdentity(ctx, h.sessions, header)
 	if err != nil {
@@ -278,12 +316,25 @@ func handicapItemToProto(i handicap.Item) *activityv1.HandicapItem {
 		// 所以問領域型別而不是讀資料庫的某一欄。
 		RequiresTargetNote: i.RequiresTargetNote(),
 		SortOrder:          i.SortOrder,
+		// 穩定識別與參數(2026-09-13):前端要對某一項做特別處理時用 key,不比對名稱;
+		// 秒數與「雙方生效」是資料,不是名稱裡的文字。
+		Key:           i.Key,
+		AppliesToBoth: i.Params.AppliesToBoth,
+		Seconds:       i.Params.Seconds,
 	}
 	// RefereeNote 刻意不出現:那是給裁判看的執行說明,不是選手端的內容。
+	// Params.Draw 也不出現:選手端只需要知道結果(HandicapSelection.draw_result),
+	// 「要不要抽」是封盤時伺服器的事。
 }
 
 func handicapSelectionToProto(s handicap.Selection) *activityv1.HandicapSelection {
-	return &activityv1.HandicapSelection{
+	return selectionToProto(s, false)
+}
+
+// selectionToProto 是唯一的轉換;withRefereeNote 只有裁判端的呼叫者會傳 true。
+// 執行說明從不離開裁判端:選手端的 handicapSelectionToProto 寫死 false。
+func selectionToProto(s handicap.Selection, withRefereeNote bool) *activityv1.HandicapSelection {
+	out := &activityv1.HandicapSelection{
 		PublicId:     s.PublicID,
 		ItemPublicId: s.ItemRef,
 		ItemName:     s.ItemName,
@@ -291,13 +342,33 @@ func handicapSelectionToProto(s handicap.Selection) *activityv1.HandicapSelectio
 		Cost:         s.Cost,
 		TargetNote:   s.TargetNote,
 		CreatedAt:    tsPB(s.CreatedAt),
+		ItemKey:      s.ItemKey,
+		// 封盤那一刻抽的結果;封盤前為 nil → 空字串。
+		DrawResult:    derefString(s.DrawResult),
+		AppliesToBoth: s.ItemParams.AppliesToBoth,
 	}
+	if withRefereeNote {
+		out.RefereeNote = s.ItemRefereeNote
+	}
+	return out
+}
+
+// derefString 把可選字串轉成 proto 的空字串語意。
+func derefString(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 func selectionsToProto(sels []handicap.Selection) []*activityv1.HandicapSelection {
+	return selectionsToProtoFor(sels, false)
+}
+
+func selectionsToProtoFor(sels []handicap.Selection, withRefereeNote bool) []*activityv1.HandicapSelection {
 	out := make([]*activityv1.HandicapSelection, 0, len(sels))
 	for _, s := range sels {
-		out = append(out, handicapSelectionToProto(s))
+		out = append(out, selectionToProto(s, withRefereeNote))
 	}
 	return out
 }
@@ -320,13 +391,22 @@ func bpBudgetToProto(matchPublicID string, b handicap.Budget) *activityv1.BpBudg
 }
 
 func matchHandicapsToProto(mh *handicap.MatchHandicaps) *activityv1.MatchHandicaps {
+	return matchHandicapsToProtoFor(mh, false)
+}
+
+// refereeMatchHandicapsToProto 是裁判端的版本:每筆選擇帶 referee_note。
+func refereeMatchHandicapsToProto(mh *handicap.MatchHandicaps) *activityv1.MatchHandicaps {
+	return matchHandicapsToProtoFor(mh, true)
+}
+
+func matchHandicapsToProtoFor(mh *handicap.MatchHandicaps, withRefereeNote bool) *activityv1.MatchHandicaps {
 	if mh == nil {
 		return nil
 	}
 	out := &activityv1.MatchHandicaps{
 		MatchPublicId:             mh.MatchPublicID,
 		Status:                    matchStatusStringToProto(mh.Status),
-		Selections:                selectionsToProto(mh.Selections),
+		Selections:                selectionsToProtoFor(mh.Selections, withRefereeNote),
 		ConstrainedPlayerPublicId: mh.ConstrainedPlayerPublicID,
 		LockedAt:                  optTS(mh.LockedAt),
 	}

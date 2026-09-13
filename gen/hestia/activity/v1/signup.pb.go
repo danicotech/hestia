@@ -31,8 +31,10 @@
 //
 // 通行碼沒有消失,只是不再是給選手看的東西:tournament_players.passcode_hash
 // 照舊產生並寫入(NOT NULL),它的同伴 passcode_issued_at 則是**已發出的
-// session 的作廢依據**。裁判的「重新產生通行碼」現在的意思是「把這個人
-// 現在所有的 session 全部踢掉」—— 棄賽之外的第二道槓桿。
+// session 的作廢依據**。裁判的「重新產生通行碼」會把這個人現在所有的
+// session 踢掉,但他可以立刻用遊戲ID 再進來 —— 那是「踢下線」,不是
+// 「擋在外面」。要擋在外面只有棄賽一條路,而棄賽單獨就夠(它同時讓
+// 現有 session 失效)。
 
 package activityv1
 

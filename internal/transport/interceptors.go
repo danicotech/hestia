@@ -83,6 +83,7 @@ var publicProcedures = map[string]struct{}{
 	activityv1connect.HandicapServiceSelectProcedure:            {},
 	activityv1connect.HandicapServiceVoidSelectionProcedure:     {},
 	activityv1connect.HandicapServiceGetMatchHandicapsProcedure: {},
+	activityv1connect.HandicapServiceListMyViolationsProcedure:  {},
 
 	// 賽事的公開檢視。觀眾不必登入就能看對戰表與段位 ——
 	// 這場活動的目的本來就是「闔家觀賞」,看的人比打的人多。

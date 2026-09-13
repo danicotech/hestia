@@ -288,8 +288,11 @@ func (*WatchTournamentResponse_Heartbeat) isWatchTournamentResponse_Update() {}
 // (專案鐵則 9)。選手的顯示名不在裡面也是刻意的 —— 前端在第 2 步已經拉過
 // 完整對戰表,public_id 足以對上,重複送顯示名等於每一則推播都帶一份快照。
 type MatchUpdate struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Match         *Match                 `protobuf:"bytes,1,opt,name=match,proto3" json:"match,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 2026-09-13 起 Match 帶 rounds 與 setup_confirmed_at:回合開始 / 結束、設定確認
+	// 都是「場次狀態改變」,走這一則,不另開種類 —— 前端拿 rounds 的最後一筆
+	// 的 started_at 就能跑計時器。
+	Match         *Match `protobuf:"bytes,1,opt,name=match,proto3" json:"match,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -334,7 +337,7 @@ func (x *MatchUpdate) GetMatch() *Match {
 // HandicapLockedUpdate 是封盤公示。
 //
 // 這是整條流裡唯一「內容變公開」而不只是「狀態變了」的一則:封盤前只有
-// 施加者本人看得到自己買了什麼,封盤後雙方與觀眾全部看得到。因此它一定
+// 施加者本人(與裁判)看得到買了什麼,封盤後雙方與觀眾全部看得到。因此它一定
 // 帶完整清單,不能只送一個 match_public_id 讓前端自己去查 ——
 // 那樣的話「公開的是封盤當下那一份」就沒有人保證得了。
 //
@@ -385,9 +388,9 @@ func (x *HandicapLockedUpdate) GetHandicaps() *MatchHandicaps {
 	return nil
 }
 
-// OddsUpdate 是賠率與票數變動。有人投票就會發一則。
+// OddsUpdate 是賠率與票數變動。有人投票就會發一則,帶的是**該場全部盤口**。
 //
-// 重用 betting.proto 的 MatchOdds:賠率的形狀(票數、毫分賠率、能不能下注)
+// 重用 betting.proto 的 MatchOdds:賠率的形狀(盤口、結果、票數、毫分賠率)
 // 只該有一個定義,而那個定義是投票推導賠率那套公式的輸出。
 //
 // **唯一的例外是 my_vote:在這條流裡它恆為 0。** 推播是廣播,一則訊息要送給

@@ -293,6 +293,117 @@ func (MatchResultKind) EnumDescriptor() ([]byte, []int) {
 	return file_hestia_activity_v1_common_proto_rawDescGZIP(), []int{3}
 }
 
+// MatchKind 區分晉級樹上的一場與季軍戰。
+//
+// 季軍戰(schemas/20,grill Q15)不屬於晉級樹:準決賽兩位敗者加打一場,
+// 勝者不晉級。它是一場普通比賽 —— 讓武、下注、設定確認、違規那一整套完全適用。
+type MatchKind int32
+
+const (
+	MatchKind_MATCH_KIND_UNSPECIFIED MatchKind = 0
+	MatchKind_MATCH_KIND_BRACKET     MatchKind = 1
+	MatchKind_MATCH_KIND_THIRD_PLACE MatchKind = 2
+)
+
+// Enum value maps for MatchKind.
+var (
+	MatchKind_name = map[int32]string{
+		0: "MATCH_KIND_UNSPECIFIED",
+		1: "MATCH_KIND_BRACKET",
+		2: "MATCH_KIND_THIRD_PLACE",
+	}
+	MatchKind_value = map[string]int32{
+		"MATCH_KIND_UNSPECIFIED": 0,
+		"MATCH_KIND_BRACKET":     1,
+		"MATCH_KIND_THIRD_PLACE": 2,
+	}
+)
+
+func (x MatchKind) Enum() *MatchKind {
+	p := new(MatchKind)
+	*p = x
+	return p
+}
+
+func (x MatchKind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (MatchKind) Descriptor() protoreflect.EnumDescriptor {
+	return file_hestia_activity_v1_common_proto_enumTypes[4].Descriptor()
+}
+
+func (MatchKind) Type() protoreflect.EnumType {
+	return &file_hestia_activity_v1_common_proto_enumTypes[4]
+}
+
+func (x MatchKind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use MatchKind.Descriptor instead.
+func (MatchKind) EnumDescriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_common_proto_rawDescGZIP(), []int{4}
+}
+
+// ViolationRuling 是裁判對一筆違規的判決。**只是紀錄,不是觸發器**(schemas/27):
+// 判該回合 = 裁判把該回合勝者填成對方;判整場 = 走 FinishRound / ReportResult。
+// 固定值是為了讓賽果公告判斷得出「這一筆要不要寫進公告」(ROUND_LOSS / MATCH_LOSS 才寫)。
+type ViolationRuling int32
+
+const (
+	ViolationRuling_VIOLATION_RULING_UNSPECIFIED ViolationRuling = 0
+	ViolationRuling_VIOLATION_RULING_WARNING     ViolationRuling = 1
+	ViolationRuling_VIOLATION_RULING_ROUND_LOSS  ViolationRuling = 2
+	ViolationRuling_VIOLATION_RULING_MATCH_LOSS  ViolationRuling = 3
+	ViolationRuling_VIOLATION_RULING_NONE        ViolationRuling = 4
+)
+
+// Enum value maps for ViolationRuling.
+var (
+	ViolationRuling_name = map[int32]string{
+		0: "VIOLATION_RULING_UNSPECIFIED",
+		1: "VIOLATION_RULING_WARNING",
+		2: "VIOLATION_RULING_ROUND_LOSS",
+		3: "VIOLATION_RULING_MATCH_LOSS",
+		4: "VIOLATION_RULING_NONE",
+	}
+	ViolationRuling_value = map[string]int32{
+		"VIOLATION_RULING_UNSPECIFIED": 0,
+		"VIOLATION_RULING_WARNING":     1,
+		"VIOLATION_RULING_ROUND_LOSS":  2,
+		"VIOLATION_RULING_MATCH_LOSS":  3,
+		"VIOLATION_RULING_NONE":        4,
+	}
+)
+
+func (x ViolationRuling) Enum() *ViolationRuling {
+	p := new(ViolationRuling)
+	*p = x
+	return p
+}
+
+func (x ViolationRuling) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ViolationRuling) Descriptor() protoreflect.EnumDescriptor {
+	return file_hestia_activity_v1_common_proto_enumTypes[5].Descriptor()
+}
+
+func (ViolationRuling) Type() protoreflect.EnumType {
+	return &file_hestia_activity_v1_common_proto_enumTypes[5]
+}
+
+func (x ViolationRuling) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ViolationRuling.Descriptor instead.
+func (ViolationRuling) EnumDescriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_common_proto_rawDescGZIP(), []int{5}
+}
+
 // PlayerStatus 是參賽者在本屆的狀態。
 type PlayerStatus int32
 
@@ -330,11 +441,11 @@ func (x PlayerStatus) String() string {
 }
 
 func (PlayerStatus) Descriptor() protoreflect.EnumDescriptor {
-	return file_hestia_activity_v1_common_proto_enumTypes[4].Descriptor()
+	return file_hestia_activity_v1_common_proto_enumTypes[6].Descriptor()
 }
 
 func (PlayerStatus) Type() protoreflect.EnumType {
-	return &file_hestia_activity_v1_common_proto_enumTypes[4]
+	return &file_hestia_activity_v1_common_proto_enumTypes[6]
 }
 
 func (x PlayerStatus) Number() protoreflect.EnumNumber {
@@ -343,7 +454,7 @@ func (x PlayerStatus) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use PlayerStatus.Descriptor instead.
 func (PlayerStatus) EnumDescriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_common_proto_rawDescGZIP(), []int{4}
+	return file_hestia_activity_v1_common_proto_rawDescGZIP(), []int{6}
 }
 
 // HandicapCategory 是讓武項目的六大分類。
@@ -402,11 +513,11 @@ func (x HandicapCategory) String() string {
 }
 
 func (HandicapCategory) Descriptor() protoreflect.EnumDescriptor {
-	return file_hestia_activity_v1_common_proto_enumTypes[5].Descriptor()
+	return file_hestia_activity_v1_common_proto_enumTypes[7].Descriptor()
 }
 
 func (HandicapCategory) Type() protoreflect.EnumType {
-	return &file_hestia_activity_v1_common_proto_enumTypes[5]
+	return &file_hestia_activity_v1_common_proto_enumTypes[7]
 }
 
 func (x HandicapCategory) Number() protoreflect.EnumNumber {
@@ -415,7 +526,7 @@ func (x HandicapCategory) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use HandicapCategory.Descriptor instead.
 func (HandicapCategory) EnumDescriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_common_proto_rawDescGZIP(), []int{5}
+	return file_hestia_activity_v1_common_proto_rawDescGZIP(), []int{7}
 }
 
 // Tournament 是一屆賽事的公開檢視。
@@ -429,10 +540,15 @@ type Tournament struct {
 	// 每差一段給多少 BP。預設 8;差二段 16、差三段 24、同段 0。
 	BpPerRankGap int64 `protobuf:"varint,5,opt,name=bp_per_rank_gap,json=bpPerRankGap,proto3" json:"bp_per_rank_gap,omitempty"`
 	// 目前報名人數。人數不設上限,也不假設是 2 的冪次。
-	PlayerCount   int32                  `protobuf:"varint,6,opt,name=player_count,json=playerCount,proto3" json:"player_count,omitempty"`
-	CreatedAt     *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	PlayerCount int32                  `protobuf:"varint,6,opt,name=player_count,json=playerCount,proto3" json:"player_count,omitempty"`
+	CreatedAt   *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	// 幾局幾勝(config.format.best_of,schemas/28)。1 = 單場定勝負;第一屆是 3。
+	// 前端靠它算「還要贏幾回合」與比分盤的結果數,不要寫死 3。
+	BestOf int32 `protobuf:"varint,8,opt,name=best_of,json=bestOf,proto3" json:"best_of,omitempty"`
+	// 準決賽敗者是否加打季軍戰。
+	ThirdPlaceMatch bool `protobuf:"varint,9,opt,name=third_place_match,json=thirdPlaceMatch,proto3" json:"third_place_match,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *Tournament) Reset() {
@@ -512,6 +628,20 @@ func (x *Tournament) GetCreatedAt() *timestamppb.Timestamp {
 		return x.CreatedAt
 	}
 	return nil
+}
+
+func (x *Tournament) GetBestOf() int32 {
+	if x != nil {
+		return x.BestOf
+	}
+	return 0
+}
+
+func (x *Tournament) GetThirdPlaceMatch() bool {
+	if x != nil {
+		return x.ThirdPlaceMatch
+	}
+	return false
 }
 
 // RankInfo 是段位的顯示資料。名稱與境界描述存在 tournaments.config,
@@ -706,9 +836,20 @@ type Match struct {
 	// 讓武是否開盤(裁判手動,不綁時鐘)。
 	HandicapOpen bool `protobuf:"varint,9,opt,name=handicap_open,json=handicapOpen,proto3" json:"handicap_open,omitempty"`
 	// 直播連結;空 = 無。對戰表上標 LIVE 的場次可直接點進去。
-	StreamUrl     string                 `protobuf:"bytes,10,opt,name=stream_url,json=streamUrl,proto3" json:"stream_url,omitempty"`
-	StartedAt     *timestamppb.Timestamp `protobuf:"bytes,11,opt,name=started_at,json=startedAt,proto3,oneof" json:"started_at,omitempty"`
-	FinishedAt    *timestamppb.Timestamp `protobuf:"bytes,12,opt,name=finished_at,json=finishedAt,proto3,oneof" json:"finished_at,omitempty"`
+	StreamUrl string `protobuf:"bytes,10,opt,name=stream_url,json=streamUrl,proto3" json:"stream_url,omitempty"`
+	// = 第一回合的正式決鬥開始。這一刻同時關下注、啟動第一回合計時;前置過程在它之前。
+	StartedAt  *timestamppb.Timestamp `protobuf:"bytes,11,opt,name=started_at,json=startedAt,proto3,oneof" json:"started_at,omitempty"`
+	FinishedAt *timestamppb.Timestamp `protobuf:"bytes,12,opt,name=finished_at,json=finishedAt,proto3,oneof" json:"finished_at,omitempty"`
+	Kind       MatchKind              `protobuf:"varint,13,opt,name=kind,proto3,enum=hestia.activity.v1.MatchKind" json:"kind,omitempty"`
+	// 開賽前設定確認(schemas/20):裁判看完整張清單按一次「都確認了」。
+	// 空 = 還沒確認,**不能開打**(伺服器擋,DB 也擋)。
+	SetupConfirmedAt *timestamppb.Timestamp `protobuf:"bytes,14,opt,name=setup_confirmed_at,json=setupConfirmedAt,proto3,oneof" json:"setup_confirmed_at,omitempty"`
+	// 逐回合結果,依 round_no。回合列在裁判按「正式決鬥開始」時才建,
+	// 所以「還沒開始的回合」不在這裡。三局兩勝可能只有兩筆。
+	Rounds []*MatchRound `protobuf:"bytes,15,rep,name=rounds,proto3" json:"rounds,omitempty"`
+	// 兩方目前的勝場數(從 rounds 算好給,避免前端各自算出不同答案)。
+	P1RoundWins   int32 `protobuf:"varint,16,opt,name=p1_round_wins,json=p1RoundWins,proto3" json:"p1_round_wins,omitempty"`
+	P2RoundWins   int32 `protobuf:"varint,17,opt,name=p2_round_wins,json=p2RoundWins,proto3" json:"p2_round_wins,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -827,6 +968,237 @@ func (x *Match) GetFinishedAt() *timestamppb.Timestamp {
 	return nil
 }
 
+func (x *Match) GetKind() MatchKind {
+	if x != nil {
+		return x.Kind
+	}
+	return MatchKind_MATCH_KIND_UNSPECIFIED
+}
+
+func (x *Match) GetSetupConfirmedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.SetupConfirmedAt
+	}
+	return nil
+}
+
+func (x *Match) GetRounds() []*MatchRound {
+	if x != nil {
+		return x.Rounds
+	}
+	return nil
+}
+
+func (x *Match) GetP1RoundWins() int32 {
+	if x != nil {
+		return x.P1RoundWins
+	}
+	return 0
+}
+
+func (x *Match) GetP2RoundWins() int32 {
+	if x != nil {
+		return x.P2RoundWins
+	}
+	return 0
+}
+
+// MatchRound 是一個回合。
+//
+// 計時器是衍生值:前端算 now() − started_at,伺服器不存倒數狀態。直播頁與
+// 裁判頁看的是同一個 started_at,不會各算各的(grill Q4)。
+type MatchRound struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// 1 起算。
+	RoundNo int32 `protobuf:"varint,1,opt,name=round_no,json=roundNo,proto3" json:"round_no,omitempty"`
+	// 正式決鬥開始 = 計時起點。前置過程(讓守關元、讓半血)在它之前,不計入。
+	StartedAt  *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=started_at,json=startedAt,proto3" json:"started_at,omitempty"`
+	FinishedAt *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=finished_at,json=finishedAt,proto3,oneof" json:"finished_at,omitempty"`
+	// 空 = 進行中。
+	WinnerPlayerPublicId string `protobuf:"bytes,4,opt,name=winner_player_public_id,json=winnerPlayerPublicId,proto3" json:"winner_player_public_id,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
+}
+
+func (x *MatchRound) Reset() {
+	*x = MatchRound{}
+	mi := &file_hestia_activity_v1_common_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MatchRound) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MatchRound) ProtoMessage() {}
+
+func (x *MatchRound) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_activity_v1_common_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MatchRound.ProtoReflect.Descriptor instead.
+func (*MatchRound) Descriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_common_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *MatchRound) GetRoundNo() int32 {
+	if x != nil {
+		return x.RoundNo
+	}
+	return 0
+}
+
+func (x *MatchRound) GetStartedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.StartedAt
+	}
+	return nil
+}
+
+func (x *MatchRound) GetFinishedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.FinishedAt
+	}
+	return nil
+}
+
+func (x *MatchRound) GetWinnerPlayerPublicId() string {
+	if x != nil {
+		return x.WinnerPlayerPublicId
+	}
+	return ""
+}
+
+// Violation 是一筆違規紀錄(schemas/27)。只記事實,不自動觸發任何後果。
+type Violation struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	PublicId      string                 `protobuf:"bytes,1,opt,name=public_id,json=publicId,proto3" json:"public_id,omitempty"`
+	MatchPublicId string                 `protobuf:"bytes,2,opt,name=match_public_id,json=matchPublicId,proto3" json:"match_public_id,omitempty"`
+	// 0 = 開賽前(例:設定確認時發現沒改到)。
+	RoundNo int32 `protobuf:"varint,3,opt,name=round_no,json=roundNo,proto3" json:"round_no,omitempty"`
+	// 違規者。**可以是任一方**:「雙方使用 46 級武庫」買方自己也可能違規。
+	PlayerPublicId    string `protobuf:"bytes,4,opt,name=player_public_id,json=playerPublicId,proto3" json:"player_public_id,omitempty"`
+	PlayerDisplayName string `protobuf:"bytes,5,opt,name=player_display_name,json=playerDisplayName,proto3" json:"player_display_name,omitempty"`
+	// 違反哪一項;空 = 不對應特定項目(違反通則)。
+	ItemPublicId string          `protobuf:"bytes,6,opt,name=item_public_id,json=itemPublicId,proto3" json:"item_public_id,omitempty"`
+	ItemName     string          `protobuf:"bytes,7,opt,name=item_name,json=itemName,proto3" json:"item_name,omitempty"`
+	Ruling       ViolationRuling `protobuf:"varint,8,opt,name=ruling,proto3,enum=hestia.activity.v1.ViolationRuling" json:"ruling,omitempty"`
+	// 裁判備註:發生了什麼、為什麼這樣判。必填。
+	Note          string                 `protobuf:"bytes,9,opt,name=note,proto3" json:"note,omitempty"`
+	CreatedAt     *timestamppb.Timestamp `protobuf:"bytes,10,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Violation) Reset() {
+	*x = Violation{}
+	mi := &file_hestia_activity_v1_common_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Violation) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Violation) ProtoMessage() {}
+
+func (x *Violation) ProtoReflect() protoreflect.Message {
+	mi := &file_hestia_activity_v1_common_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Violation.ProtoReflect.Descriptor instead.
+func (*Violation) Descriptor() ([]byte, []int) {
+	return file_hestia_activity_v1_common_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *Violation) GetPublicId() string {
+	if x != nil {
+		return x.PublicId
+	}
+	return ""
+}
+
+func (x *Violation) GetMatchPublicId() string {
+	if x != nil {
+		return x.MatchPublicId
+	}
+	return ""
+}
+
+func (x *Violation) GetRoundNo() int32 {
+	if x != nil {
+		return x.RoundNo
+	}
+	return 0
+}
+
+func (x *Violation) GetPlayerPublicId() string {
+	if x != nil {
+		return x.PlayerPublicId
+	}
+	return ""
+}
+
+func (x *Violation) GetPlayerDisplayName() string {
+	if x != nil {
+		return x.PlayerDisplayName
+	}
+	return ""
+}
+
+func (x *Violation) GetItemPublicId() string {
+	if x != nil {
+		return x.ItemPublicId
+	}
+	return ""
+}
+
+func (x *Violation) GetItemName() string {
+	if x != nil {
+		return x.ItemName
+	}
+	return ""
+}
+
+func (x *Violation) GetRuling() ViolationRuling {
+	if x != nil {
+		return x.Ruling
+	}
+	return ViolationRuling_VIOLATION_RULING_UNSPECIFIED
+}
+
+func (x *Violation) GetNote() string {
+	if x != nil {
+		return x.Note
+	}
+	return ""
+}
+
+func (x *Violation) GetCreatedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.CreatedAt
+	}
+	return nil
+}
+
 // BracketRound 是對戰表的一輪。
 //
 // 手機版是**分輪檢視**而不是縮小的完整樹(視覺規範硬規則 3),
@@ -849,7 +1221,7 @@ type BracketRound struct {
 
 func (x *BracketRound) Reset() {
 	*x = BracketRound{}
-	mi := &file_hestia_activity_v1_common_proto_msgTypes[4]
+	mi := &file_hestia_activity_v1_common_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -861,7 +1233,7 @@ func (x *BracketRound) String() string {
 func (*BracketRound) ProtoMessage() {}
 
 func (x *BracketRound) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_common_proto_msgTypes[4]
+	mi := &file_hestia_activity_v1_common_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -874,7 +1246,7 @@ func (x *BracketRound) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BracketRound.ProtoReflect.Descriptor instead.
 func (*BracketRound) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_common_proto_rawDescGZIP(), []int{4}
+	return file_hestia_activity_v1_common_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *BracketRound) GetRound() int32 {
@@ -914,13 +1286,21 @@ type HandicapItem struct {
 	// 需要填寫指定內容的項目(如「指定對手武學」),前端要出一個輸入框。
 	RequiresTargetNote bool  `protobuf:"varint,7,opt,name=requires_target_note,json=requiresTargetNote,proto3" json:"requires_target_note,omitempty"`
 	SortOrder          int32 `protobuf:"varint,8,opt,name=sort_order,json=sortOrder,proto3" json:"sort_order,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// 穩定識別,如 victory.survive_90s。改名不改 key(schemas/20)。
+	// 前端要對某一項做特別處理(例如計時提示)時用它,不要比對名稱文字。
+	Key string `protobuf:"bytes,9,opt,name=key,proto3" json:"key,omitempty"`
+	// 此項對施加方同樣生效(目前只有「雙方使用 46 級武庫武學裝備」)。
+	// 選購頁要醒目提示:買方自己也受限。
+	AppliesToBoth bool `protobuf:"varint,10,opt,name=applies_to_both,json=appliesToBoth,proto3" json:"applies_to_both,omitempty"`
+	// 「撐過 N 秒即獲勝」的 N;0 = 與時間無關。數字是資料,不是名稱裡的文字。
+	Seconds       int64 `protobuf:"varint,11,opt,name=seconds,proto3" json:"seconds,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *HandicapItem) Reset() {
 	*x = HandicapItem{}
-	mi := &file_hestia_activity_v1_common_proto_msgTypes[5]
+	mi := &file_hestia_activity_v1_common_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -932,7 +1312,7 @@ func (x *HandicapItem) String() string {
 func (*HandicapItem) ProtoMessage() {}
 
 func (x *HandicapItem) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_common_proto_msgTypes[5]
+	mi := &file_hestia_activity_v1_common_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -945,7 +1325,7 @@ func (x *HandicapItem) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HandicapItem.ProtoReflect.Descriptor instead.
 func (*HandicapItem) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_common_proto_rawDescGZIP(), []int{5}
+	return file_hestia_activity_v1_common_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *HandicapItem) GetPublicId() string {
@@ -1004,6 +1384,27 @@ func (x *HandicapItem) GetSortOrder() int32 {
 	return 0
 }
 
+func (x *HandicapItem) GetKey() string {
+	if x != nil {
+		return x.Key
+	}
+	return ""
+}
+
+func (x *HandicapItem) GetAppliesToBoth() bool {
+	if x != nil {
+		return x.AppliesToBoth
+	}
+	return false
+}
+
+func (x *HandicapItem) GetSeconds() int64 {
+	if x != nil {
+		return x.Seconds
+	}
+	return 0
+}
+
 // HandicapSelection 是一次已成立的讓武選擇。
 //
 // 每買一次一列 —— 同一項目買三次就是三列,不是一列 qty=3。
@@ -1018,15 +1419,25 @@ type HandicapSelection struct {
 	// 購買當下的價格快照。項目改價不影響已成立的選擇。
 	Cost int64 `protobuf:"varint,5,opt,name=cost,proto3" json:"cost,omitempty"`
 	// 指定內容:「指定對手武學:XX」「互換的兩個按鍵:X 與 Y」。
-	TargetNote    string                 `protobuf:"bytes,6,opt,name=target_note,json=targetNote,proto3" json:"target_note,omitempty"`
-	CreatedAt     *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	TargetNote string                 `protobuf:"bytes,6,opt,name=target_note,json=targetNote,proto3" json:"target_note,omitempty"`
+	CreatedAt  *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	// 項目的穩定識別(同 HandicapItem.key)。
+	ItemKey string `protobuf:"bytes,8,opt,name=item_key,json=itemKey,proto3" json:"item_key,omitempty"`
+	// 系統抽選的結果(隨機武學抽到哪一個、方向鍵打亂成什麼)。
+	// 抽選在**封盤那一刻**做(grill Q13),所以封盤公示是完整的;封盤前恆為空。
+	DrawResult string `protobuf:"bytes,9,opt,name=draw_result,json=drawResult,proto3" json:"draw_result,omitempty"`
+	// 同 HandicapItem.applies_to_both。
+	AppliesToBoth bool `protobuf:"varint,10,opt,name=applies_to_both,json=appliesToBoth,proto3" json:"applies_to_both,omitempty"`
+	// 裁判執行說明。**只在 JudgeService 的回應裡有值**(ReviewHandicap / LockHandicap);
+	// 選手端與觀眾端的任何路徑一律空字串。裁判封盤前審清單就要照著它退掉重疊的項目。
+	RefereeNote   string `protobuf:"bytes,11,opt,name=referee_note,json=refereeNote,proto3" json:"referee_note,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *HandicapSelection) Reset() {
 	*x = HandicapSelection{}
-	mi := &file_hestia_activity_v1_common_proto_msgTypes[6]
+	mi := &file_hestia_activity_v1_common_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1038,7 +1449,7 @@ func (x *HandicapSelection) String() string {
 func (*HandicapSelection) ProtoMessage() {}
 
 func (x *HandicapSelection) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_common_proto_msgTypes[6]
+	mi := &file_hestia_activity_v1_common_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1051,7 +1462,7 @@ func (x *HandicapSelection) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HandicapSelection.ProtoReflect.Descriptor instead.
 func (*HandicapSelection) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_common_proto_rawDescGZIP(), []int{6}
+	return file_hestia_activity_v1_common_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *HandicapSelection) GetPublicId() string {
@@ -1103,6 +1514,34 @@ func (x *HandicapSelection) GetCreatedAt() *timestamppb.Timestamp {
 	return nil
 }
 
+func (x *HandicapSelection) GetItemKey() string {
+	if x != nil {
+		return x.ItemKey
+	}
+	return ""
+}
+
+func (x *HandicapSelection) GetDrawResult() string {
+	if x != nil {
+		return x.DrawResult
+	}
+	return ""
+}
+
+func (x *HandicapSelection) GetAppliesToBoth() bool {
+	if x != nil {
+		return x.AppliesToBoth
+	}
+	return false
+}
+
+func (x *HandicapSelection) GetRefereeNote() string {
+	if x != nil {
+		return x.RefereeNote
+	}
+	return ""
+}
+
 // BpBudget 是某人在某場的讓武預算。
 //
 // BP 不是貨幣:每輪依段位差重新發放,該場有效,**賽後作廢**,不跨輪累積、不找零。
@@ -1124,7 +1563,7 @@ type BpBudget struct {
 
 func (x *BpBudget) Reset() {
 	*x = BpBudget{}
-	mi := &file_hestia_activity_v1_common_proto_msgTypes[7]
+	mi := &file_hestia_activity_v1_common_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1136,7 +1575,7 @@ func (x *BpBudget) String() string {
 func (*BpBudget) ProtoMessage() {}
 
 func (x *BpBudget) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_common_proto_msgTypes[7]
+	mi := &file_hestia_activity_v1_common_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1149,7 +1588,7 @@ func (x *BpBudget) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BpBudget.ProtoReflect.Descriptor instead.
 func (*BpBudget) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_common_proto_rawDescGZIP(), []int{7}
+	return file_hestia_activity_v1_common_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *BpBudget) GetMatchPublicId() string {
@@ -1202,6 +1641,10 @@ type MatchHandicaps struct {
 	// 受限方(高段位方)。
 	ConstrainedPlayerPublicId string `protobuf:"bytes,5,opt,name=constrained_player_public_id,json=constrainedPlayerPublicId,proto3" json:"constrained_player_public_id,omitempty"`
 	// 封盤時間;空 = 尚未封盤,此時 selections 只會包含請求者自己的。
+	//
+	// 唯一的例外是 JudgeService.ReviewHandicap:裁判在封盤前也拿得到完整內容
+	// (場上要他執行的規則就寫在那些項目裡)。所以**不要拿 locked_at 為空
+	// 去推論「這份內容還是秘密」**—— 它只說明這場封盤了沒有。
 	LockedAt      *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=locked_at,json=lockedAt,proto3,oneof" json:"locked_at,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1209,7 +1652,7 @@ type MatchHandicaps struct {
 
 func (x *MatchHandicaps) Reset() {
 	*x = MatchHandicaps{}
-	mi := &file_hestia_activity_v1_common_proto_msgTypes[8]
+	mi := &file_hestia_activity_v1_common_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1221,7 +1664,7 @@ func (x *MatchHandicaps) String() string {
 func (*MatchHandicaps) ProtoMessage() {}
 
 func (x *MatchHandicaps) ProtoReflect() protoreflect.Message {
-	mi := &file_hestia_activity_v1_common_proto_msgTypes[8]
+	mi := &file_hestia_activity_v1_common_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1234,7 +1677,7 @@ func (x *MatchHandicaps) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MatchHandicaps.ProtoReflect.Descriptor instead.
 func (*MatchHandicaps) Descriptor() ([]byte, []int) {
-	return file_hestia_activity_v1_common_proto_rawDescGZIP(), []int{8}
+	return file_hestia_activity_v1_common_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *MatchHandicaps) GetMatchPublicId() string {
@@ -1283,7 +1726,7 @@ var File_hestia_activity_v1_common_proto protoreflect.FileDescriptor
 
 const file_hestia_activity_v1_common_proto_rawDesc = "" +
 	"\n" +
-	"\x1fhestia/activity/v1/common.proto\x12\x12hestia.activity.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\x91\x02\n" +
+	"\x1fhestia/activity/v1/common.proto\x12\x12hestia.activity.v1\x1a\x1fgoogle/protobuf/timestamp.proto\"\xd6\x02\n" +
 	"\n" +
 	"Tournament\x12\x1b\n" +
 	"\tpublic_id\x18\x01 \x01(\tR\bpublicId\x12\x12\n" +
@@ -1293,7 +1736,9 @@ const file_hestia_activity_v1_common_proto_rawDesc = "" +
 	"\x0fbp_per_rank_gap\x18\x05 \x01(\x03R\fbpPerRankGap\x12!\n" +
 	"\fplayer_count\x18\x06 \x01(\x05R\vplayerCount\x129\n" +
 	"\n" +
-	"created_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\"\x84\x01\n" +
+	"created_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x12\x17\n" +
+	"\abest_of\x18\b \x01(\x05R\x06bestOf\x12*\n" +
+	"\x11third_place_match\x18\t \x01(\bR\x0fthirdPlaceMatch\"\x84\x01\n" +
 	"\bRankInfo\x12,\n" +
 	"\x04rank\x18\x01 \x01(\x0e2\x18.hestia.activity.v1.RankR\x04rank\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x14\n" +
@@ -1306,7 +1751,7 @@ const file_hestia_activity_v1_common_proto_rawDesc = "" +
 	"\x04rank\x18\x04 \x01(\x0e2\x18.hestia.activity.v1.RankR\x04rank\x128\n" +
 	"\x06status\x18\x05 \x01(\x0e2 .hestia.activity.v1.PlayerStatusR\x06status\x12\x17\n" +
 	"\aseed_no\x18\x06 \x01(\x05R\x06seedNo\x12$\n" +
-	"\x0euser_public_id\x18\a \x01(\tR\fuserPublicId\"\xc7\x04\n" +
+	"\x0euser_public_id\x18\a \x01(\tR\fuserPublicId\"\xe0\x06\n" +
 	"\x05Match\x12\x1b\n" +
 	"\tpublic_id\x18\x01 \x01(\tR\bpublicId\x12\x14\n" +
 	"\x05round\x18\x02 \x01(\x05R\x05round\x12\x12\n" +
@@ -1324,13 +1769,41 @@ const file_hestia_activity_v1_common_proto_rawDesc = "" +
 	"\n" +
 	"started_at\x18\v \x01(\v2\x1a.google.protobuf.TimestampH\x00R\tstartedAt\x88\x01\x01\x12@\n" +
 	"\vfinished_at\x18\f \x01(\v2\x1a.google.protobuf.TimestampH\x01R\n" +
-	"finishedAt\x88\x01\x01B\r\n" +
+	"finishedAt\x88\x01\x01\x121\n" +
+	"\x04kind\x18\r \x01(\x0e2\x1d.hestia.activity.v1.MatchKindR\x04kind\x12M\n" +
+	"\x12setup_confirmed_at\x18\x0e \x01(\v2\x1a.google.protobuf.TimestampH\x02R\x10setupConfirmedAt\x88\x01\x01\x126\n" +
+	"\x06rounds\x18\x0f \x03(\v2\x1e.hestia.activity.v1.MatchRoundR\x06rounds\x12\"\n" +
+	"\rp1_round_wins\x18\x10 \x01(\x05R\vp1RoundWins\x12\"\n" +
+	"\rp2_round_wins\x18\x11 \x01(\x05R\vp2RoundWinsB\r\n" +
 	"\v_started_atB\x0e\n" +
-	"\f_finished_at\"o\n" +
+	"\f_finished_atB\x15\n" +
+	"\x13_setup_confirmed_at\"\xeb\x01\n" +
+	"\n" +
+	"MatchRound\x12\x19\n" +
+	"\bround_no\x18\x01 \x01(\x05R\aroundNo\x129\n" +
+	"\n" +
+	"started_at\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\tstartedAt\x12@\n" +
+	"\vfinished_at\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampH\x00R\n" +
+	"finishedAt\x88\x01\x01\x125\n" +
+	"\x17winner_player_public_id\x18\x04 \x01(\tR\x14winnerPlayerPublicIdB\x0e\n" +
+	"\f_finished_at\"\x94\x03\n" +
+	"\tViolation\x12\x1b\n" +
+	"\tpublic_id\x18\x01 \x01(\tR\bpublicId\x12&\n" +
+	"\x0fmatch_public_id\x18\x02 \x01(\tR\rmatchPublicId\x12\x19\n" +
+	"\bround_no\x18\x03 \x01(\x05R\aroundNo\x12(\n" +
+	"\x10player_public_id\x18\x04 \x01(\tR\x0eplayerPublicId\x12.\n" +
+	"\x13player_display_name\x18\x05 \x01(\tR\x11playerDisplayName\x12$\n" +
+	"\x0eitem_public_id\x18\x06 \x01(\tR\fitemPublicId\x12\x1b\n" +
+	"\titem_name\x18\a \x01(\tR\bitemName\x12;\n" +
+	"\x06ruling\x18\b \x01(\x0e2#.hestia.activity.v1.ViolationRulingR\x06ruling\x12\x12\n" +
+	"\x04note\x18\t \x01(\tR\x04note\x129\n" +
+	"\n" +
+	"created_at\x18\n" +
+	" \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\"o\n" +
 	"\fBracketRound\x12\x14\n" +
 	"\x05round\x18\x01 \x01(\x05R\x05round\x12\x14\n" +
 	"\x05label\x18\x02 \x01(\tR\x05label\x123\n" +
-	"\amatches\x18\x03 \x03(\v2\x19.hestia.activity.v1.MatchR\amatches\"\xa8\x02\n" +
+	"\amatches\x18\x03 \x03(\v2\x19.hestia.activity.v1.MatchR\amatches\"\xfc\x02\n" +
 	"\fHandicapItem\x12\x1b\n" +
 	"\tpublic_id\x18\x01 \x01(\tR\bpublicId\x12@\n" +
 	"\bcategory\x18\x02 \x01(\x0e2$.hestia.activity.v1.HandicapCategoryR\bcategory\x12\x12\n" +
@@ -1342,7 +1815,11 @@ const file_hestia_activity_v1_common_proto_rawDesc = "" +
 	"repeatable\x120\n" +
 	"\x14requires_target_note\x18\a \x01(\bR\x12requiresTargetNote\x12\x1d\n" +
 	"\n" +
-	"sort_order\x18\b \x01(\x05R\tsortOrder\"\xa5\x02\n" +
+	"sort_order\x18\b \x01(\x05R\tsortOrder\x12\x10\n" +
+	"\x03key\x18\t \x01(\tR\x03key\x12&\n" +
+	"\x0fapplies_to_both\x18\n" +
+	" \x01(\bR\rappliesToBoth\x12\x18\n" +
+	"\aseconds\x18\v \x01(\x03R\aseconds\"\xac\x03\n" +
 	"\x11HandicapSelection\x12\x1b\n" +
 	"\tpublic_id\x18\x01 \x01(\tR\bpublicId\x12$\n" +
 	"\x0eitem_public_id\x18\x02 \x01(\tR\fitemPublicId\x12\x1b\n" +
@@ -1352,7 +1829,13 @@ const file_hestia_activity_v1_common_proto_rawDesc = "" +
 	"\vtarget_note\x18\x06 \x01(\tR\n" +
 	"targetNote\x129\n" +
 	"\n" +
-	"created_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\"\xa8\x01\n" +
+	"created_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x12\x19\n" +
+	"\bitem_key\x18\b \x01(\tR\aitemKey\x12\x1f\n" +
+	"\vdraw_result\x18\t \x01(\tR\n" +
+	"drawResult\x12&\n" +
+	"\x0fapplies_to_both\x18\n" +
+	" \x01(\bR\rappliesToBoth\x12!\n" +
+	"\freferee_note\x18\v \x01(\tR\vrefereeNote\"\xa8\x01\n" +
 	"\bBpBudget\x12&\n" +
 	"\x0fmatch_public_id\x18\x01 \x01(\tR\rmatchPublicId\x12(\n" +
 	"\x10player_public_id\x18\x02 \x01(\tR\x0eplayerPublicId\x12\x16\n" +
@@ -1395,7 +1878,17 @@ const file_hestia_activity_v1_common_proto_rawDesc = "" +
 	"\x0fMatchResultKind\x12!\n" +
 	"\x1dMATCH_RESULT_KIND_UNSPECIFIED\x10\x00\x12\x1c\n" +
 	"\x18MATCH_RESULT_KIND_NORMAL\x10\x01\x12\x1e\n" +
-	"\x1aMATCH_RESULT_KIND_WALKOVER\x10\x02*\x82\x01\n" +
+	"\x1aMATCH_RESULT_KIND_WALKOVER\x10\x02*[\n" +
+	"\tMatchKind\x12\x1a\n" +
+	"\x16MATCH_KIND_UNSPECIFIED\x10\x00\x12\x16\n" +
+	"\x12MATCH_KIND_BRACKET\x10\x01\x12\x1a\n" +
+	"\x16MATCH_KIND_THIRD_PLACE\x10\x02*\xae\x01\n" +
+	"\x0fViolationRuling\x12 \n" +
+	"\x1cVIOLATION_RULING_UNSPECIFIED\x10\x00\x12\x1c\n" +
+	"\x18VIOLATION_RULING_WARNING\x10\x01\x12\x1f\n" +
+	"\x1bVIOLATION_RULING_ROUND_LOSS\x10\x02\x12\x1f\n" +
+	"\x1bVIOLATION_RULING_MATCH_LOSS\x10\x03\x12\x19\n" +
+	"\x15VIOLATION_RULING_NONE\x10\x04*\x82\x01\n" +
 	"\fPlayerStatus\x12\x1d\n" +
 	"\x19PLAYER_STATUS_UNSPECIFIED\x10\x00\x12\x18\n" +
 	"\x14PLAYER_STATUS_ACTIVE\x10\x01\x12\x1c\n" +
@@ -1422,49 +1915,60 @@ func file_hestia_activity_v1_common_proto_rawDescGZIP() []byte {
 	return file_hestia_activity_v1_common_proto_rawDescData
 }
 
-var file_hestia_activity_v1_common_proto_enumTypes = make([]protoimpl.EnumInfo, 6)
-var file_hestia_activity_v1_common_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_hestia_activity_v1_common_proto_enumTypes = make([]protoimpl.EnumInfo, 8)
+var file_hestia_activity_v1_common_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
 var file_hestia_activity_v1_common_proto_goTypes = []any{
 	(Rank)(0),                     // 0: hestia.activity.v1.Rank
 	(TournamentPhase)(0),          // 1: hestia.activity.v1.TournamentPhase
 	(MatchStatus)(0),              // 2: hestia.activity.v1.MatchStatus
 	(MatchResultKind)(0),          // 3: hestia.activity.v1.MatchResultKind
-	(PlayerStatus)(0),             // 4: hestia.activity.v1.PlayerStatus
-	(HandicapCategory)(0),         // 5: hestia.activity.v1.HandicapCategory
-	(*Tournament)(nil),            // 6: hestia.activity.v1.Tournament
-	(*RankInfo)(nil),              // 7: hestia.activity.v1.RankInfo
-	(*Player)(nil),                // 8: hestia.activity.v1.Player
-	(*Match)(nil),                 // 9: hestia.activity.v1.Match
-	(*BracketRound)(nil),          // 10: hestia.activity.v1.BracketRound
-	(*HandicapItem)(nil),          // 11: hestia.activity.v1.HandicapItem
-	(*HandicapSelection)(nil),     // 12: hestia.activity.v1.HandicapSelection
-	(*BpBudget)(nil),              // 13: hestia.activity.v1.BpBudget
-	(*MatchHandicaps)(nil),        // 14: hestia.activity.v1.MatchHandicaps
-	(*timestamppb.Timestamp)(nil), // 15: google.protobuf.Timestamp
+	(MatchKind)(0),                // 4: hestia.activity.v1.MatchKind
+	(ViolationRuling)(0),          // 5: hestia.activity.v1.ViolationRuling
+	(PlayerStatus)(0),             // 6: hestia.activity.v1.PlayerStatus
+	(HandicapCategory)(0),         // 7: hestia.activity.v1.HandicapCategory
+	(*Tournament)(nil),            // 8: hestia.activity.v1.Tournament
+	(*RankInfo)(nil),              // 9: hestia.activity.v1.RankInfo
+	(*Player)(nil),                // 10: hestia.activity.v1.Player
+	(*Match)(nil),                 // 11: hestia.activity.v1.Match
+	(*MatchRound)(nil),            // 12: hestia.activity.v1.MatchRound
+	(*Violation)(nil),             // 13: hestia.activity.v1.Violation
+	(*BracketRound)(nil),          // 14: hestia.activity.v1.BracketRound
+	(*HandicapItem)(nil),          // 15: hestia.activity.v1.HandicapItem
+	(*HandicapSelection)(nil),     // 16: hestia.activity.v1.HandicapSelection
+	(*BpBudget)(nil),              // 17: hestia.activity.v1.BpBudget
+	(*MatchHandicaps)(nil),        // 18: hestia.activity.v1.MatchHandicaps
+	(*timestamppb.Timestamp)(nil), // 19: google.protobuf.Timestamp
 }
 var file_hestia_activity_v1_common_proto_depIdxs = []int32{
 	1,  // 0: hestia.activity.v1.Tournament.phase:type_name -> hestia.activity.v1.TournamentPhase
-	15, // 1: hestia.activity.v1.Tournament.created_at:type_name -> google.protobuf.Timestamp
+	19, // 1: hestia.activity.v1.Tournament.created_at:type_name -> google.protobuf.Timestamp
 	0,  // 2: hestia.activity.v1.RankInfo.rank:type_name -> hestia.activity.v1.Rank
 	0,  // 3: hestia.activity.v1.Player.rank:type_name -> hestia.activity.v1.Rank
-	4,  // 4: hestia.activity.v1.Player.status:type_name -> hestia.activity.v1.PlayerStatus
+	6,  // 4: hestia.activity.v1.Player.status:type_name -> hestia.activity.v1.PlayerStatus
 	2,  // 5: hestia.activity.v1.Match.status:type_name -> hestia.activity.v1.MatchStatus
 	3,  // 6: hestia.activity.v1.Match.result_kind:type_name -> hestia.activity.v1.MatchResultKind
-	15, // 7: hestia.activity.v1.Match.started_at:type_name -> google.protobuf.Timestamp
-	15, // 8: hestia.activity.v1.Match.finished_at:type_name -> google.protobuf.Timestamp
-	9,  // 9: hestia.activity.v1.BracketRound.matches:type_name -> hestia.activity.v1.Match
-	5,  // 10: hestia.activity.v1.HandicapItem.category:type_name -> hestia.activity.v1.HandicapCategory
-	5,  // 11: hestia.activity.v1.HandicapSelection.category:type_name -> hestia.activity.v1.HandicapCategory
-	15, // 12: hestia.activity.v1.HandicapSelection.created_at:type_name -> google.protobuf.Timestamp
-	2,  // 13: hestia.activity.v1.MatchHandicaps.status:type_name -> hestia.activity.v1.MatchStatus
-	13, // 14: hestia.activity.v1.MatchHandicaps.budget:type_name -> hestia.activity.v1.BpBudget
-	12, // 15: hestia.activity.v1.MatchHandicaps.selections:type_name -> hestia.activity.v1.HandicapSelection
-	15, // 16: hestia.activity.v1.MatchHandicaps.locked_at:type_name -> google.protobuf.Timestamp
-	17, // [17:17] is the sub-list for method output_type
-	17, // [17:17] is the sub-list for method input_type
-	17, // [17:17] is the sub-list for extension type_name
-	17, // [17:17] is the sub-list for extension extendee
-	0,  // [0:17] is the sub-list for field type_name
+	19, // 7: hestia.activity.v1.Match.started_at:type_name -> google.protobuf.Timestamp
+	19, // 8: hestia.activity.v1.Match.finished_at:type_name -> google.protobuf.Timestamp
+	4,  // 9: hestia.activity.v1.Match.kind:type_name -> hestia.activity.v1.MatchKind
+	19, // 10: hestia.activity.v1.Match.setup_confirmed_at:type_name -> google.protobuf.Timestamp
+	12, // 11: hestia.activity.v1.Match.rounds:type_name -> hestia.activity.v1.MatchRound
+	19, // 12: hestia.activity.v1.MatchRound.started_at:type_name -> google.protobuf.Timestamp
+	19, // 13: hestia.activity.v1.MatchRound.finished_at:type_name -> google.protobuf.Timestamp
+	5,  // 14: hestia.activity.v1.Violation.ruling:type_name -> hestia.activity.v1.ViolationRuling
+	19, // 15: hestia.activity.v1.Violation.created_at:type_name -> google.protobuf.Timestamp
+	11, // 16: hestia.activity.v1.BracketRound.matches:type_name -> hestia.activity.v1.Match
+	7,  // 17: hestia.activity.v1.HandicapItem.category:type_name -> hestia.activity.v1.HandicapCategory
+	7,  // 18: hestia.activity.v1.HandicapSelection.category:type_name -> hestia.activity.v1.HandicapCategory
+	19, // 19: hestia.activity.v1.HandicapSelection.created_at:type_name -> google.protobuf.Timestamp
+	2,  // 20: hestia.activity.v1.MatchHandicaps.status:type_name -> hestia.activity.v1.MatchStatus
+	17, // 21: hestia.activity.v1.MatchHandicaps.budget:type_name -> hestia.activity.v1.BpBudget
+	16, // 22: hestia.activity.v1.MatchHandicaps.selections:type_name -> hestia.activity.v1.HandicapSelection
+	19, // 23: hestia.activity.v1.MatchHandicaps.locked_at:type_name -> google.protobuf.Timestamp
+	24, // [24:24] is the sub-list for method output_type
+	24, // [24:24] is the sub-list for method input_type
+	24, // [24:24] is the sub-list for extension type_name
+	24, // [24:24] is the sub-list for extension extendee
+	0,  // [0:24] is the sub-list for field type_name
 }
 
 func init() { file_hestia_activity_v1_common_proto_init() }
@@ -1473,14 +1977,15 @@ func file_hestia_activity_v1_common_proto_init() {
 		return
 	}
 	file_hestia_activity_v1_common_proto_msgTypes[3].OneofWrappers = []any{}
-	file_hestia_activity_v1_common_proto_msgTypes[8].OneofWrappers = []any{}
+	file_hestia_activity_v1_common_proto_msgTypes[4].OneofWrappers = []any{}
+	file_hestia_activity_v1_common_proto_msgTypes[10].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_hestia_activity_v1_common_proto_rawDesc), len(file_hestia_activity_v1_common_proto_rawDesc)),
-			NumEnums:      6,
-			NumMessages:   9,
+			NumEnums:      8,
+			NumMessages:   11,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

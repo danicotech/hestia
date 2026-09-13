@@ -5,13 +5,25 @@ syntax = "proto3";
 // ── 為什麼是投票驅動而不是彩池 ──────────────────────────────────
 //
 // 彩池做不了串關:彩池的賠率要等封盤後才算得出來,而串關必須在下注當下就
-// 知道每一腿的賠率才能乘起來。所以改成投票推導隱含機率:
+// 知道每一腿的賠率才能乘起來。所以改成投票推導隱含機率(n 路,schemas/21):
 //
-//   隱含機率 = (該方票數 + SMOOTHING) / (總票數 + 2×SMOOTHING)
-//   賠率     = (1 − VIG) / 隱含機率,夾在 [MIN_ODDS, MAX_ODDS]
+//   p_i    = (票_i + SMOOTHING) / (總票數 + n×SMOOTHING)     n = 該盤口的結果數
+//   賠率_i = (1 − VIG) / p_i,夾在 [MIN_ODDS, MAX_ODDS]
+//
+// 這是標準運彩邏輯:Σp_i = 1,Σ(1/賠率_i) = 1/(1−VIG) —— 那多出來的就是抽水。
+// 兩路(勝負)是 n=2 的特例;比分盤(三局兩勝)是 n=4。
 //
 // **賠率在下注當下鎖定**寫進注單。之後票數再怎麼跑都不影響已成立的注單,
 // 派彩也直接發下注當下算定的金額 —— 選手看到的「可能贏得 X」必須等於實際入帳。
+//
+// ── 盤口(2026-09-13)──────────────────────────────────────────
+//
+// 一場比賽有多個盤口:整場勝敗、單回合勝敗、時長、比分。哪些存在由該屆的
+// 規則設定決定(schemas/28),場次開盤時建。每個盤口各自投票、各自結算。
+//
+// **串關的各腿必須落在不同場次**(同一場只能一腿):押「A 贏整場」+「比分 2:0」
+// 是同一件事押兩次,賠率卻相乘 —— 沒有莊家在對面收錢,超額派彩直接從代幣供給出。
+// 跨場串不同盤口完全可以:第 1 場押時長 + 第 2 場押比分 + 第 3 場押勝負。
 //
 // ── 這裡全部是真錢 ──────────────────────────────────────────────
 //
@@ -35,9 +47,9 @@ option go_package = "github.com/danicotech/hestia/gen/hestia/activity/v1;activit
 
 // BettingService 是觀眾側的投票與下注。除了 GetOdds,全部需要平台帳號。
 service BettingService {
-  // 投票給某一方。一場一票,再投即改票。
+  // 對某個盤口投一個結果。一場每盤口一票,再投即改票。
   rpc Vote(VoteRequest) returns (VoteResponse) {}
-  // 取得目前賠率與票數。匿名可讀。
+  // 取得目前各盤口的賠率與票數。匿名可讀。
   rpc GetOdds(GetOddsRequest) returns (GetOddsResponse) {}
   // 下注。單場或串關都走這支。
   rpc PlaceBet(PlaceBetRequest) returns (PlaceBetResponse) {}
@@ -65,31 +77,75 @@ enum LegResult {
   LEG_RESULT_VOID = 4;
 }
 
-// MatchOdds 是一場比賽的即時賠率。
-message MatchOdds {
-  string match_public_id = 1;
-  int32 p1_votes = 2;
-  int32 p2_votes = 3;
+// MarketKind 是盤口的種類。結算邏輯每種一個,在伺服器裡;哪些盤口存在是資料。
+enum MarketKind {
+  MARKET_KIND_UNSPECIFIED = 0;
+  // 整場(系列賽)勝敗。結果:p1 / p2。
+  MARKET_KIND_MATCH_WINNER = 1;
+  // 單一回合的勝敗,每回合一個盤口。結果:p1 / p2。
+  MARKET_KIND_ROUND_WINNER = 2;
+  // 該回合時長 vs 線(line_seconds),每回合一個盤口。結果:over / under;**等於線算 over**。
+  MARKET_KIND_DURATION = 3;
+  // 回合比數。結果由幾局幾勝推導:三局兩勝是 p1_2_0 / p1_2_1 / p2_2_1 / p2_2_0。
+  MARKET_KIND_SCORE = 4;
+}
+
+// MarketStatus 是盤口狀態。
+enum MarketStatus {
+  MARKET_STATUS_UNSPECIFIED = 0;
+  MARKET_STATUS_OPEN = 1;
+  // 已關盤(第一回合正式開打),等結算。
+  MARKET_STATUS_CLOSED = 2;
+  MARKET_STATUS_SETTLED = 3;
+  // 作廢退款:沒打到的回合(三局兩勝 2:0 結束就沒有第三回合)、或棄賽。
+  MARKET_STATUS_VOID = 4;
+}
+
+// OutcomeOdds 是一個盤口裡一個結果的票數與賠率。
+message OutcomeOdds {
+  // 結果代碼(p1 / p2 / over / under / p1_2_0 …)。下注與投票都用它。
+  string outcome = 1;
+  // 顯示用的名稱,伺服器組好:選手名、「超過 90 秒」、「2:0」。前端不要自己拼。
+  string label = 2;
+  int32 votes = 3;
   // 賠率 ×1000 的整數(1.43 → 1430)。
   // 浮點數在這裡是禁止的:賠率會參與串關的連乘,誤差會直接乘進派彩金額。
-  int64 p1_odds_milli = 4;
-  int64 p2_odds_milli = 5;
-  // 現在能不能下注。READY 與 LOCKED 可以,LIVE 之後不行。
-  bool open_for_bets = 6;
-  // 我投給了哪一方(1 或 2);0 = 還沒投或未登入。
+  int64 odds_milli = 4;
+}
+
+// MarketOdds 是一個盤口的即時賠率。
+message MarketOdds {
+  string market_public_id = 1;
+  string match_public_id = 2;
+  MarketKind kind = 3;
+  // ROUND_WINNER / DURATION 才有;其餘 0。
+  int32 round_no = 4;
+  // DURATION 才有;其餘 0。
+  int64 line_seconds = 5;
+  MarketStatus status = 6;
+  repeated OutcomeOdds outcomes = 7;
+  // 現在能不能下注(status = OPEN)。
+  bool open_for_bets = 8;
+  // 我投了哪個結果;空 = 還沒投或未登入。
   // 只回自己的 —— 別人投給誰永遠不會出現在任何回應裡。
-  int32 my_vote = 7;
+  string my_vote = 9;
+}
+
+// MatchOdds 是一場比賽全部盤口的即時賠率。
+message MatchOdds {
+  string match_public_id = 1;
+  repeated MarketOdds markets = 2;
 }
 
 message VoteRequest {
-  string match_public_id = 1;
-  // 1 = p1,2 = p2。
-  int32 side = 2;
+  string market_public_id = 1;
+  // 該盤口的結果代碼。
+  string outcome = 2;
 }
 
 message VoteResponse {
-  // 投完後的即時賠率。票數變了賠率就會變,所以一併回。
-  MatchOdds odds = 1;
+  // 投完後該盤口的即時賠率。票數變了賠率就會變,所以一併回。
+  MarketOdds odds = 1;
 }
 
 message GetOddsRequest {
@@ -101,18 +157,17 @@ message GetOddsResponse {
   repeated MatchOdds odds = 1;
 }
 
-// BetLegInput 是要押的一腿。
+// BetLegInput 是要押的一腿:哪個盤口的哪個結果。
 message BetLegInput {
-  string match_public_id = 1;
-  // 1 = p1,2 = p2。
-  int32 side = 2;
+  string market_public_id = 1;
+  string outcome = 2;
 }
 
 message PlaceBetRequest {
   string tournament_slug = 1;
   // 下注額。同一注單的所有腿共用這一筆本金(串關不是各押各的)。
   int64 stake = 2;
-  // 一腿 = 單場,多腿 = 串關。同一場不可押兩次(押完 p1 再押 p2 等於穩賺)。
+  // 一腿 = 單場,多腿 = 串關。**同一場只能一腿**(不同盤口也不行,見檔頭)。
   repeated BetLegInput legs = 3;
   // 動錢的 RPC 一律要帶。重送同一把鍵回同一張注單,不會重複扣款。
   string idempotency_key = 4;
@@ -142,12 +197,16 @@ message BetLeg {
   string match_public_id = 1;
   // 場次描述快照,如「首輪 · 李璃 vs A冷」。避免列注單時還要再查每一場。
   string match_label = 2;
-  int32 side = 3;
-  // 押的那一方的顯示名快照。
-  string side_display_name = 4;
+  string market_public_id = 3;
+  MarketKind kind = 4;
+  // ROUND_WINNER / DURATION 才有。
+  int32 round_no = 5;
+  string outcome = 6;
+  // 押的結果的顯示名快照(選手名、「超過 90 秒」、「2:0」)。
+  string outcome_label = 7;
   // 下注當下鎖定的賠率 ×1000。之後票數再跑都不改這個值。
-  int64 odds_milli = 5;
-  LegResult result = 6;
+  int64 odds_milli = 8;
+  LegResult result = 9;
 }
 
 message PlaceBetResponse {

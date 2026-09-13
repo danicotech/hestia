@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -22,12 +23,17 @@ import (
 )
 
 type fakeActivityMatches struct {
-	opened    []match.OpenHandicapParams
-	locked    []match.LockHandicapParams
-	started   []match.StartMatchParams
-	reported  []match.ReportResultParams
-	withdrawn []match.WithdrawPlayerParams
-	streams   []match.SetStreamURLParams
+	opened        []match.OpenHandicapParams
+	locked        []match.LockHandicapParams
+	roundStarts   []string
+	roundFinishes []int
+	violations    []match.RecordViolationParams
+	setups        []string
+	violationsOf  []match.Violation
+	reported      []match.ReportResultParams
+	withdrawn     []match.WithdrawPlayerParams
+	streams       []match.SetStreamURLParams
+	refunds       []match.RefundSelectionParams
 
 	err error
 }
@@ -57,15 +63,86 @@ func (f *fakeActivityMatches) LockHandicap(
 	}, nil
 }
 
-func (f *fakeActivityMatches) StartMatch(
-	_ context.Context, p match.StartMatchParams,
-) (*match.Match, error) {
-	f.started = append(f.started, p)
+func (f *fakeActivityMatches) ReviewSetup(_ context.Context, _ string) (*match.SetupReview, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
 	m := testBracketMatches()[0]
+	return &match.SetupReview{
+		Match:     m,
+		Handicaps: &handicap.MatchHandicaps{MatchPublicID: testMatchID, Status: "locked", Revealed: true},
+		Checklist: []handicap.ChecklistEntry{{
+			SelectionPublicID: "01SELECTION", ItemKey: "skill.ban_any_art",
+			ItemName: "禁用任意奇術", RefereeNote: "開賽前確認", TargetNote: "踏雪無痕",
+		}},
+		WinsNeeded: 2,
+	}, nil
+}
+
+func (f *fakeActivityMatches) ConfirmSetup(_ context.Context, id string, _ int64) (*match.Match, error) {
+	f.setups = append(f.setups, id)
+	if f.err != nil {
+		return nil, f.err
+	}
+	m := testBracketMatches()[0]
+	at := time.Unix(1_700_000_000, 0)
+	m.SetupConfirmedAt = &at
 	return &m, nil
+}
+
+func (f *fakeActivityMatches) StartRound(_ context.Context, id string, _ int64) (*match.RoundStart, error) {
+	f.roundStarts = append(f.roundStarts, id)
+	if f.err != nil {
+		return nil, f.err
+	}
+	m := testBracketMatches()[0]
+	m.Status = match.StatusLive
+	r := match.Round{RoundNo: 1, StartedAt: time.Unix(1_700_000_000, 0)}
+	return &match.RoundStart{Match: m, Round: r, Rounds: []match.Round{r}}, nil
+}
+
+func (f *fakeActivityMatches) FinishRound(
+	_ context.Context, p match.FinishRoundParams,
+) (*match.RoundFinish, error) {
+	// 與真的服務同一道門:沒帶 confirm 就不記、不做。
+	if !p.Confirm {
+		return nil, match.ErrConfirmationRequired
+	}
+	roundNo := p.RoundNo
+	f.roundFinishes = append(f.roundFinishes, roundNo)
+	if f.err != nil {
+		return nil, f.err
+	}
+	m := testBracketMatches()[0]
+	m.Status = match.StatusLive
+	at := time.Unix(1_700_000_000, 0)
+	r := match.Round{RoundNo: roundNo, StartedAt: at, FinishedAt: &at, WinnerPlayerID: testPlayerBInternal}
+	return &match.RoundFinish{
+		Match: m, Round: r, Rounds: []match.Round{r},
+		Score: match.Score{P2Wins: 1}, RoundSettledBetCount: 2,
+	}, nil
+}
+
+func (f *fakeActivityMatches) RecordViolation(
+	_ context.Context, p match.RecordViolationParams,
+) (*match.Violation, error) {
+	f.violations = append(f.violations, p)
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &match.Violation{
+		PublicID: "01VIOLATION", MatchPublicID: p.MatchPublicID, RoundNo: p.RoundNo,
+		PlayerPublicID: p.PlayerPublicID, PlayerDisplayName: "選手B",
+		Ruling: p.Ruling, Note: p.Note, RecordedBy: p.ActorUserID,
+		CreatedAt: time.Unix(1_700_000_000, 0),
+	}, nil
+}
+
+func (f *fakeActivityMatches) ListMatchViolations(_ context.Context, _ string) ([]match.Violation, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.violationsOf, nil
 }
 
 func (f *fakeActivityMatches) ReportResult(
@@ -113,6 +190,27 @@ func (f *fakeActivityMatches) SetStreamURL(
 	m := testBracketMatches()[0]
 	m.StreamURL = p.StreamURL
 	return &m, nil
+}
+
+func (f *fakeActivityMatches) RefundSelection(
+	_ context.Context, p match.RefundSelectionParams,
+) (*match.RefundSelectionResult, error) {
+	f.refunds = append(f.refunds, p)
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &match.RefundSelectionResult{
+		MatchPublicID: testMatchID,
+		Selection: handicap.Selection{
+			PublicID: "01SELECTION", MatchPublicID: testMatchID,
+			ItemRef: "01ITEM", ItemName: "禁用任意奇術",
+			Category: handicap.CategorySkill, Cost: 3, TargetNote: "踏雪無痕", Voided: true,
+		},
+		Budget: handicap.Budget{
+			MatchID: 1, PlayerID: testPlayerAInternal,
+			PlayerPublicID: testPlayerAID, Budget: 24, Spent: 12,
+		},
+	}, nil
 }
 
 type fakeActivityPrizes struct {
@@ -166,7 +264,21 @@ func judgeDeps() (ActivityDeps, *fakeActivityTournament, *fakeActivityMatches,
 	deps.Signup = sgn
 	deps.Prizes = prizes
 	deps.Authorizer = authz
+	// ReviewHandicap 走的是讓武領域服務(純讀取,不寫稽核),與 HandicapService
+	// 拿的是同一個值 —— 所以這裡直接借用那邊的 fixture,不另造第二個假物件。
+	hdeps, _, _ := handicapDeps()
+	deps.Handicap = hdeps.Handicap
 	return deps, tsvc, matches, sgn, prizes, authz
+}
+
+// judgeHandicapFake 取出 judgeDeps 裝進去的讓武假物件。
+func judgeHandicapFake(t *testing.T, deps ActivityDeps) *fakeActivityHandicap {
+	t.Helper()
+	f, ok := deps.Handicap.(*fakeActivityHandicap)
+	if !ok {
+		t.Fatalf("deps.Handicap 的型別是 %T", deps.Handicap)
+	}
+	return f
 }
 
 // 每一支裁判 RPC 都要平台帳號 + 裁判權限,而且是逐支檢查,不是挑幾支。
@@ -311,6 +423,24 @@ func judgeCalls(c activityv1connect.JudgeServiceClient) map[string]func(context.
 			_, err := c.OpenHandicap(ctx, r)
 			return err
 		},
+		"ReviewHandicap": func(ctx context.Context, in bool) error {
+			r := connect.NewRequest(&activityv1.ReviewHandicapRequest{MatchPublicId: testMatchID})
+			if in {
+				withUser(r, testUserID)
+			}
+			_, err := c.ReviewHandicap(ctx, r)
+			return err
+		},
+		"RefundSelection": func(ctx context.Context, in bool) error {
+			r := connect.NewRequest(&activityv1.RefundSelectionRequest{
+				SelectionPublicId: "01SELECTION", Reason: "依項目規則返還",
+			})
+			if in {
+				withUser(r, testUserID)
+			}
+			_, err := c.RefundSelection(ctx, r)
+			return err
+		},
 		"LockHandicap": func(ctx context.Context, in bool) error {
 			r := connect.NewRequest(&activityv1.LockHandicapRequest{
 				MatchPublicId: testMatchID, Confirm: true,
@@ -329,12 +459,57 @@ func judgeCalls(c activityv1connect.JudgeServiceClient) map[string]func(context.
 			_, err := c.SetStreamUrl(ctx, r)
 			return err
 		},
-		"StartMatch": func(ctx context.Context, in bool) error {
-			r := connect.NewRequest(&activityv1.StartMatchRequest{MatchPublicId: testMatchID})
+		"ReviewSetup": func(ctx context.Context, in bool) error {
+			r := connect.NewRequest(&activityv1.ReviewSetupRequest{MatchPublicId: testMatchID})
 			if in {
 				withUser(r, testUserID)
 			}
-			_, err := c.StartMatch(ctx, r)
+			_, err := c.ReviewSetup(ctx, r)
+			return err
+		},
+		"ConfirmSetup": func(ctx context.Context, in bool) error {
+			r := connect.NewRequest(&activityv1.ConfirmSetupRequest{MatchPublicId: testMatchID})
+			if in {
+				withUser(r, testUserID)
+			}
+			_, err := c.ConfirmSetup(ctx, r)
+			return err
+		},
+		"StartRound": func(ctx context.Context, in bool) error {
+			r := connect.NewRequest(&activityv1.StartRoundRequest{MatchPublicId: testMatchID})
+			if in {
+				withUser(r, testUserID)
+			}
+			_, err := c.StartRound(ctx, r)
+			return err
+		},
+		"FinishRound": func(ctx context.Context, in bool) error {
+			r := connect.NewRequest(&activityv1.FinishRoundRequest{
+				MatchPublicId: testMatchID, RoundNo: 1, WinnerPlayerPublicId: testPlayerBID, Confirm: true,
+			})
+			if in {
+				withUser(r, testUserID)
+			}
+			_, err := c.FinishRound(ctx, r)
+			return err
+		},
+		"RecordViolation": func(ctx context.Context, in bool) error {
+			r := connect.NewRequest(&activityv1.RecordViolationRequest{
+				MatchPublicId: testMatchID, PlayerPublicId: testPlayerBID,
+				Ruling: activityv1.ViolationRuling_VIOLATION_RULING_WARNING, Note: "越線",
+			})
+			if in {
+				withUser(r, testUserID)
+			}
+			_, err := c.RecordViolation(ctx, r)
+			return err
+		},
+		"ListViolations": func(ctx context.Context, in bool) error {
+			r := connect.NewRequest(&activityv1.ListViolationsRequest{MatchPublicId: testMatchID})
+			if in {
+				withUser(r, testUserID)
+			}
+			_, err := c.ListViolations(ctx, r)
 			return err
 		},
 		"ReportResult": func(ctx context.Context, in bool) error {
@@ -842,6 +1017,171 @@ func TestUnmappedActivityErrorsStayOpaque(t *testing.T) {
 	}
 }
 
+// 裁判在封盤前看得到讓武內容,而同一場透過選手端那支查詢**看不到**。
+//
+// 兩個斷言寫在同一個測試裡是刻意的:它們是同一條界線的兩面。
+// 只驗前者的話,把揭露限制整個拆掉也會是綠的 —— 而那正是這支 RPC
+// 最可能造成的傷害(對手提前知道自己會被禁什麼)。
+func TestJudgeReviewHandicapSeesBeforeLockWhilePlayersDoNot(t *testing.T) {
+	deps, _, _, _, _, _ := judgeDeps()
+	svc := judgeHandicapFake(t, deps)
+	// 把場景改成**尚未封盤**:這支 RPC 的全部價值都在這個時間點。
+	svc.matchHcaps.Revealed = false
+	svc.matchHcaps.Status = "ready"
+
+	srv := newActivityServer(t, deps)
+	ctx := context.Background()
+	judge := activityv1connect.NewJudgeServiceClient(srv.Client(), srv.URL)
+	players := activityv1connect.NewHandicapServiceClient(srv.Client(), srv.URL)
+
+	req := connect.NewRequest(&activityv1.ReviewHandicapRequest{MatchPublicId: testMatchID})
+	withUser(req, testUserID)
+	got, err := judge.ReviewHandicap(ctx, req)
+	if err != nil {
+		t.Fatalf("ReviewHandicap: %v", err)
+	}
+	h := got.Msg.GetHandicaps()
+	if len(h.GetSelections()) != 1 || h.GetBudget() == nil {
+		t.Fatalf("裁判在封盤前就該看到內容: %+v", h)
+	}
+	if h.GetSelections()[0].GetItemName() != "禁迴避" {
+		t.Fatalf("項目內容不對: %+v", h.GetSelections()[0])
+	}
+	if h.GetLockedAt() != nil {
+		t.Fatal("尚未封盤卻有封盤時間 —— 前端會拿它判斷可不可以公開")
+	}
+
+	// 同一場、同一時刻,匿名觀眾走選手端那支:看不到任何內容。
+	anon, err := players.GetMatchHandicaps(ctx, connect.NewRequest(
+		&activityv1.GetMatchHandicapsRequest{MatchPublicId: testMatchID}))
+	if err != nil {
+		t.Fatalf("GetMatchHandicaps(匿名): %v", err)
+	}
+	if len(anon.Msg.GetHandicaps().GetSelections()) != 0 || anon.Msg.GetHandicaps().GetBudget() != nil {
+		t.Fatalf("封盤前匿名不該看到內容: %+v", anon.Msg.GetHandicaps())
+	}
+
+	// 帶 session 的非持有者(testSessionTok 是 A,而這份 fixture 的持有者
+	// 也是 A —— 所以改用一個不存在的 session,它會退化成匿名)。
+	other, err := players.GetMatchHandicaps(ctx, withPlayerSession(connect.NewRequest(
+		&activityv1.GetMatchHandicapsRequest{MatchPublicId: testMatchID}), "別人的壞 session"))
+	if err != nil {
+		t.Fatalf("GetMatchHandicaps(非持有者): %v", err)
+	}
+	if len(other.Msg.GetHandicaps().GetSelections()) != 0 {
+		t.Fatalf("封盤前非持有者不該看到內容: %+v", other.Msg.GetHandicaps())
+	}
+
+	// 入口層真的走了裁判那支方法,不是偷偷用選手那支。
+	if len(svc.refereeViews) != 1 || svc.refereeViews[0] != testMatchID {
+		t.Fatalf("ReviewHandicap 沒有走 RefereeMatchHandicaps: %v", svc.refereeViews)
+	}
+}
+
+// 代退把裁判身分與理由交給領域層,並把結果原樣回給裁判端。
+func TestJudgeRefundSelection(t *testing.T) {
+	deps, _, matches, _, _, _ := judgeDeps()
+	srv := newActivityServer(t, deps)
+	client := activityv1connect.NewJudgeServiceClient(srv.Client(), srv.URL)
+
+	req := connect.NewRequest(&activityv1.RefundSelectionRequest{
+		SelectionPublicId: "01SELECTION",
+		Reason:            "同時買了禁用奇術,依項目規則返還",
+	})
+	withUser(req, testUserID)
+	got, err := client.RefundSelection(context.Background(), req)
+	if err != nil {
+		t.Fatalf("RefundSelection: %v", err)
+	}
+
+	if len(matches.refunds) != 1 {
+		t.Fatalf("領域層被呼叫 %d 次", len(matches.refunds))
+	}
+	p := matches.refunds[0]
+	// 裁判身分只能來自認證過的平台帳號,永遠不從 body 讀。
+	if p.ActorUserID != testUserID {
+		t.Fatalf("actor = %d,want %d", p.ActorUserID, testUserID)
+	}
+	if p.SelectionPublicID != "01SELECTION" || p.Reason == "" {
+		t.Fatalf("參數沒有原樣傳下去: %+v", p)
+	}
+
+	// 回應要填得出 match_public_id(VoidSelection 那支填不出來)。
+	if got.Msg.GetBudget().GetMatchPublicId() != testMatchID {
+		t.Fatalf("budget 缺 match_public_id: %+v", got.Msg.GetBudget())
+	}
+	if got.Msg.GetBudget().GetRemaining() != 12 {
+		t.Fatalf("remaining = %d,want 12(由伺服器算好)", got.Msg.GetBudget().GetRemaining())
+	}
+	if got.Msg.GetSelection().GetItemName() != "禁用任意奇術" ||
+		got.Msg.GetSelection().GetTargetNote() != "踏雪無痕" {
+		t.Fatalf("沒回被退掉的那一筆: %+v", got.Msg.GetSelection())
+	}
+}
+
+func TestJudgeRefundSelectionRejections(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("缺 selection_public_id", func(t *testing.T) {
+		deps, _, matches, _, _, _ := judgeDeps()
+		srv := newActivityServer(t, deps)
+		client := activityv1connect.NewJudgeServiceClient(srv.Client(), srv.URL)
+		req := connect.NewRequest(&activityv1.RefundSelectionRequest{Reason: "退"})
+		withUser(req, testUserID)
+		_, err := client.RefundSelection(ctx, req)
+		requireCode(t, err, connect.CodeInvalidArgument)
+		if len(matches.refunds) != 0 {
+			t.Fatal("缺必填欄位卻打到領域層")
+		}
+	})
+
+	t.Run("封盤後拒絕", func(t *testing.T) {
+		deps, _, matches, _, _, _ := judgeDeps()
+		matches.err = handicap.ErrHandicapLocked
+		srv := newActivityServer(t, deps)
+		client := activityv1connect.NewJudgeServiceClient(srv.Client(), srv.URL)
+		req := connect.NewRequest(&activityv1.RefundSelectionRequest{
+			SelectionPublicId: "01SELECTION", Reason: "退",
+		})
+		withUser(req, testUserID)
+		_, err := client.RefundSelection(ctx, req)
+		requireCode(t, err, connect.CodeFailedPrecondition)
+		if ErrorReason(err) != "handicap_locked" {
+			t.Fatalf("reason = %q,前端要靠它顯示「已封盤,不可再更動」", ErrorReason(err))
+		}
+	})
+
+	t.Run("沒寫理由由領域層擋", func(t *testing.T) {
+		deps, _, matches, _, _, _ := judgeDeps()
+		matches.err = match.ErrInvalidRequest
+		srv := newActivityServer(t, deps)
+		client := activityv1connect.NewJudgeServiceClient(srv.Client(), srv.URL)
+		req := connect.NewRequest(&activityv1.RefundSelectionRequest{
+			SelectionPublicId: "01SELECTION",
+		})
+		withUser(req, testUserID)
+		_, err := client.RefundSelection(ctx, req)
+		requireCode(t, err, connect.CodeInvalidArgument)
+		// 入口層不自己判斷 reason:它要真的送到領域層才算「權威只有一份」。
+		if len(matches.refunds) != 1 {
+			t.Fatalf("領域層被呼叫 %d 次,理由的權威應該在那裡", len(matches.refunds))
+		}
+	})
+
+	t.Run("不存在的選擇", func(t *testing.T) {
+		deps, _, matches, _, _, _ := judgeDeps()
+		matches.err = handicap.ErrSelectionNotFound
+		srv := newActivityServer(t, deps)
+		client := activityv1connect.NewJudgeServiceClient(srv.Client(), srv.URL)
+		req := connect.NewRequest(&activityv1.RefundSelectionRequest{
+			SelectionPublicId: "01NOPE", Reason: "退",
+		})
+		withUser(req, testUserID)
+		_, err := client.RefundSelection(ctx, req)
+		requireCode(t, err, connect.CodeNotFound)
+	})
+}
+
 // judgeCalls 必須涵蓋 proto 裡的每一支 JudgeService RPC。
 //
 // 判準取自 proto descriptor,不是另一個手寫數字。上一版靠的是
@@ -873,5 +1213,21 @@ func TestJudgeCallsCoversEveryRPC(t *testing.T) {
 		if methods.ByName(protoreflect.Name(name)) == nil {
 			t.Errorf("judgeCalls 有 %s,但 proto 沒有這支 RPC(改名後留下的舊字串?)", name)
 		}
+	}
+}
+
+// FinishRound 沒帶 confirm → InvalidArgument,而且旗標是原樣傳到領域層由它擋,
+// 不是入口層自己多一份規則。
+func TestFinishRoundWithoutConfirmIsRejected(t *testing.T) {
+	deps, _, matches, _, _, _ := judgeDeps()
+	srv := newActivityServer(t, deps)
+	client := activityv1connect.NewJudgeServiceClient(srv.Client(), srv.URL)
+
+	_, err := client.FinishRound(context.Background(), withUser(connect.NewRequest(&activityv1.FinishRoundRequest{
+		MatchPublicId: testMatchID, RoundNo: 1, WinnerPlayerPublicId: testPlayerBID,
+	}), testUserID))
+	requireCode(t, err, connect.CodeInvalidArgument)
+	if len(matches.roundFinishes) != 0 {
+		t.Fatal("沒帶 confirm 不該結束任何回合")
 	}
 }

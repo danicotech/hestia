@@ -143,7 +143,13 @@ var errorCodes = []struct {
 	// 賠率在送達前跑掉了。Aborted:重讀賠率後重試是正確的處置。
 	{betting.ErrOddsMoved, connect.CodeAborted, "bet_odds_moved"},
 	{betting.ErrStakeTooLarge, connect.CodeFailedPrecondition, "bet_stake_too_large"},
-	{betting.ErrDuplicateLeg, connect.CodeInvalidArgument, "bet_duplicate_leg"},
+	{betting.ErrDuplicateMatchInParlay, connect.CodeInvalidArgument, "bet_duplicate_match_in_parlay"},
+	{betting.ErrMarketNotFound, connect.CodeNotFound, "market_not_found"},
+	{betting.ErrMarketClosed, connect.CodeFailedPrecondition, "market_closed"},
+	{betting.ErrOutcomeInvalid, connect.CodeInvalidArgument, "bet_outcome_invalid"},
+	{betting.ErrMarketsExist, connect.CodeAlreadyExists, "markets_exist"},
+	{betting.ErrMarketSettled, connect.CodeFailedPrecondition, "market_settled"},
+	{betting.ErrRoundNotFinished, connect.CodeFailedPrecondition, "round_not_finished"},
 	{betting.ErrTooManyLegs, connect.CodeInvalidArgument, "bet_too_many_legs"},
 	{betting.ErrMatchNotInTournament, connect.CodeInvalidArgument, "bet_match_not_in_tournament"},
 	{betting.ErrMatchNotDecided, connect.CodeFailedPrecondition, "bet_match_not_decided"},
@@ -167,6 +173,23 @@ var errorCodes = []struct {
 	// 對戰表或晉級目標不見了:資料完整性失效,不是使用者錯誤。
 	{match.ErrBracketMissing, connect.CodeInternal, "activity_bracket_missing"},
 	{match.ErrAdvanceTargetMissing, connect.CodeInternal, "activity_advance_target_missing"},
+	// 多回合制的裁判動線(schemas/20,2026-09-13)。
+	{match.ErrSetupNotConfirmed, connect.CodeFailedPrecondition, "match_setup_not_confirmed"},
+	{match.ErrSetupAlreadyConfirmed, connect.CodeAlreadyExists, "match_setup_already_confirmed"},
+	{match.ErrMatchDecided, connect.CodeFailedPrecondition, "match_decided"},
+	{match.ErrRoundInProgress, connect.CodeFailedPrecondition, "round_in_progress"},
+	{match.ErrRoundNotFound, connect.CodeNotFound, "round_not_found"},
+	{match.ErrRoundAlreadyFinished, connect.CodeFailedPrecondition, "round_already_finished"},
+	{match.ErrRoundsInconsistent, connect.CodeInternal, "rounds_inconsistent"},
+	{match.ErrMultiRoundMatch, connect.CodeFailedPrecondition, "match_multi_round"},
+	{match.ErrPlayerNotInMatch, connect.CodeInvalidArgument, "player_not_in_match"},
+	{match.ErrInvalidRuling, connect.CodeInvalidArgument, "violation_invalid_ruling"},
+	// 讓武的 key / 抽選 / 目錄同步(schemas/20,2026-09-13)。
+	{handicap.ErrInvalidItemParams, connect.CodeInternal, "handicap_invalid_item_params"},
+	{handicap.ErrDrawPoolEmpty, connect.CodeFailedPrecondition, "handicap_draw_pool_empty"},
+	{handicap.ErrAlreadyDrawn, connect.CodeInternal, "handicap_already_drawn"},
+	{handicap.ErrCatalogueInUse, connect.CodeFailedPrecondition, "handicap_catalogue_in_use"},
+	{handicap.ErrCatalogueMismatch, connect.CodeFailedPrecondition, "handicap_catalogue_mismatch"},
 
 	{play.ErrNotFound, connect.CodeNotFound, "play_not_found"},
 	{play.ErrDisabled, connect.CodeFailedPrecondition, "play_disabled"},

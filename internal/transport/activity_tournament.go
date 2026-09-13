@@ -86,6 +86,9 @@ type ActivityReader interface {
 	// CurrentMatchOfPlayer 回這位選手目前輪到要打的場次;nil = 沒有待打的場次
 	// (已出局、已棄賽、或還沒抽籤)。
 	CurrentMatchOfPlayer(ctx context.Context, playerID int64) (*match.Match, error)
+	// RoundsByMatches 批次取這些場次的回合(對戰表要顯示比分與進行中的回合)。
+	// WinnerPublicID 由呼叫端用 match.ResolveRoundWinners 補(查詢不 JOIN 選手)。
+	RoundsByMatches(ctx context.Context, matchIDs []int64) (map[int64][]match.Round, error)
 	// Fencers 依 fencer id 批次取跨屆檔案(裁判評段要看歷屆戰績)。
 	// 查不到的 id 不出現在回傳的 map 裡,不是錯誤。
 	Fencers(ctx context.Context, fencerIDs []int64) (map[int64]signup.Fencer, error)
@@ -148,7 +151,7 @@ func MountActivity(mux *http.ServeMux, deps ActivityDeps, opts ...connect.Handle
 	}, opts...))
 	mux.Handle(activityv1connect.NewHandicapServiceHandler(activityHandicapHandler{
 		svc: deps.Handicap, tournaments: deps.Tournament, reader: deps.Reader,
-		sessions: deps.Sessions,
+		sessions: deps.Sessions, matches: deps.Matches,
 	}, opts...))
 	mux.Handle(activityv1connect.NewBettingServiceHandler(activityBettingHandler{
 		svc: deps.Betting,
@@ -157,6 +160,9 @@ func MountActivity(mux *http.ServeMux, deps ActivityDeps, opts ...connect.Handle
 		tournaments: deps.Tournament, matches: deps.Matches, signup: deps.Signup,
 		reader: deps.Reader, prizes: deps.Prizes, directory: deps.Directory,
 		authz: deps.Authorizer, creator: deps.TournamentCreator,
+		// 與 HandicapService 拿的是同一個值:裁判端的檢視只是同一個領域服務的
+		// 另一支方法(RefereeMatchHandicaps),不是另一個實作。
+		handicap: deps.Handicap,
 	}, opts...))
 }
 
@@ -215,7 +221,7 @@ func (h activityTournamentHandler) ListRanks(
 	}
 	return connect.NewResponse(&activityv1.ListRanksResponse{
 		Ranks:        out,
-		BpPerRankGap: view.Config.BPPerRankGap,
+		BpPerRankGap: view.Config.BP.PerRankGap,
 	}), nil
 }
 
@@ -283,13 +289,18 @@ func (h activityTournamentHandler) GetBracket(
 	if err != nil {
 		return nil, toConnectError(err)
 	}
+	// 回合一次撈整屆:對戰表要顯示每場比分與進行中的回合,逐場查是 N 次往返。
+	rounds, err := h.reader.RoundsByMatches(ctx, matchIDs(matches))
+	if err != nil {
+		return nil, toConnectError(err)
+	}
 	inBracket := playersInMatches(players, matches)
 	pbPlayers, err := playersWithAccountsToProto(ctx, h.directory, inBracket, ranksPublished(view.Tournament.Phase))
 	if err != nil {
 		return nil, err
 	}
 	return connect.NewResponse(&activityv1.GetBracketResponse{
-		Rounds:           bracketRoundsToProto(matches),
+		Rounds:           bracketRoundsToProto(matches, rounds),
 		Players:          pbPlayers,
 		BracketPublished: true,
 	}), nil
@@ -333,7 +344,7 @@ func (h activityTournamentHandler) GetMatch(
 	}
 	// bp.Holder 在任一方未評段時回錯。那不是使用者的問題(對戰表在評段前
 	// 根本抽不出來),所以這裡只當成「本場還算不出 BP」,不讓整支 RPC 失敗。
-	if budget, holderIsP1, err := bp.Holder(m.P1.Rank, m.P2.Rank, cfg.BPPerRankGap); err == nil && budget > 0 {
+	if budget, holderIsP1, err := bp.HolderFor(cfg.BP, m.P1.Rank, m.P2.Rank); err == nil && budget > 0 {
 		res.HandicapBudget = budget
 		if holderIsP1 {
 			res.HandicapHolderPublicId = m.P1.PublicID
@@ -427,19 +438,21 @@ func ranksPublished(p tournament.Phase) bool {
 
 func tournamentToProto(v *tournament.View, playerCount int32) *activityv1.Tournament {
 	return &activityv1.Tournament{
-		PublicId:     v.Tournament.PublicID,
-		Slug:         v.Tournament.Slug,
-		Name:         v.Tournament.Name,
-		Phase:        phaseToProto(v.Tournament.Phase),
-		BpPerRankGap: v.Config.BPPerRankGap,
-		PlayerCount:  playerCount,
-		CreatedAt:    tsPB(v.Tournament.CreatedAt),
+		PublicId:        v.Tournament.PublicID,
+		Slug:            v.Tournament.Slug,
+		Name:            v.Tournament.Name,
+		Phase:           phaseToProto(v.Tournament.Phase),
+		BpPerRankGap:    v.Config.BP.PerRankGap,
+		BestOf:          int32(v.Config.Format.BestOf),
+		ThirdPlaceMatch: v.Config.Format.ThirdPlaceMatch,
+		PlayerCount:     playerCount,
+		CreatedAt:       tsPB(v.Tournament.CreatedAt),
 	}
 }
 
 func rankInfoToProto(ri tournament.RankInfo) *activityv1.RankInfo {
 	return &activityv1.RankInfo{
-		Rank:        rankToProto(ri.Rank),
+		Rank:        rankToProto(bp.Rank(ri.Level)),
 		Name:        ri.Name,
 		Title:       ri.Title,
 		Description: ri.Description,
@@ -480,6 +493,9 @@ func matchToProto(m match.Match) *activityv1.Match {
 		StreamUrl:    m.StreamURL,
 		StartedAt:    optTS(m.StartedAt),
 		FinishedAt:   optTS(m.FinishedAt),
+		// 多回合制(2026-09-13):季軍戰以 kind 區分;setup_confirmed_at 空 = 不能開打。
+		Kind:             matchKindToProto(m.Kind),
+		SetupConfirmedAt: optTS(m.SetupConfirmedAt),
 	}
 	if m.P1.Seated() {
 		out.P1PlayerPublicId = m.P1.PublicID
@@ -504,7 +520,8 @@ func matchToProto(m match.Match) *activityv1.Match {
 // 總輪數取自場次的最大 round,再交給 bracket.Shape 推出輪次名稱 ——
 // 「八強」還是「四強」取決於樹的大小,那個規則的權威在 bracket 套件,
 // 不在這裡重寫一份。
-func bracketRoundsToProto(matches []match.Match) []*activityv1.BracketRound {
+// roundsByMatch 可為 nil(呼叫端沒撈回合時);那樣每場的 rounds 為空、勝場數為 0。
+func bracketRoundsToProto(matches []match.Match, roundsByMatch map[int64][]match.Round) []*activityv1.BracketRound {
 	if len(matches) == 0 {
 		return nil
 	}
@@ -522,7 +539,7 @@ func bracketRoundsToProto(matches []match.Match) []*activityv1.BracketRound {
 		if _, ok := byRound[m.Round]; !ok {
 			rounds = append(rounds, m.Round)
 		}
-		byRound[m.Round] = append(byRound[m.Round], matchToProto(m))
+		byRound[m.Round] = append(byRound[m.Round], matchWithRoundsToProto(m, roundsByMatch[m.ID]))
 	}
 	sort.Ints(rounds)
 
@@ -695,4 +712,42 @@ func handicapCategoryToProto(c handicap.Category) activityv1.HandicapCategory {
 	default:
 		return activityv1.HandicapCategory_HANDICAP_CATEGORY_UNSPECIFIED
 	}
+}
+
+// matchWithRoundsToProto 是 matchToProto 加上回合與勝場數。
+//
+// 勝場數由伺服器算好給(match.ScoreOf),避免前端各自數出不同答案;
+// WinnerPublicID 由 ResolveRoundWinners 從場上兩人的 id 對回 public_id(鐵則 5)。
+// 兩者都是衍生值,不存。
+func matchWithRoundsToProto(m match.Match, rounds []match.Round) *activityv1.Match {
+	out := matchToProto(m)
+	if len(rounds) == 0 {
+		return out
+	}
+	m.ResolveRoundWinners(rounds)
+	score := match.ScoreOf(m, rounds)
+	out.Rounds = roundsToProto(rounds)
+	out.P1RoundWins = int32(score.P1Wins)
+	out.P2RoundWins = int32(score.P2Wins)
+	return out
+}
+
+func matchKindToProto(k match.MatchKind) activityv1.MatchKind {
+	switch k {
+	case match.KindBracket:
+		return activityv1.MatchKind_MATCH_KIND_BRACKET
+	case match.KindThirdPlace:
+		return activityv1.MatchKind_MATCH_KIND_THIRD_PLACE
+	default:
+		return activityv1.MatchKind_MATCH_KIND_UNSPECIFIED
+	}
+}
+
+// matchIDs 取內部 id 給批次查詢用;不會離開伺服器。
+func matchIDs(ms []match.Match) []int64 {
+	out := make([]int64, 0, len(ms))
+	for _, m := range ms {
+		out = append(out, m.ID)
+	}
+	return out
 }
