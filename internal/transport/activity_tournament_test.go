@@ -723,3 +723,31 @@ func TestDrawSeedRoundTrip(t *testing.T) {
 		t.Fatalf("0 代表「伺服器自己產」,應轉成空字串,得到 %q", got)
 	}
 }
+
+// 單場查詢要帶回合與勝場數:場次頁的記分板與計時器只有這一個來源。
+// 曾經只有對戰表(GetBracket)帶,場次頁顯示 0:0 與「沒打過任何回合」。
+func TestGetMatchCarriesRoundsAndScore(t *testing.T) {
+	deps, _, reader := baseActivityDeps()
+	reader.matchByPublic = map[string]match.Match{testMatchID: testBracketMatches()[0]}
+	at := time.Unix(1_700_000_000, 0)
+	later := at.Add(90 * time.Second)
+	reader.rounds = map[int64][]match.Round{1: {
+		{RoundNo: 1, StartedAt: at, FinishedAt: &later, WinnerPlayerID: testPlayerBInternal},
+		{RoundNo: 2, StartedAt: later},
+	}}
+	srv := newActivityServer(t, deps)
+	client := activityv1connect.NewTournamentServiceClient(srv.Client(), srv.URL)
+
+	got, err := client.GetMatch(context.Background(), connect.NewRequest(
+		&activityv1.GetMatchRequest{MatchPublicId: testMatchID}))
+	if err != nil {
+		t.Fatalf("GetMatch: %v", err)
+	}
+	m := got.Msg.GetMatch()
+	if len(m.GetRounds()) != 2 || m.GetRounds()[0].GetWinnerPlayerPublicId() != testPlayerBID {
+		t.Fatalf("rounds = %v,要 2 回合且第一回合勝者是 %s", m.GetRounds(), testPlayerBID)
+	}
+	if m.GetP1RoundWins() != 0 || m.GetP2RoundWins() != 1 {
+		t.Fatalf("比數 = %d:%d,want 0:1", m.GetP1RoundWins(), m.GetP2RoundWins())
+	}
+}

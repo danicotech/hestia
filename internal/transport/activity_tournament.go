@@ -331,7 +331,12 @@ func (h activityTournamentHandler) GetMatch(
 	}
 	cfg, _ := tournament.ParseConfig(t.ConfigRaw)
 
-	res := &activityv1.GetMatchResponse{Match: matchToProto(m)}
+	// 場次頁的記分板與計時器都靠 rounds:單場查詢也要帶,不然只有對戰表看得到比數。
+	rounds, err := h.reader.RoundsByMatches(ctx, []int64{m.ID})
+	if err != nil {
+		return nil, toConnectError(err)
+	}
+	res := &activityv1.GetMatchResponse{Match: matchWithRoundsToProto(m, rounds[m.ID])}
 	if p1, err := h.fullPlayer(ctx, m.TournamentID, m.P1); err != nil {
 		return nil, err
 	} else if p1 != nil {
