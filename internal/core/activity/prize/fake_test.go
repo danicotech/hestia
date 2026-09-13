@@ -218,6 +218,18 @@ func fourMatches(ps []tournament.Player) []match.Match {
 	}
 }
 
+// thirdPlaceMatch 季軍戰:與決賽同輪、slot 1、kind 不同。勝者是準決賽敗者之一。
+func thirdPlaceMatch(winnerID int64, p1, p2 tournament.Player) match.Match {
+	return match.Match{
+		ID: 101, PublicID: "01MATCHTHIRD000000000000", TournamentID: 1,
+		Kind:  match.KindThirdPlace,
+		Round: 2, Slot: 1, Status: match.StatusDone, ResultKind: match.ResultNormal,
+		WinnerPlayerID: winnerID,
+		P1:             match.Player{ID: p1.ID, PublicID: p1.PublicID, DisplayName: p1.DisplayName},
+		P2:             match.Player{ID: p2.ID, PublicID: p2.PublicID, DisplayName: p2.DisplayName},
+	}
+}
+
 func (s *scene) award(ctx context.Context) (*AwardResult, error) {
 	return s.svc.AwardPrizes(ctx, AwardParams{TournamentSlug: slug, ActorUserID: judgeUserID})
 }

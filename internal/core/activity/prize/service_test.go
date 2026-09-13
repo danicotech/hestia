@@ -181,7 +181,7 @@ func TestAwardPrizes棄賽者仍拿參賽獎(t *testing.T) {
 	}
 }
 
-func TestAwardPrizes季軍推不出來(t *testing.T) {
+func TestAwardPrizes沒有季軍戰就推不出季軍(t *testing.T) {
 	ps := fourPlayers()
 	s := newScene(`{"prizes":{"champion":1000,"third":300}}`, ps, fourMatches(ps))
 
@@ -192,6 +192,52 @@ func TestAwardPrizes季軍推不出來(t *testing.T) {
 	// 算不出來就一毛都不發:發一半再報錯,裁判得先去帳本查哪些人已經拿到了。
 	if n := s.led.callCount(); n != 0 {
 		t.Errorf("失敗前不該動錢,帳本被呼叫 %d 次", n)
+	}
+}
+
+func TestAwardPrizes季軍戰未分勝負(t *testing.T) {
+	ps := fourPlayers()
+	ms := fourMatches(ps)
+	third := thirdPlaceMatch(0, ps[2], ps[3])
+	third.Status = match.StatusLive
+	ms = append(ms, third)
+	s := newScene(`{"prizes":{"champion":1000,"third":300}}`, ps, ms)
+
+	_, err := s.award(context.Background())
+	if !errors.Is(err, ErrThirdPlaceUndecidable) {
+		t.Fatalf("err = %v,想要 ErrThirdPlaceUndecidable", err)
+	}
+	if n := s.led.callCount(); n != 0 {
+		t.Errorf("失敗前不該動錢,帳本被呼叫 %d 次", n)
+	}
+}
+
+func TestAwardPrizes季軍由季軍戰勝者拿(t *testing.T) {
+	ps := fourPlayers()
+	// 準決賽敗者 ps[2]、ps[3] 打季軍戰,ps[3] 贏。
+	ms := append(fourMatches(ps), thirdPlaceMatch(ps[3].ID, ps[2], ps[3]))
+	s := newScene(`{"prizes":{"champion":1000,"runner_up":500,"third":300}}`, ps, ms)
+
+	res, err := s.award(context.Background())
+	if err != nil {
+		t.Fatalf("AwardPrizes: %v", err)
+	}
+	if len(res.Awards) != 3 {
+		t.Fatalf("獎項筆數 = %d,想要 3:%+v", len(res.Awards), res.Awards)
+	}
+	a := awardOf(t, res, ps[3].PublicID, KindThird)
+	if !a.Granted || a.Amount != 300 {
+		t.Errorf("季軍獎:%+v", a)
+	}
+	// 季軍戰與決賽同輪:決賽的判定不能被季軍戰混淆。
+	if c := awardOf(t, res, ps[0].PublicID, KindChampion); !c.Granted || c.Amount != 1000 {
+		t.Errorf("冠軍獎:%+v", c)
+	}
+	if got := s.led.balance(104); got != 300 {
+		t.Errorf("季軍餘額 = %d,想要 300", got)
+	}
+	if got := s.led.balance(103); got != 0 {
+		t.Errorf("季軍戰敗者餘額 = %d,想要 0", got)
 	}
 }
 

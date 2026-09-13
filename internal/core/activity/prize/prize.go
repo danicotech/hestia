@@ -32,11 +32,12 @@
 // 把剩下的補完,已發的原樣回放。對一個裁判會手動重按的操作來說,可續跑
 // 比全有全無更有用。
 //
-// # 季軍發不出來
+// # 季軍只從季軍戰推
 //
-// 單淘汰沒有季軍賽:bracket 建的樹只有主線,四強的兩個敗者之間沒有任何
-// 比賽可以分出高下。所以 config 設了 prizes.third 又要發獎時,這裡回
-// ErrThirdPlaceUndecidable 而不是自己挑一個(用籤位、用段位、用勝場數
+// 單淘汰的主線推不出季軍:四強的兩個敗者之間沒有比過。季軍獎的唯一依據是
+// 季軍戰(matches.kind = 'third_place',format.third_place_match 開著才會成形)
+// 的勝者。這屆沒開季軍戰、或季軍戰還沒打完,而 config 又設了 prizes.third,
+// 這裡回 ErrThirdPlaceUndecidable 而不是自己挑一個(用籤位、用段位、用勝場數
 // 都是發明規則,而發明出來的規則會直接變成某個人的錢)。
 package prize
 
@@ -58,7 +59,7 @@ const (
 	KindChampion Kind = "champion"
 	// KindRunnerUp 亞軍:決賽敗者(對手棄賽造成的不戰而勝也算,他確實是打到決賽的那一位)。
 	KindRunnerUp Kind = "runner_up"
-	// KindThird 季軍。單淘汰推不出來,見套件註解與 ErrThirdPlaceUndecidable。
+	// KindThird 季軍:季軍戰勝者。沒有季軍戰就發不出來,見套件註解。
 	KindThird Kind = "third"
 	// KindParticipation 參賽獎:發給所有報名者,含已淘汰與已棄賽。
 	KindParticipation Kind = "participation"
@@ -130,11 +131,12 @@ var (
 	// ErrInvalidRequest 表示請求參數不合法。
 	ErrInvalidRequest = errors.New("請求參數不合法")
 
-	// ErrThirdPlaceUndecidable 表示 config 設了季軍獎金,但賽制推不出季軍。
+	// ErrThirdPlaceUndecidable 表示 config 設了季軍獎金,但這屆沒有打完的季軍戰。
 	//
-	// 單淘汰沒有季軍賽,四強的兩個敗者之間沒有比過。要發季軍獎必須先有
-	// 一場能分出勝負的比賽 —— 那是賽制問題,不是這裡能替裁判決定的事。
-	ErrThirdPlaceUndecidable = errors.New("單淘汰賽制沒有季軍賽,推不出季軍")
+	// 四強的兩個敗者之間沒有比過就沒有季軍。要發季軍獎必須先有一場能分出
+	// 勝負的季軍戰 —— 那是賽制設定(format.third_place_match)與賽程的事,
+	// 不是這裡能替裁判決定的事。
+	ErrThirdPlaceUndecidable = errors.New("這屆沒有打完的季軍戰,推不出季軍")
 
 	// ErrFinalNotDecided 表示決賽還沒分出勝負,名次不成立。
 	ErrFinalNotDecided = errors.New("決賽尚未分出勝負,無法決定名次")

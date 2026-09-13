@@ -92,26 +92,36 @@ func (s *Service) AwardPrizes(ctx context.Context, p AwardParams) (*AwardResult,
 func (s *Service) plan(
 	ctx context.Context, t tournament.Tournament, cfg tournament.Config, players []tournament.Player,
 ) ([]Award, error) {
-	// 季軍先擋:它是「不管對戰表長什麼樣都發不出來」的那一種,
-	// 排在最前面才不會讓裁判先收到一個關於決賽的錯誤、修好之後才撞上這個。
-	if cfg.Prizes.Third > 0 {
-		return nil, fmt.Errorf("%w(config 設了 prizes.third = %d)",
-			ErrThirdPlaceUndecidable, cfg.Prizes.Third)
-	}
-
-	awards := make([]Award, 0, len(players)+2)
+	awards := make([]Award, 0, len(players)+3)
 	byID := make(map[int64]tournament.Player, len(players))
 	for _, pl := range players {
 		byID[pl.ID] = pl
 	}
 
-	// 只有真的要發冠亞軍時才去推名次:一屆只設參賽獎的賽事,不該因為
+	// 只有真的要發名次獎時才去讀對戰表:一屆只設參賽獎的賽事,不該因為
 	// 決賽還沒打完就發不了參賽獎。
-	if cfg.Prizes.Champion > 0 || cfg.Prizes.RunnerUp > 0 {
-		matches, err := s.repo.ListMatches(ctx, t.ID)
+	var matches []match.Match
+	if cfg.Prizes.Champion > 0 || cfg.Prizes.RunnerUp > 0 || cfg.Prizes.Third > 0 {
+		var err error
+		matches, err = s.repo.ListMatches(ctx, t.ID)
 		if err != nil {
 			return nil, fmt.Errorf("讀對戰表 tournament=%d: %w", t.ID, err)
 		}
+	}
+	// 季軍先算:它是「賽制沒開就一定發不出來」的那一種,排在決賽之前才不會
+	// 讓裁判先收到一個關於決賽的錯誤、修好之後才撞上這個。
+	if cfg.Prizes.Third > 0 {
+		thirdID, err := thirdPlace(matches)
+		if err != nil {
+			return nil, err
+		}
+		a, err := newAward(byID, thirdID, KindThird, cfg.Prizes.Third)
+		if err != nil {
+			return nil, err
+		}
+		awards = append(awards, a)
+	}
+	if cfg.Prizes.Champion > 0 || cfg.Prizes.RunnerUp > 0 {
 		championID, runnerUpID, err := standings(matches)
 		if err != nil {
 			return nil, err
@@ -214,10 +224,29 @@ func (s *Service) pay(
 	return nil
 }
 
+// thirdPlace 從對戰表推出季軍:唯一依據是打完的季軍戰。
+//
+// 季軍戰以 kind 辨識,不靠座標:它與決賽同輪(bracket.ThirdPlaceSlot),
+// 靠 slot 分會把「季軍戰在哪」這件事在兩個套件各寫一次。
+func thirdPlace(matches []match.Match) (int64, error) {
+	for i := range matches {
+		m := &matches[i]
+		if m.Kind != match.KindThirdPlace {
+			continue
+		}
+		if m.Status != match.StatusDone || m.WinnerPlayerID == 0 {
+			return 0, fmt.Errorf("%w: 季軍戰 %s 目前是 %s", ErrThirdPlaceUndecidable, m.PublicID, m.Status)
+		}
+		return m.WinnerPlayerID, nil
+	}
+	return 0, fmt.Errorf("%w(config 設了 prizes.third,但這屆沒有季軍戰)", ErrThirdPlaceUndecidable)
+}
+
 // standings 從對戰表推出冠亞軍。
 //
 // 決賽 = 最後一輪的 slot 0。單淘汰的最後一輪只有這一場
-// (bracket 的樹寬每輪減半),所以不需要別的判準。
+// (bracket 的樹寬每輪減半);季軍戰雖同輪但在 slot 1 且 kind 不同,
+// 這裡順手排除,不讓它有機會被當成決賽。
 func standings(matches []match.Match) (championID, runnerUpID int64, err error) {
 	totalRounds := 0
 	for _, m := range matches {
@@ -233,7 +262,7 @@ func standings(matches []match.Match) (championID, runnerUpID int64, err error) 
 
 	var final *match.Match
 	for i := range matches {
-		if matches[i].Round == totalRounds && matches[i].Slot == 0 {
+		if matches[i].Round == totalRounds && matches[i].Slot == 0 && matches[i].Kind != match.KindThirdPlace {
 			final = &matches[i]
 			break
 		}
