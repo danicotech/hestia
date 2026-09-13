@@ -103,9 +103,10 @@ SELECT pg_advisory_xact_lock(
 -- 都在這裡排成序;與 handicap 的 LockMatchForHandicap 鎖的是同一列,
 -- 所以「一邊買讓武一邊封盤」也一併被擋住。查無 0 列 → adapter 回 ErrMatchNotFound。
 SELECT
-  m.id, m.public_id, m.tournament_id, m.round, m.slot,
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
   m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
   m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
   m.p1_player_id,
   p1.public_id    AS p1_public_id,
   p1.fencer_id    AS p1_fencer_id,
@@ -130,9 +131,10 @@ FOR UPDATE OF m;
 -- tournament_id 一起進 WHERE 而不是只用 (round, slot):那兩欄只在一屆內唯一。
 -- 查無 0 列 → adapter 回 ErrMatchNotFound,service 再轉成 ErrAdvanceTargetMissing。
 SELECT
-  m.id, m.public_id, m.tournament_id, m.round, m.slot,
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
   m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
   m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
   m.p1_player_id,
   p1.public_id    AS p1_public_id,
   p1.fencer_id    AS p1_fencer_id,
@@ -159,9 +161,10 @@ FOR UPDATE OF m;
 -- 回來要看得到它寫下的 status='locked' 與 handicap_locked_at。
 -- 再加一次 FOR UPDATE 在同一個 tx 裡沒有任何效果,只會多一次寫 xmax 的代價。
 SELECT
-  m.id, m.public_id, m.tournament_id, m.round, m.slot,
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
   m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
   m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
   m.p1_player_id,
   p1.public_id    AS p1_public_id,
   p1.fencer_id    AS p1_fencer_id,
@@ -187,9 +190,10 @@ WHERE m.public_id = sqlc.arg(match_public_id)::text;
 -- 沒有這支的話,adapter 得自己維護一份 tx 內的 id → public_id 對照表,
 -- 那是把 DB 查得到的事實搬進記憶體再維護一次(規則 9)。
 SELECT
-  m.id, m.public_id, m.tournament_id, m.round, m.slot,
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
   m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
   m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
   m.p1_player_id,
   p1.public_id    AS p1_public_id,
   p1.fencer_id    AS p1_fencer_id,
@@ -219,9 +223,10 @@ WHERE m.id = sqlc.arg(id)::bigint;
 -- 含對手未定的場次:呼叫端要看得到它們才判斷得出「這場現在還判不了」,
 -- 留給晉級鏈接手(matches_winner_is_participant_check 也不允許現在就寫勝者)。
 SELECT
-  m.id, m.public_id, m.tournament_id, m.round, m.slot,
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
   m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
   m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
   m.p1_player_id,
   p1.public_id    AS p1_public_id,
   p1.fencer_id    AS p1_fencer_id,
@@ -348,9 +353,10 @@ WITH upd AS (
   RETURNING *
 )
 SELECT
-  m.id, m.public_id, m.tournament_id, m.round, m.slot,
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
   m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
   m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
   m.p1_player_id,
   p1.public_id    AS p1_public_id,
   p1.fencer_id    AS p1_fencer_id,
@@ -382,12 +388,14 @@ WITH upd AS (
       updated_at = now()
   WHERE id = sqlc.arg(match_id)::bigint
     AND status = 'locked'
+    AND setup_confirmed_at IS NOT NULL
   RETURNING *
 )
 SELECT
-  m.id, m.public_id, m.tournament_id, m.round, m.slot,
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
   m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
   m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
   m.p1_player_id,
   p1.public_id    AS p1_public_id,
   p1.fencer_id    AS p1_fencer_id,
@@ -432,9 +440,10 @@ WITH upd AS (
   RETURNING *
 )
 SELECT
-  m.id, m.public_id, m.tournament_id, m.round, m.slot,
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
   m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
   m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
   m.p1_player_id,
   p1.public_id    AS p1_public_id,
   p1.fencer_id    AS p1_fencer_id,
@@ -466,9 +475,10 @@ WITH upd AS (
   RETURNING *
 )
 SELECT
-  m.id, m.public_id, m.tournament_id, m.round, m.slot,
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
   m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
   m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
   m.p1_player_id,
   p1.public_id    AS p1_public_id,
   p1.fencer_id    AS p1_fencer_id,
@@ -516,9 +526,10 @@ WITH upd AS (
   RETURNING *
 )
 SELECT
-  m.id, m.public_id, m.tournament_id, m.round, m.slot,
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
   m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
   m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
   m.p1_player_id,
   p1.public_id    AS p1_public_id,
   p1.fencer_id    AS p1_fencer_id,
@@ -534,6 +545,153 @@ SELECT
 FROM upd m
 LEFT JOIN activity.tournament_players p1 ON p1.id = m.p1_player_id
 LEFT JOIN activity.tournament_players p2 ON p2.id = m.p2_player_id;
+
+-- ══ 開賽前設定確認 ══════════════════════════════════════════════
+
+-- name: ConfirmMatchSetup :one
+-- 裁判看完整張清單按一次「都確認了」(grill Q1/Q9:整體一次確認,不逐項)。
+-- 清單本身是推導值,這裡只寫「誰、什麼時候」。
+--
+-- 三道守門同一句:status = 'locked'(封盤前沒有清單可確認,封盤後才有定案的內容)、
+-- setup_confirmed_at IS NULL(不可重複確認 —— 第二次會蓋掉第一次的時間與人)。
+-- 0 列 → adapter 重讀分辨:查無 / 尚未封盤 / 已確認過。
+-- 回傳形狀與 LockMatchForJudge 逐字相同。
+WITH upd AS (
+  UPDATE activity.matches
+  SET setup_confirmed_at = now(),
+      setup_confirmed_by = sqlc.arg(actor_user_id)::bigint,
+      updated_at = now()
+  WHERE id = sqlc.arg(match_id)::bigint
+    AND status = 'locked'
+    AND setup_confirmed_at IS NULL
+  RETURNING *
+)
+SELECT
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
+  m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
+  m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
+  m.p1_player_id,
+  p1.public_id    AS p1_public_id,
+  p1.fencer_id    AS p1_fencer_id,
+  p1.display_name AS p1_display_name,
+  p1.rank_level   AS p1_rank_level,
+  p1.status       AS p1_status,
+  m.p2_player_id,
+  p2.public_id    AS p2_public_id,
+  p2.fencer_id    AS p2_fencer_id,
+  p2.display_name AS p2_display_name,
+  p2.rank_level   AS p2_rank_level,
+  p2.status       AS p2_status
+FROM upd m
+LEFT JOIN activity.tournament_players p1 ON p1.id = m.p1_player_id
+LEFT JOIN activity.tournament_players p2 ON p2.id = m.p2_player_id;
+
+-- ══ 回合 ════════════════════════════════════════════════════════
+--
+-- 回合列在裁判按「正式決鬥開始」時建,不預建(00006 檔頭)。所以「開始第 N 回合」
+-- 就是 INSERT;started_at 由 DEFAULT now() 給 —— core 不該有第二個時鐘。
+-- 第一回合開始時 matches.started_at 也要寫(那是下注關盤點),由 MarkMatchLive 負責,
+-- 兩句在同一個 tx 裡。match_rounds_match_round_uq 讓「同一回合開始兩次」是 23505。
+
+-- name: InsertMatchRound :one
+INSERT INTO activity.match_rounds (match_id, round_no)
+VALUES (sqlc.arg(match_id)::bigint, sqlc.arg(round_no)::int)
+RETURNING id, match_id, round_no, started_at, finished_at, winner_player_id, created_at;
+
+-- name: FinishMatchRound :one
+-- 填該回合勝者。finished_at IS NULL 是「一回合只結束一次」的 DB 側保證;
+-- 0 列 = 查無此回合或已結束,adapter 重讀分辨。勝者必須是場上兩人之一由 service 擋
+--(DB 無法跨表 CHECK)。finished_at >= started_at 由 match_rounds_order_check 守。
+UPDATE activity.match_rounds
+SET winner_player_id = sqlc.arg(winner_player_id)::bigint,
+    finished_at = now()
+WHERE match_id = sqlc.arg(match_id)::bigint
+  AND round_no = sqlc.arg(round_no)::int
+  AND finished_at IS NULL
+RETURNING id, match_id, round_no, started_at, finished_at, winner_player_id, created_at;
+
+-- name: ListMatchRounds :many
+-- 一場的全部回合,依 round_no。回合比數與整場勝者都從這裡算(衍生值不存)。
+-- 無鎖:讀取路徑(對戰表、計時器、結算)都用它;寫入路徑已持有 matches 列鎖。
+SELECT id, match_id, round_no, started_at, finished_at, winner_player_id, created_at
+FROM activity.match_rounds
+WHERE match_id = sqlc.arg(match_id)::bigint
+ORDER BY round_no;
+
+-- name: ListMatchRoundsByMatches :many
+-- 批次版(對戰表一次撈整屆的回合)。順序 (match_id, round_no),呼叫端自己分組。
+SELECT id, match_id, round_no, started_at, finished_at, winner_player_id, created_at
+FROM activity.match_rounds
+WHERE match_id = ANY(sqlc.arg(match_ids)::bigint[])
+ORDER BY match_id, round_no;
+
+-- ══ 季軍戰 ══════════════════════════════════════════════════════
+
+-- name: InsertThirdPlaceMatch :one
+-- 準決賽兩場都 done 之後建季軍戰(config.format.third_place_match = true 時)。
+-- kind = 'third_place'、雙方已知、狀態 pending(等裁判開盤,與其他場次一樣走完整流程)。
+-- round 記為決賽那一輪、slot 由呼叫端給(bracket 套件決定,這裡不推)。
+-- UNIQUE (tournament_id, round, slot) 讓重複建是 23505,不是靜靜多一場。
+-- 回傳形狀與 LockMatchForJudge 逐字相同。
+WITH ins AS (
+  INSERT INTO activity.matches (
+    tournament_id, public_id, round, slot, kind, p1_player_id, p2_player_id, status
+  )
+  VALUES (
+    sqlc.arg(tournament_id)::bigint, sqlc.arg(public_id)::text,
+    sqlc.arg(round)::int, sqlc.arg(slot)::int, 'third_place',
+    sqlc.arg(p1_player_id)::bigint, sqlc.arg(p2_player_id)::bigint, 'pending'
+  )
+  RETURNING *
+)
+SELECT
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
+  m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
+  m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
+  m.p1_player_id,
+  p1.public_id    AS p1_public_id,
+  p1.fencer_id    AS p1_fencer_id,
+  p1.display_name AS p1_display_name,
+  p1.rank_level   AS p1_rank_level,
+  p1.status       AS p1_status,
+  m.p2_player_id,
+  p2.public_id    AS p2_public_id,
+  p2.fencer_id    AS p2_fencer_id,
+  p2.display_name AS p2_display_name,
+  p2.rank_level   AS p2_rank_level,
+  p2.status       AS p2_status
+FROM ins m
+LEFT JOIN activity.tournament_players p1 ON p1.id = m.p1_player_id
+LEFT JOIN activity.tournament_players p2 ON p2.id = m.p2_player_id;
+
+-- name: FindThirdPlaceMatch :one
+-- 本屆的季軍戰(至多一場)。查無 0 列 → adapter 回 nil,不是錯誤:
+-- 沒建就是「還沒到那一步」或「這屆不打季軍戰」。無鎖。
+SELECT
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
+  m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
+  m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
+  m.p1_player_id,
+  p1.public_id    AS p1_public_id,
+  p1.fencer_id    AS p1_fencer_id,
+  p1.display_name AS p1_display_name,
+  p1.rank_level   AS p1_rank_level,
+  p1.status       AS p1_status,
+  m.p2_player_id,
+  p2.public_id    AS p2_public_id,
+  p2.fencer_id    AS p2_fencer_id,
+  p2.display_name AS p2_display_name,
+  p2.rank_level   AS p2_rank_level,
+  p2.status       AS p2_status
+FROM activity.matches m
+LEFT JOIN activity.tournament_players p1 ON p1.id = m.p1_player_id
+LEFT JOIN activity.tournament_players p2 ON p2.id = m.p2_player_id
+WHERE m.tournament_id = sqlc.arg(tournament_id)::bigint
+  AND m.kind = 'third_place'
+LIMIT 1;
 
 -- ══ 即時戰況推播 ════════════════════════════════════════════════
 

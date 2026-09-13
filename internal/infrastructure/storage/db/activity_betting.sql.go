@@ -198,11 +198,16 @@ func (q *Queries) BettingMatchesByPublicIDs(ctx context.Context, publicIds []str
 
 const bettingOddsConfig = `-- name: BettingOddsConfig :one
 SELECT
-  COALESCE(substring(t.config -> 'odds' ->> 'smoothing'        FROM '^-?[0-9]{1,18}$'), '0')::bigint AS smoothing_votes,
-  COALESCE(substring(t.config -> 'odds' ->> 'vig_bps'          FROM '^-?[0-9]{1,18}$'), '0')::bigint AS vig_bps,
-  COALESCE(substring(t.config -> 'odds' ->> 'min_odds_milli'   FROM '^-?[0-9]{1,18}$'), '0')::bigint AS min_odds_milli,
-  COALESCE(substring(t.config -> 'odds' ->> 'max_odds_milli'   FROM '^-?[0-9]{1,18}$'), '0')::bigint AS max_odds_milli,
-  COALESCE(substring(t.config -> 'odds' ->> 'max_parlay_milli' FROM '^-?[0-9]{1,18}$'), '0')::bigint AS max_parlay_milli,
+  -- v2 config 在 betting.odds,v1 在頂層 odds(schemas/28「從 version 1 升版」);兩者都缺時 0 → Normalize 補預設。
+  COALESCE(substring(COALESCE(t.config -> 'betting' -> 'odds', t.config -> 'odds') ->> 'smoothing'        FROM '^-?[0-9]{1,18}$'), '0')::bigint AS smoothing_votes,
+  COALESCE(substring(COALESCE(t.config -> 'betting' -> 'odds', t.config -> 'odds') ->> 'vig_bps'          FROM '^-?[0-9]{1,18}$'), '0')::bigint AS vig_bps,
+  COALESCE(substring(COALESCE(t.config -> 'betting' -> 'odds', t.config -> 'odds') ->> 'min_odds_milli'   FROM '^-?[0-9]{1,18}$'), '0')::bigint AS min_odds_milli,
+  COALESCE(substring(COALESCE(t.config -> 'betting' -> 'odds', t.config -> 'odds') ->> 'max_odds_milli'   FROM '^-?[0-9]{1,18}$'), '0')::bigint AS max_odds_milli,
+  COALESCE(substring(COALESCE(t.config -> 'betting' -> 'odds', t.config -> 'odds') ->> 'max_parlay_milli' FROM '^-?[0-9]{1,18}$'), '0')::bigint AS max_parlay_milli,
+  -- 比分盤的結果數由 best_of 推導(3 → 4 種);缺鍵 = 1(單場定勝負)。
+  COALESCE(substring(t.config -> 'format' ->> 'best_of' FROM '^[0-9]{1,3}$'), '1')::int AS best_of,
+  -- 盤口清單與串關規則整包交給 core(rules 套件)解析,SQL 不知道 kind 的名字。
+  COALESCE(t.config -> 'betting', '{}'::jsonb) AS betting_rules,
   -- max_stake 的權威在 **platform.economy_configs**,不在 tournaments.config。
   --
   -- 單注上限是平台層的風險控制,不是逐屆的玩法旋鈕 —— schemas/21 就是這樣訂的
@@ -231,10 +236,12 @@ type BettingOddsConfigRow struct {
 	MinOddsMilli   int64
 	MaxOddsMilli   int64
 	MaxParlayMilli int64
+	BestOf         int32
+	BettingRules   interface{}
 	MaxStake       int64
 }
 
-// 賠率參數。tournaments.config 是逐屆規則的唯一權威(同 bp_per_rank_gap 的取法),
+// 賠率參數。tournaments.config 是逐屆規則的唯一權威(同 bp.per_rank_gap 的取法),
 // 這裡只負責「把 JSONB 取成整數」,預設值一律不寫在 SQL 裡 ——
 // 權威在 betting.OddsConfig.Normalize(),缺值回 0 由它補,兩邊各寫一份就會漂移。
 //
@@ -257,6 +264,8 @@ func (q *Queries) BettingOddsConfig(ctx context.Context, tournamentID int64) (Be
 		&i.MinOddsMilli,
 		&i.MaxOddsMilli,
 		&i.MaxParlayMilli,
+		&i.BestOf,
+		&i.BettingRules,
 		&i.MaxStake,
 	)
 	return i, err
@@ -280,6 +289,83 @@ func (q *Queries) BettingTournamentBySlug(ctx context.Context, slug string) (Bet
 	var i BettingTournamentBySlugRow
 	err := row.Scan(&i.ID, &i.Slug)
 	return i, err
+}
+
+const closeMatchMarkets = `-- name: CloseMatchMarkets :execrows
+UPDATE activity.markets
+SET status = 'closed'
+WHERE match_id = $1::bigint AND status = 'open'
+`
+
+// 關盤:該場所有 open 的盤口一起 closed(grill Q11/Q20:第一回合正式決鬥開始即關,
+// 不逐回合重開)。呼叫位置是 MarkMatchLive 的同一個 tx。影響列數回給 adapter 核對。
+func (q *Queries) CloseMatchMarkets(ctx context.Context, matchID int64) (int64, error) {
+	result, err := q.db.Exec(ctx, closeMatchMarkets, matchID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const getMarketByPublicID = `-- name: GetMarketByPublicID :one
+SELECT id, public_id, match_id, kind, round_no, params, status, created_at, settled_at
+FROM activity.markets
+WHERE public_id = $1::text
+`
+
+// 下注與投票以盤口的 public_id 定址。查無 0 列 → ErrMarketNotFound。
+func (q *Queries) GetMarketByPublicID(ctx context.Context, publicID string) (ActivityMarket, error) {
+	row := q.db.QueryRow(ctx, getMarketByPublicID, publicID)
+	var i ActivityMarket
+	err := row.Scan(
+		&i.ID,
+		&i.PublicID,
+		&i.MatchID,
+		&i.Kind,
+		&i.RoundNo,
+		&i.Params,
+		&i.Status,
+		&i.CreatedAt,
+		&i.SettledAt,
+	)
+	return i, err
+}
+
+const getMarketsByPublicIDs = `-- name: GetMarketsByPublicIDs :many
+SELECT id, public_id, match_id, kind, round_no, params, status, created_at, settled_at
+FROM activity.markets
+WHERE public_id = ANY($1::text[])
+`
+
+// 批次版(串關一次帶多腿)。順序不拘,呼叫端自己用 public_id 索引。
+func (q *Queries) GetMarketsByPublicIDs(ctx context.Context, publicIds []string) ([]ActivityMarket, error) {
+	rows, err := q.db.Query(ctx, getMarketsByPublicIDs, publicIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ActivityMarket
+	for rows.Next() {
+		var i ActivityMarket
+		if err := rows.Scan(
+			&i.ID,
+			&i.PublicID,
+			&i.MatchID,
+			&i.Kind,
+			&i.RoundNo,
+			&i.Params,
+			&i.Status,
+			&i.CreatedAt,
+			&i.SettledAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const insertBet = `-- name: InsertBet :one
@@ -325,20 +411,22 @@ func (q *Queries) InsertBet(ctx context.Context, arg InsertBetParams) (InsertBet
 }
 
 const insertBetLegs = `-- name: InsertBetLegs :execrows
-INSERT INTO activity.bet_legs (bet_id, match_id, side, odds_milli)
-SELECT $1, v.match_id, v.side, v.odds_milli
+INSERT INTO activity.bet_legs (bet_id, match_id, market_id, outcome, odds_milli)
+SELECT $1, v.match_id, v.market_id, v.outcome, v.odds_milli
 FROM (
   SELECT
     unnest($2::bigint[])  AS match_id,
-    unnest($3::smallint[])    AS side,
-    unnest($4::bigint[]) AS odds_milli
+    unnest($3::bigint[]) AS market_id,
+    unnest($4::text[])     AS outcome,
+    unnest($5::bigint[]) AS odds_milli
 ) AS v
 `
 
 type InsertBetLegsParams struct {
 	BetID     int64
 	MatchIds  []int64
-	Sides     []int16
+	MarketIds []int64
+	Outcomes  []string
 	OddsMilli []int64
 }
 
@@ -359,7 +447,8 @@ func (q *Queries) InsertBetLegs(ctx context.Context, arg InsertBetLegsParams) (i
 	result, err := q.db.Exec(ctx, insertBetLegs,
 		arg.BetID,
 		arg.MatchIds,
-		arg.Sides,
+		arg.MarketIds,
+		arg.Outcomes,
 		arg.OddsMilli,
 	)
 	if err != nil {
@@ -368,16 +457,89 @@ func (q *Queries) InsertBetLegs(ctx context.Context, arg InsertBetLegsParams) (i
 	return result.RowsAffected(), nil
 }
 
+const insertMarkets = `-- name: InsertMarkets :many
+
+INSERT INTO activity.markets (public_id, match_id, kind, round_no, params)
+SELECT v.public_id, $1::bigint, v.kind, NULLIF(v.round_no, 0), v.params::jsonb
+FROM (
+  SELECT
+    unnest($2::text[]) AS public_id,
+    unnest($3::text[])      AS kind,
+    unnest($4::int[])   AS round_no,
+    unnest($5::text[])     AS params
+) AS v
+RETURNING id, public_id, match_id, kind, round_no, params, status, created_at, settled_at
+`
+
+type InsertMarketsParams struct {
+	MatchID   int64
+	PublicIds []string
+	Kinds     []string
+	RoundNos  []int32
+	Params    []string
+}
+
+// ══ 盤口 ════════════════════════════════════════════════════════
+//
+// 盤口是資料列(00007 檔頭):哪些存在由 config.betting.markets 決定,場次進入 ready 時
+// 由 match 套件透過 betting 埠建列。結果(outcome)不存,由 kind + config 推導。
+// 一場一次建齊。unnest 批次(同 InsertBetLegs 的理由:半套盤口比整批失敗糟)。
+// round_no 以 int[] 傳入,NULL 用 0 佔位再 NULLIF 回 NULL —— 陣列元素表達不了 NULL。
+// params 以 text[] 傳入再 cast(同 InsertHandicapItems)。public_id 由 adapter 產生。
+// 撞到 markets_match_kind_line_uq 是 23505:同一場建兩次盤口必須出聲。
+func (q *Queries) InsertMarkets(ctx context.Context, arg InsertMarketsParams) ([]ActivityMarket, error) {
+	rows, err := q.db.Query(ctx, insertMarkets,
+		arg.MatchID,
+		arg.PublicIds,
+		arg.Kinds,
+		arg.RoundNos,
+		arg.Params,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ActivityMarket
+	for rows.Next() {
+		var i ActivityMarket
+		if err := rows.Scan(
+			&i.ID,
+			&i.PublicID,
+			&i.MatchID,
+			&i.Kind,
+			&i.RoundNo,
+			&i.Params,
+			&i.Status,
+			&i.CreatedAt,
+			&i.SettledAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const legsByBetIDs = `-- name: LegsByBetIDs :many
 SELECT
-  l.id, l.bet_id, l.match_id, l.side, l.odds_milli, l.result,
+  l.id, l.bet_id, l.match_id, l.odds_milli, l.result, l.market_id, l.outcome,
   m.public_id AS match_public_id,
   m.round,
   m.slot,
-  COALESCE(CASE l.side WHEN 1 THEN p1.display_name WHEN 2 THEN p2.display_name END, '')::text
-    AS side_display_name
+  mk.public_id AS market_public_id,
+  mk.kind      AS market_kind,
+  mk.round_no  AS market_round_no,
+  mk.params    AS market_params,
+  -- 結果的顯示名由 core 依 kind 組(p1/p2 → 選手名;over/under → 大於/小於線;
+  -- 比分 → 2:0);SQL 只把兩位選手的名字帶回去,不在這裡重做一次 outcome 的語意。
+  COALESCE(p1.display_name, '')::text AS p1_display_name,
+  COALESCE(p2.display_name, '')::text AS p2_display_name
 FROM activity.bet_legs l
 JOIN activity.matches m                  ON m.id = l.match_id
+JOIN activity.markets mk                 ON mk.id = l.market_id
 LEFT JOIN activity.tournament_players p1 ON p1.id = m.p1_player_id
 LEFT JOIN activity.tournament_players p2 ON p2.id = m.p2_player_id
 WHERE l.bet_id = ANY($1::bigint[])
@@ -385,16 +547,22 @@ ORDER BY l.bet_id, l.id
 `
 
 type LegsByBetIDsRow struct {
-	ID              int64
-	BetID           int64
-	MatchID         int64
-	Side            int16
-	OddsMilli       int64
-	Result          string
-	MatchPublicID   string
-	Round           int32
-	Slot            int32
-	SideDisplayName string
+	ID             int64
+	BetID          int64
+	MatchID        int64
+	OddsMilli      int64
+	Result         string
+	MarketID       int64
+	Outcome        string
+	MatchPublicID  string
+	Round          int32
+	Slot           int32
+	MarketPublicID string
+	MarketKind     string
+	MarketRoundNo  *int32
+	MarketParams   []byte
+	P1DisplayName  string
+	P2DisplayName  string
 }
 
 // 讀這些注單的**全部**腿(含已判定的)。
@@ -419,13 +587,57 @@ func (q *Queries) LegsByBetIDs(ctx context.Context, betIds []int64) ([]LegsByBet
 			&i.ID,
 			&i.BetID,
 			&i.MatchID,
-			&i.Side,
 			&i.OddsMilli,
 			&i.Result,
+			&i.MarketID,
+			&i.Outcome,
 			&i.MatchPublicID,
 			&i.Round,
 			&i.Slot,
-			&i.SideDisplayName,
+			&i.MarketPublicID,
+			&i.MarketKind,
+			&i.MarketRoundNo,
+			&i.MarketParams,
+			&i.P1DisplayName,
+			&i.P2DisplayName,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listMarketsByMatches = `-- name: ListMarketsByMatches :many
+SELECT id, public_id, match_id, kind, round_no, params, status, created_at, settled_at
+FROM activity.markets
+WHERE match_id = ANY($1::bigint[])
+ORDER BY match_id, kind, round_no NULLS FIRST, id
+`
+
+// 批次讀盤口(GetOdds 一次帶整輪)。順序 (match_id, kind, round_no) 讓前端呈現穩定。
+func (q *Queries) ListMarketsByMatches(ctx context.Context, matchIds []int64) ([]ActivityMarket, error) {
+	rows, err := q.db.Query(ctx, listMarketsByMatches, matchIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ActivityMarket
+	for rows.Next() {
+		var i ActivityMarket
+		if err := rows.Scan(
+			&i.ID,
+			&i.PublicID,
+			&i.MatchID,
+			&i.Kind,
+			&i.RoundNo,
+			&i.Params,
+			&i.Status,
+			&i.CreatedAt,
+			&i.SettledAt,
 		); err != nil {
 			return nil, err
 		}
@@ -551,35 +763,35 @@ func (q *Queries) LockUserForBet(ctx context.Context, userID int64) (int64, erro
 	return id, err
 }
 
-const myVotesByMatch = `-- name: MyVotesByMatch :many
-SELECT match_id, side FROM activity.votes
+const myVotesByMarkets = `-- name: MyVotesByMarkets :many
+SELECT market_id, outcome FROM activity.votes
 WHERE user_id = $1
-  AND match_id = ANY($2::bigint[])
+  AND market_id = ANY($2::bigint[])
 `
 
-type MyVotesByMatchParams struct {
-	UserID   int64
-	MatchIds []int64
+type MyVotesByMarketsParams struct {
+	UserID    int64
+	MarketIds []int64
 }
 
-type MyVotesByMatchRow struct {
-	MatchID int64
-	Side    int16
+type MyVotesByMarketsRow struct {
+	MarketID int64
+	Outcome  string
 }
 
 // **只查請求者自己的票。** user_id 是必填參數,不是可選過濾條件 ——
 // 沒有它就變成「列出這些場次的所有投票」,那正是 VoteTalliesByMatch 註解裡
 // 不能存在的那支查詢。要看別人投給誰,這裡沒有路。
-func (q *Queries) MyVotesByMatch(ctx context.Context, arg MyVotesByMatchParams) ([]MyVotesByMatchRow, error) {
-	rows, err := q.db.Query(ctx, myVotesByMatch, arg.UserID, arg.MatchIds)
+func (q *Queries) MyVotesByMarkets(ctx context.Context, arg MyVotesByMarketsParams) ([]MyVotesByMarketsRow, error) {
+	rows, err := q.db.Query(ctx, myVotesByMarkets, arg.UserID, arg.MarketIds)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []MyVotesByMatchRow
+	var items []MyVotesByMarketsRow
 	for rows.Next() {
-		var i MyVotesByMatchRow
-		if err := rows.Scan(&i.MatchID, &i.Side); err != nil {
+		var i MyVotesByMarketsRow
+		if err := rows.Scan(&i.MarketID, &i.Outcome); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -596,15 +808,16 @@ SELECT pg_notify(
   $1::text,
   json_build_object('t', t.slug, 'k', $2::text, 'r', m.public_id)::text
 )
-FROM activity.matches m
+FROM activity.markets mk
+JOIN activity.matches m     ON m.id = mk.match_id
 JOIN activity.tournaments t ON t.id = m.tournament_id
-WHERE m.id = $3
+WHERE mk.id = $3
 `
 
 type NotifyWatchOddsParams struct {
-	Channel string
-	Kind    string
-	MatchID int64
+	Channel  string
+	Kind     string
+	MarketID int64
 }
 
 // ══ 即時戰況推播 ════════════════════════════════════════════════
@@ -625,7 +838,7 @@ type NotifyWatchOddsParams struct {
 // 同一個交易裡對同一場投兩次票只會送一則:Postgres 會把 (channel, payload)
 // 完全相同的通知去重,而投票的信封不含票數,內容天生相同。
 func (q *Queries) NotifyWatchOdds(ctx context.Context, arg NotifyWatchOddsParams) error {
-	_, err := q.db.Exec(ctx, notifyWatchOdds, arg.Channel, arg.Kind, arg.MatchID)
+	_, err := q.db.Exec(ctx, notifyWatchOdds, arg.Channel, arg.Kind, arg.MarketID)
 	return err
 }
 
@@ -681,9 +894,85 @@ func (q *Queries) OpenBetsByUser(ctx context.Context, arg OpenBetsByUserParams) 
 	return items, nil
 }
 
+const openMarketsByMatch = `-- name: OpenMarketsByMatch :many
+SELECT id, public_id, match_id, kind, round_no, params, status, created_at, settled_at
+FROM activity.markets
+WHERE match_id = $1::bigint AND status IN ('open', 'closed')
+ORDER BY id
+`
+
+// 場次 done 時要把「沒打到的回合」的盤口標 void(schemas/21「沒打到的回合」):
+// 這一支列出該場尚未結算的盤口,core 依 kind / round_no 與實際回合數決定各自的命運。
+func (q *Queries) OpenMarketsByMatch(ctx context.Context, matchID int64) ([]ActivityMarket, error) {
+	rows, err := q.db.Query(ctx, openMarketsByMatch, matchID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ActivityMarket
+	for rows.Next() {
+		var i ActivityMarket
+		if err := rows.Scan(
+			&i.ID,
+			&i.PublicID,
+			&i.MatchID,
+			&i.Kind,
+			&i.RoundNo,
+			&i.Params,
+			&i.Status,
+			&i.CreatedAt,
+			&i.SettledAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const pendingLegsByMarket = `-- name: PendingLegsByMarket :many
+SELECT id, bet_id, match_id, odds_milli, result, market_id, outcome FROM activity.bet_legs
+WHERE market_id = $1::bigint AND result = 'pending'
+ORDER BY bet_id, id
+`
+
+// 撈出押到這個盤口、還沒判定的腿(逐盤口結算:round_winner / duration 在該回合結束時,
+// match_winner / score 在場次 done 時)。走 bet_legs_market_result_idx。
+// ORDER BY bet_id, id 同 PendingLegsByMatch 的理由:取鎖順序是防死鎖的全部。
+func (q *Queries) PendingLegsByMarket(ctx context.Context, marketID int64) ([]ActivityBetLeg, error) {
+	rows, err := q.db.Query(ctx, pendingLegsByMarket, marketID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ActivityBetLeg
+	for rows.Next() {
+		var i ActivityBetLeg
+		if err := rows.Scan(
+			&i.ID,
+			&i.BetID,
+			&i.MatchID,
+			&i.OddsMilli,
+			&i.Result,
+			&i.MarketID,
+			&i.Outcome,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const pendingLegsByMatch = `-- name: PendingLegsByMatch :many
 
-SELECT id, bet_id, match_id, side, odds_milli, result FROM activity.bet_legs
+SELECT id, bet_id, match_id, odds_milli, result, market_id, outcome FROM activity.bet_legs
 WHERE match_id = $1 AND result = 'pending'
 ORDER BY bet_id, id
 `
@@ -710,9 +999,10 @@ func (q *Queries) PendingLegsByMatch(ctx context.Context, matchID int64) ([]Acti
 			&i.ID,
 			&i.BetID,
 			&i.MatchID,
-			&i.Side,
 			&i.OddsMilli,
 			&i.Result,
+			&i.MarketID,
+			&i.Outcome,
 		); err != nil {
 			return nil, err
 		}
@@ -745,6 +1035,29 @@ type SetBetStakeEntryParams struct {
 // 查詢的參數不可以 —— 「補上分錄 id」傳 NULL 是沒有意義的呼叫,不該在型別上存在。
 func (q *Queries) SetBetStakeEntry(ctx context.Context, arg SetBetStakeEntryParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setBetStakeEntry, arg.EntryID, arg.BetID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const settleMarket = `-- name: SettleMarket :execrows
+UPDATE activity.markets
+SET status = $1::text,
+    settled_at = now()
+WHERE id = $2::bigint AND status IN ('open', 'closed')
+`
+
+type SettleMarketParams struct {
+	Status   string
+	MarketID int64
+}
+
+// 把一個盤口標成 settled 或 void。status IN ('open','closed') 是「一個盤口只結算一次」
+// 的 DB 側保證;settled_at 由 DB 給(markets_settled_at_check 要求兩者同生共死)。
+// 0 列 = 已結算過或查無,adapter 出聲。
+func (q *Queries) SettleMarket(ctx context.Context, arg SettleMarketParams) (int64, error) {
+	result, err := q.db.Exec(ctx, settleMarket, arg.Status, arg.MarketID)
 	if err != nil {
 		return 0, err
 	}
@@ -829,21 +1142,21 @@ func (q *Queries) UpdateLegResults(ctx context.Context, arg UpdateLegResultsPara
 }
 
 const upsertVote = `-- name: UpsertVote :exec
-INSERT INTO activity.votes (match_id, user_id, side)
-VALUES ($1, $2, $3::smallint)
-ON CONFLICT (match_id, user_id) DO UPDATE
-SET side = EXCLUDED.side, updated_at = now()
+INSERT INTO activity.votes (market_id, user_id, outcome)
+VALUES ($1, $2, $3::text)
+ON CONFLICT (market_id, user_id) DO UPDATE
+SET outcome = EXCLUDED.outcome, updated_at = now()
 `
 
 type UpsertVoteParams struct {
-	MatchID int64
-	UserID  int64
-	Side    int16
+	MarketID int64
+	UserID   int64
+	Outcome  string
 }
 
-// 一場一票,改票即覆寫。
+// 一場每盤口一票,改票即覆寫(grill Q19:每個盤口各自投票)。
 //
-// 權威是 votes_match_user_uq (match_id, user_id) 這條 UNIQUE,不是應用層的
+// 權威是 votes_market_user_uq (market_id, user_id) 這條 UNIQUE,不是應用層的
 // 「先查再決定 insert 還是 update」—— 那個寫法在併發連點下會兩邊都查不到、
 // 兩邊都 insert,第二筆撞鍵報錯,使用者看到的是「投票失敗」。
 // ON CONFLICT DO UPDATE 讓連點變成冪等:最後一次的 side 勝出。
@@ -851,29 +1164,26 @@ type UpsertVoteParams struct {
 // 改票不新增列:votes 是「當下的票」,不是投票史。要看變更時間有 updated_at,
 // 而賠率只認當下 —— 留一串舊票只會讓 count 把同一個人算好幾次。
 func (q *Queries) UpsertVote(ctx context.Context, arg UpsertVoteParams) error {
-	_, err := q.db.Exec(ctx, upsertVote, arg.MatchID, arg.UserID, arg.Side)
+	_, err := q.db.Exec(ctx, upsertVote, arg.MarketID, arg.UserID, arg.Outcome)
 	return err
 }
 
-const voteTalliesByMatch = `-- name: VoteTalliesByMatch :many
+const voteTalliesByMarkets = `-- name: VoteTalliesByMarkets :many
 
-SELECT
-  match_id,
-  count(*) FILTER (WHERE side = 1)::bigint AS p1_votes,
-  count(*) FILTER (WHERE side = 2)::bigint AS p2_votes
+SELECT market_id, outcome, count(*)::bigint AS votes
 FROM activity.votes
-WHERE match_id = ANY($1::bigint[])
-GROUP BY match_id
+WHERE market_id = ANY($1::bigint[])
+GROUP BY market_id, outcome
 `
 
-type VoteTalliesByMatchRow struct {
-	MatchID int64
-	P1Votes int64
-	P2Votes int64
+type VoteTalliesByMarketsRow struct {
+	MarketID int64
+	Outcome  string
+	Votes    int64
 }
 
 // ══ 投票 ════════════════════════════════════════════════════════
-// 數票:每場每邊各幾票。**只回票數,永不回傳誰投給誰。**
+// 數票:每盤口每結果各幾票。**只回票數,永不回傳誰投給誰。**
 //
 // 這不是效能考量也不是隱私加分項:票數直接推導賠率,公開投票人等於公開可操縱的標的
 // (誰灌了票、該去說服誰改票)。所以這支查詢在型別上就沒有 user_id 可以洩漏,
@@ -881,16 +1191,16 @@ type VoteTalliesByMatchRow struct {
 //
 // 沒人投票的場次不會有列 —— 呼叫端 map 查不到即零票,零票時平滑參數會給出兩邊
 // 相同的賠率,不需要在 SQL 補空列。走 votes_match_side_idx。
-func (q *Queries) VoteTalliesByMatch(ctx context.Context, matchIds []int64) ([]VoteTalliesByMatchRow, error) {
-	rows, err := q.db.Query(ctx, voteTalliesByMatch, matchIds)
+func (q *Queries) VoteTalliesByMarkets(ctx context.Context, marketIds []int64) ([]VoteTalliesByMarketsRow, error) {
+	rows, err := q.db.Query(ctx, voteTalliesByMarkets, marketIds)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []VoteTalliesByMatchRow
+	var items []VoteTalliesByMarketsRow
 	for rows.Next() {
-		var i VoteTalliesByMatchRow
-		if err := rows.Scan(&i.MatchID, &i.P1Votes, &i.P2Votes); err != nil {
+		var i VoteTalliesByMarketsRow
+		if err := rows.Scan(&i.MarketID, &i.Outcome, &i.Votes); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

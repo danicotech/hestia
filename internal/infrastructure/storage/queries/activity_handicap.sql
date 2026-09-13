@@ -34,7 +34,10 @@ SELECT
   p2.public_id AS p2_player_public_id,
   p1.rank_level AS p1_rank_level,
   p2.rank_level AS p2_rank_level,
-  COALESCE(NULLIF(t.config ->> 'bp_per_rank_gap', ''), '0')::bigint AS per_rank_gap
+  -- v2 config 在 bp.per_rank_gap,v1 在頂層 bp_per_rank_gap(schemas/28「從 version 1 升版」)。
+  -- 兩者都缺時回 0,由 bp 套件退回預設值 8。
+  COALESCE(NULLIF(t.config -> 'bp' ->> 'per_rank_gap', ''),
+           NULLIF(t.config ->> 'bp_per_rank_gap', ''), '0')::bigint AS per_rank_gap
 FROM activity.matches m
 JOIN activity.tournaments t ON t.id = m.tournament_id
 LEFT JOIN activity.tournament_players p1 ON p1.id = m.p1_player_id
@@ -54,7 +57,10 @@ SELECT
   p2.public_id AS p2_player_public_id,
   p1.rank_level AS p1_rank_level,
   p2.rank_level AS p2_rank_level,
-  COALESCE(NULLIF(t.config ->> 'bp_per_rank_gap', ''), '0')::bigint AS per_rank_gap
+  -- v2 config 在 bp.per_rank_gap,v1 在頂層 bp_per_rank_gap(schemas/28「從 version 1 升版」)。
+  -- 兩者都缺時回 0,由 bp 套件退回預設值 8。
+  COALESCE(NULLIF(t.config -> 'bp' ->> 'per_rank_gap', ''),
+           NULLIF(t.config ->> 'bp_per_rank_gap', ''), '0')::bigint AS per_rank_gap
 FROM activity.matches m
 JOIN activity.tournaments t ON t.id = m.tournament_id
 LEFT JOIN activity.tournament_players p1 ON p1.id = m.p1_player_id
@@ -80,8 +86,8 @@ WHERE id = sqlc.arg(match_id) AND handicap_locked_at IS NULL;
 -- 排序即前端的呈現順序:先分類,類內依 sort_order,最後以 id 收尾 ——
 -- sort_order 允許重複,沒有第三個鍵的話同分項目的順序會隨執行計畫變動,
 -- 選購頁每次重整就換一次位置。走 handicap_items_tournament_idx。
-SELECT id, public_id, tournament_id, category, name, description, referee_note,
-       cost, repeatable, sort_order
+SELECT id, public_id, tournament_id, key, category, name, description, referee_note,
+       cost, repeatable, sort_order, params
 FROM activity.handicap_items
 WHERE tournament_id = sqlc.arg(tournament_id)
 ORDER BY category, sort_order, id;
@@ -89,8 +95,8 @@ ORDER BY category, sort_order, id;
 -- name: GetHandicapItemByPublicID :one
 -- tournament_id 一起進 WHERE 而不是查到再比對:項目逐屆一套、價格逐屆可調,
 -- 拿上一屆的 public_id 買這一屆的場次必須是「找不到」,不是「找到但不給用」。
-SELECT id, public_id, tournament_id, category, name, description, referee_note,
-       cost, repeatable, sort_order
+SELECT id, public_id, tournament_id, key, category, name, description, referee_note,
+       cost, repeatable, sort_order, params
 FROM activity.handicap_items
 WHERE tournament_id = sqlc.arg(tournament_id) AND public_id = sqlc.arg(public_id);
 
@@ -104,31 +110,36 @@ WHERE tournament_id = sqlc.arg(tournament_id) AND public_id = sqlc.arg(public_id
 -- 中途失敗不會留下半套項目。public_id(ULID)由 adapter 產生後傳入,SQL 生不出 ULID。
 --
 -- NULLIF(..., '') 把空字串收斂成 NULL:text[] 參數的元素表達不了 NULL,
--- 而「還沒寫」的 referee_note 在 DB 裡就該是 NULL(seed 目前全為 null,待裁判補)。
+-- 而「還沒寫」的 referee_note 在 DB 裡就該是 NULL。
 --
 -- 八個單引數 unnest 併排在子查詢裡,而不是 unnest(a, b, ...) AS v(...):
 -- sqlc 的 catalog 只認單引數 unnest,多引數形式會編譯失敗。兩者語意相同 ——
 -- select list 裡的多個集合回傳函數自 PG10 起同步展開(長度一致時逐列對齊)。
 WITH inserted AS (
   INSERT INTO activity.handicap_items (
-    tournament_id, public_id, category, name, description, referee_note,
-    cost, repeatable, sort_order
+    tournament_id, public_id, key, category, name, description, referee_note,
+    cost, repeatable, sort_order, params
   )
   SELECT
-    sqlc.arg(tournament_id), v.public_id, v.category, v.name,
+    sqlc.arg(tournament_id), v.public_id, v.key, v.category, v.name,
     NULLIF(v.description, ''), NULLIF(v.referee_note, ''),
-    v.cost, v.repeatable, v.sort_order
+    v.cost, v.repeatable, v.sort_order, v.params::jsonb
   FROM (
     SELECT
       unnest(sqlc.arg(public_ids)::text[])     AS public_id,
+      unnest(sqlc.arg(keys)::text[])           AS key,
       unnest(sqlc.arg(categories)::text[])     AS category,
       unnest(sqlc.arg(names)::text[])          AS name,
       unnest(sqlc.arg(descriptions)::text[])   AS description,
       unnest(sqlc.arg(referee_notes)::text[])  AS referee_note,
       unnest(sqlc.arg(costs)::bigint[])        AS cost,
       unnest(sqlc.arg(repeatables)::boolean[]) AS repeatable,
-      unnest(sqlc.arg(sort_orders)::int[])     AS sort_order
+      unnest(sqlc.arg(sort_orders)::int[])     AS sort_order,
+      -- params 以 text[] 傳入再 cast:pgx 對 jsonb[] 的編碼不穩定,text 最不會出事。
+      unnest(sqlc.arg(params)::text[])         AS params
   ) AS v
+  -- 衝突鍵維持 (category, name):重跑安裝回 0 列不改價格。**key 撞到會是 23505**,
+  -- 那是要的 —— 目錄改了名稱卻用 install 而不是 sync,必須出聲。
   ON CONFLICT (tournament_id, category, name) DO NOTHING
   RETURNING id
 )
@@ -200,8 +211,14 @@ WHERE match_id = sqlc.arg(match_id) AND player_id = sqlc.arg(player_id);
 -- 順帶帶回 match 的 public_id,免得同一個 Selection 型別在不同查詢路徑有不同的完整度。
 SELECT s.id, s.public_id, s.match_id, m.public_id AS match_public_id,
        s.player_id, s.item_id,
-       i.public_id AS item_ref, i.name AS item_name, i.category,
-       s.cost, s.target_note, s.voided, s.created_at
+       i.public_id AS item_ref, i.key AS item_key, i.name AS item_name, i.category,
+       i.params AS item_params,
+       -- 執行說明跟著選擇走:開賽前設定確認清單就是「該場每筆選擇的 referee_note + 抽選結果」,
+       -- 不帶的話裁判端要逐項回查。對外仍不離開裁判端(選手端的轉換不輸出它)。
+       COALESCE(i.referee_note, '')::text AS item_referee_note,
+       i.sort_order AS item_sort_order,
+       s.cost, s.target_note, s.voided, s.created_at,
+       s.draw_result, s.drawn_at
 FROM activity.handicap_selections s
 JOIN activity.handicap_items i ON i.id = s.item_id
 JOIN activity.matches m ON m.id = s.match_id
@@ -217,8 +234,14 @@ ORDER BY s.created_at, s.id;
 -- 也就是「從一筆選擇找到它所屬的序列化點」。
 SELECT s.id, s.public_id, s.match_id, m.public_id AS match_public_id,
        s.player_id, s.item_id,
-       i.public_id AS item_ref, i.name AS item_name, i.category,
-       s.cost, s.target_note, s.voided, s.created_at
+       i.public_id AS item_ref, i.key AS item_key, i.name AS item_name, i.category,
+       i.params AS item_params,
+       -- 執行說明跟著選擇走:開賽前設定確認清單就是「該場每筆選擇的 referee_note + 抽選結果」,
+       -- 不帶的話裁判端要逐項回查。對外仍不離開裁判端(選手端的轉換不輸出它)。
+       COALESCE(i.referee_note, '')::text AS item_referee_note,
+       i.sort_order AS item_sort_order,
+       s.cost, s.target_note, s.voided, s.created_at,
+       s.draw_result, s.drawn_at
 FROM activity.handicap_selections s
 JOIN activity.handicap_items i ON i.id = s.item_id
 JOIN activity.matches m ON m.id = s.match_id
@@ -243,12 +266,21 @@ WITH ins AS (
     sqlc.arg(public_id), sqlc.arg(match_id), sqlc.arg(player_id), sqlc.arg(item_id),
     sqlc.arg(cost), NULLIF(sqlc.arg(target_note)::text, '')
   )
-  RETURNING id, public_id, match_id, player_id, item_id, cost, target_note, voided, created_at
+  -- draw_result / drawn_at 剛插入時必為 NULL,但外層 SELECT 的形狀要與 List/Get 逐字相同,
+  -- 所以 RETURNING 必須帶上它們 —— 少了就是「CTE 裡沒有這欄」,Postgres 與 sqlc 都會擋。
+  RETURNING id, public_id, match_id, player_id, item_id, cost, target_note, voided, created_at,
+            draw_result, drawn_at
 )
 SELECT s.id, s.public_id, s.match_id, m.public_id AS match_public_id,
        s.player_id, s.item_id,
-       i.public_id AS item_ref, i.name AS item_name, i.category,
-       s.cost, s.target_note, s.voided, s.created_at
+       i.public_id AS item_ref, i.key AS item_key, i.name AS item_name, i.category,
+       i.params AS item_params,
+       -- 執行說明跟著選擇走:開賽前設定確認清單就是「該場每筆選擇的 referee_note + 抽選結果」,
+       -- 不帶的話裁判端要逐項回查。對外仍不離開裁判端(選手端的轉換不輸出它)。
+       COALESCE(i.referee_note, '')::text AS item_referee_note,
+       i.sort_order AS item_sort_order,
+       s.cost, s.target_note, s.voided, s.created_at,
+       s.draw_result, s.drawn_at
 FROM ins s
 JOIN activity.handicap_items i ON i.id = s.item_id
 JOIN activity.matches m ON m.id = s.match_id;
@@ -262,3 +294,54 @@ JOIN activity.matches m ON m.id = s.match_id;
 UPDATE activity.handicap_selections
 SET voided = true
 WHERE id = sqlc.arg(id) AND NOT voided;
+
+-- name: GetHandicapItemByKey :one
+-- 以穩定識別定址(封盤時抽選、規則判斷都用 key,不用名稱)。tournament_id 一起進 WHERE 同上。
+SELECT id, public_id, tournament_id, key, category, name, description, referee_note,
+       cost, repeatable, sort_order, params
+FROM activity.handicap_items
+WHERE tournament_id = sqlc.arg(tournament_id) AND key = sqlc.arg(key);
+
+-- name: SyncHandicapItems :execrows
+-- 把目錄的**文字與參數**同步進既有那屆(cmd/admin catalogue sync)。以 key 匹配。
+--
+-- **不動 cost**:價格是賽制設定,上屆的選購紀錄必須永遠指向上屆的價格。
+-- 前置條件「該屆沒有任何 handicap_selections」由 adapter 用 CountHandicapSelectionsInTournament
+-- 在同一個 tx 裡先驗;已有人依舊說明選購,改文字等於改比賽條件。
+-- 回影響列數,adapter 核對「= 目錄裡在該屆有對應 key 的項數」;對不上代表目錄與該屆不一致。
+UPDATE activity.handicap_items AS i
+SET name         = v.name,
+    description  = NULLIF(v.description, ''),
+    referee_note = NULLIF(v.referee_note, ''),
+    repeatable   = v.repeatable,
+    sort_order   = v.sort_order,
+    params       = v.params::jsonb,
+    updated_at   = now()
+FROM (
+  SELECT
+    unnest(sqlc.arg(keys)::text[])           AS key,
+    unnest(sqlc.arg(names)::text[])          AS name,
+    unnest(sqlc.arg(descriptions)::text[])   AS description,
+    unnest(sqlc.arg(referee_notes)::text[])  AS referee_note,
+    unnest(sqlc.arg(repeatables)::boolean[]) AS repeatable,
+    unnest(sqlc.arg(sort_orders)::int[])     AS sort_order,
+    unnest(sqlc.arg(params)::text[])         AS params
+) AS v
+WHERE i.tournament_id = sqlc.arg(tournament_id) AND i.key = v.key;
+
+-- name: CountHandicapSelectionsInTournament :one
+-- 該屆指向任何讓武項目的選擇數,**含已作廢**:退掉的也是「有人依這份文字買過」。
+SELECT count(*)::bigint AS selections
+FROM activity.handicap_selections s
+JOIN activity.handicap_items i ON i.id = s.item_id
+WHERE i.tournament_id = sqlc.arg(tournament_id);
+
+-- name: SetHandicapSelectionDraw :execrows
+-- 寫入抽選結果。draw_result IS NULL 是「一筆選擇只抽一次」的 DB 側保證(封盤不可逆 ⇒ 抽選不可逆)。
+-- drawn_at 與 draw_result 同生共死由 handicap_selections_draw_check 守。
+-- 時間由呼叫端傳入而不是 now():它必須等於封盤時間(LockMatchHandicaps 的 locked_at),
+-- 同一個 tx 內兩個 now() 相等,但「等於封盤時間」是語意,不該靠時鐘巧合。
+UPDATE activity.handicap_selections
+SET draw_result = sqlc.arg(result)::text,
+    drawn_at = sqlc.arg(at)::timestamptz
+WHERE id = sqlc.arg(id) AND draw_result IS NULL;

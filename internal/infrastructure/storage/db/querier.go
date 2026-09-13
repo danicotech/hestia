@@ -63,7 +63,7 @@ type Querier interface {
 	// NULL 一律 COALESCE 成 0:0 不是合法的 id,而 betting.Participant.IsUser 對 0 恆回 false
 	// ——「兩邊都沒綁帳號」絕不能被當成「所有人都是這位選手」。
 	BettingMatchesByPublicIDs(ctx context.Context, publicIds []string) ([]BettingMatchesByPublicIDsRow, error)
-	// 賠率參數。tournaments.config 是逐屆規則的唯一權威(同 bp_per_rank_gap 的取法),
+	// 賠率參數。tournaments.config 是逐屆規則的唯一權威(同 bp.per_rank_gap 的取法),
 	// 這裡只負責「把 JSONB 取成整數」,預設值一律不寫在 SQL 裡 ——
 	// 權威在 betting.OddsConfig.Normalize(),缺值回 0 由它補,兩邊各寫一份就會漂移。
 	//
@@ -180,14 +180,28 @@ type Querier interface {
 	// NULL 不受 UNIQUE 限制,正是「未抽」要的語意。
 	ClearTournamentSeeds(ctx context.Context, tournamentID int64) error
 	CloseGiveaway(ctx context.Context, id int64) error
+	// 關盤:該場所有 open 的盤口一起 closed(grill Q11/Q20:第一回合正式決鬥開始即關,
+	// 不逐回合重開)。呼叫位置是 MarkMatchLive 的同一個 tx。影響列數回給 adapter 核對。
+	CloseMatchMarkets(ctx context.Context, matchID int64) (int64, error)
 	ClosePresenceSpan(ctx context.Context, arg ClosePresenceSpanParams) error
 	CloseReaction(ctx context.Context, arg CloseReactionParams) error
 	// 帶 joined_at 讓分區裁剪生效(voice_sessions 按 joined_at 分區)。
 	// COALESCE:補收尾的事件若沒帶靜音狀態,保留進場時記下的值。
 	CloseVoiceSession(ctx context.Context, arg CloseVoiceSessionParams) error
+	// ══ 開賽前設定確認 ══════════════════════════════════════════════
+	// 裁判看完整張清單按一次「都確認了」(grill Q1/Q9:整體一次確認,不逐項)。
+	// 清單本身是推導值,這裡只寫「誰、什麼時候」。
+	//
+	// 三道守門同一句:status = 'locked'(封盤前沒有清單可確認,封盤後才有定案的內容)、
+	// setup_confirmed_at IS NULL(不可重複確認 —— 第二次會蓋掉第一次的時間與人)。
+	// 0 列 → adapter 重讀分辨:查無 / 尚未封盤 / 已確認過。
+	// 回傳形狀與 LockMatchForJudge 逐字相同。
+	ConfirmMatchSetup(ctx context.Context, arg ConfirmMatchSetupParams) (ConfirmMatchSetupRow, error)
 	// 每日次數上限(schemas/25:20 次/人/日)。用 UTC 當日,與 XP 的 daily_cap 一致 ——
 	// 兩個「今天」用不同定義會讓人在某個時區看到兩者不同步。
 	CountDrawsToday(ctx context.Context, userID int64) (int64, error)
+	// 該屆指向任何讓武項目的選擇數,**含已作廢**:退掉的也是「有人依這份文字買過」。
+	CountHandicapSelectionsInTournament(ctx context.Context, tournamentID int64) (int64, error)
 	// ═══ 選手 ═══════════════════════════════════════════════════
 	// 本屆報名人數(Tournament.player_count)。
 	//
@@ -281,6 +295,13 @@ type Querier interface {
 	// 所以「這場的預算」等於「施加者的預算」。LIMIT 1 是對這個不變量的防守,
 	// 不是在多列裡挑一列 —— 真的出現兩列代表發預算的路徑有 bug。
 	FindMatchBudgetByMatch(ctx context.Context, matchID int64) (FindMatchBudgetByMatchRow, error)
+	// 本屆的季軍戰(至多一場)。查無 0 列 → adapter 回 nil,不是錯誤:
+	// 沒建就是「還沒到那一步」或「這屆不打季軍戰」。無鎖。
+	FindThirdPlaceMatch(ctx context.Context, tournamentID int64) (FindThirdPlaceMatchRow, error)
+	// 填該回合勝者。finished_at IS NULL 是「一回合只結束一次」的 DB 側保證;
+	// 0 列 = 查無此回合或已結束,adapter 重讀分辨。勝者必須是場上兩人之一由 service 擋
+	//(DB 無法跨表 CHECK)。finished_at >= started_at 由 match_rounds_order_check 守。
+	FinishMatchRound(ctx context.Context, arg FinishMatchRoundParams) (ActivityMatchRound, error)
 	GetBalance(ctx context.Context, arg GetBalanceParams) (int64, error)
 	// 投遞時用:這個空間的這個用途要貼到哪個頻道。
 	// 查無列 = 沒設定,呼叫端應略過而不是報錯(部署可能刻意不設某個用途)。
@@ -303,6 +324,8 @@ type Querier interface {
 	// 真正的權威是 UNIQUE (game_id),而拿不到列的那一邊會走 InsertFencerIfAbsent。
 	GetFencerByGameID(ctx context.Context, gameID string) (ActivityFencer, error)
 	GetGiveawayByPublicID(ctx context.Context, publicID string) (GetGiveawayByPublicIDRow, error)
+	// 以穩定識別定址(封盤時抽選、規則判斷都用 key,不用名稱)。tournament_id 一起進 WHERE 同上。
+	GetHandicapItemByKey(ctx context.Context, arg GetHandicapItemByKeyParams) (GetHandicapItemByKeyRow, error)
 	// tournament_id 一起進 WHERE 而不是查到再比對:項目逐屆一套、價格逐屆可調,
 	// 拿上一屆的 public_id 買這一屆的場次必須是「找不到」,不是「找到但不給用」。
 	GetHandicapItemByPublicID(ctx context.Context, arg GetHandicapItemByPublicIDParams) (GetHandicapItemByPublicIDRow, error)
@@ -351,6 +374,10 @@ type Querier interface {
 	GetLoginIdentity(ctx context.Context, arg GetLoginIdentityParams) (GetLoginIdentityRow, error)
 	// ── 開箱 ──────────────────────────────────────────────────────
 	GetLootBoxByPublicID(ctx context.Context, publicID string) (GetLootBoxByPublicIDRow, error)
+	// 下注與投票以盤口的 public_id 定址。查無 0 列 → ErrMarketNotFound。
+	GetMarketByPublicID(ctx context.Context, publicID string) (ActivityMarket, error)
+	// 批次版(串關一次帶多腿)。順序不拘,呼叫端自己用 public_id 索引。
+	GetMarketsByPublicIDs(ctx context.Context, publicIds []string) ([]ActivityMarket, error)
 	// ── BP 預算 ─────────────────────────────────────────────────────
 	// 沒有列 = 本場無讓武(同段對決)、或這個人是高段位方、或根本不是這場的選手。
 	// 三者對呼叫端是同一件事,一律 ErrNoBudget —— 分得更細等於洩漏「這場的預算持有者
@@ -652,7 +679,7 @@ type Querier interface {
 	// 中途失敗不會留下半套項目。public_id(ULID)由 adapter 產生後傳入,SQL 生不出 ULID。
 	//
 	// NULLIF(..., '') 把空字串收斂成 NULL:text[] 參數的元素表達不了 NULL,
-	// 而「還沒寫」的 referee_note 在 DB 裡就該是 NULL(seed 目前全為 null,待裁判補)。
+	// 而「還沒寫」的 referee_note 在 DB 裡就該是 NULL。
 	//
 	// 八個單引數 unnest 併排在子查詢裡,而不是 unnest(a, b, ...) AS v(...):
 	// sqlc 的 catalog 只認單引數 unnest,多引數形式會編譯失敗。兩者語意相同 ——
@@ -691,6 +718,15 @@ type Querier interface {
 	// ══ 成交紀錄 ══
 	// 買賣雙方 + 金額 + 手續費全額記帳:任兩人的資金淨流向可查(防洗點稽核的資料來源)。
 	InsertMarketOrder(ctx context.Context, arg InsertMarketOrderParams) (InsertMarketOrderRow, error)
+	// ══ 盤口 ════════════════════════════════════════════════════════
+	//
+	// 盤口是資料列(00007 檔頭):哪些存在由 config.betting.markets 決定,場次進入 ready 時
+	// 由 match 套件透過 betting 埠建列。結果(outcome)不存,由 kind + config 推導。
+	// 一場一次建齊。unnest 批次(同 InsertBetLegs 的理由:半套盤口比整批失敗糟)。
+	// round_no 以 int[] 傳入,NULL 用 0 佔位再 NULLIF 回 NULL —— 陣列元素表達不了 NULL。
+	// params 以 text[] 傳入再 cast(同 InsertHandicapItems)。public_id 由 adapter 產生。
+	// 撞到 markets_match_kind_line_uq 是 23505:同一場建兩次盤口必須出聲。
+	InsertMarkets(ctx context.Context, arg InsertMarketsParams) ([]ActivityMarket, error)
 	// 刻意**沒有** ON CONFLICT:複合主鍵 (match_id, player_id) 撞鍵時要讓 23505 冒上來,
 	// adapter 轉成 ErrBudgetExists,呼叫端再去比對既有金額與當下段位差是否一致。
 	// 吞掉衝突(DO NOTHING / DO UPDATE)會讓「抽籤後有人改了段位」變成默默覆蓋,
@@ -699,6 +735,30 @@ type Querier interface {
 	// 用 CTE 而不是單純 RETURNING:RETURNING 看不到 join 進來的 public_id,
 	// 而呼叫端拿到的 Budget 必須是完整的(少一個欄位就得多一次往返)。
 	InsertMatchBudget(ctx context.Context, arg InsertMatchBudgetParams) (InsertMatchBudgetRow, error)
+	// ══ 回合 ════════════════════════════════════════════════════════
+	//
+	// 回合列在裁判按「正式決鬥開始」時建,不預建(00006 檔頭)。所以「開始第 N 回合」
+	// 就是 INSERT;started_at 由 DEFAULT now() 給 —— core 不該有第二個時鐘。
+	// 第一回合開始時 matches.started_at 也要寫(那是下注關盤點),由 MarkMatchLive 負責,
+	// 兩句在同一個 tx 裡。match_rounds_match_round_uq 讓「同一回合開始兩次」是 23505。
+	InsertMatchRound(ctx context.Context, arg InsertMatchRoundParams) (ActivityMatchRound, error)
+	// 違規紀錄 query(schemas/27,migrations/activity/00006)。
+	// 呼叫端是 internal/core/activity/match 的 Repository[TX] 埠(裁判動作,同一個 tx)。
+	//
+	// ── 只記事實,不做規則 ─────────────────────────────────────────
+	//
+	// 這裡沒有「第幾次」、沒有累計、沒有任何會觸發後果的敘述(grill Q21)。
+	// 判該回合 / 判整場走 activity_match.sql 的回合與賽果路徑;本檔只留說明。
+	//
+	// ── 沿用既有 query,不重寫(專案規則 9)──────────────────────
+	//
+	//   稽核  裁判「記了一筆違規」這個動作仍寫 admin_audit_logs(actor = 裁判),
+	//         由 adapter 在同一個 tx 裡緊接著呼叫 audit.sql 的 InsertAdminAudit。
+	//         違規者本人(選手)不進稽核表 —— 他不一定有平台帳號,而稽核表的 actor 是 NOT NULL 外鍵。
+	// 一筆一列。刻意沒有任何 UNIQUE / ON CONFLICT:同一人同一項在同一回合可以違規兩次。
+	// public_id(ULID)由 adapter 產生;item_id 允許 NULL(違反通則,不對應特定項目)。
+	// note 非空由 match_violations_note_check 守,傳空字串是 23514 而不是靜靜寫進去。
+	InsertMatchViolation(ctx context.Context, arg InsertMatchViolationParams) (ActivityMatchViolation, error)
 	// 同上,整棵樹一個語句寫完。public_id(ULID)由 adapter 逐場產好再傳進來 ——
 	// SQL 不生成 id(鐵則:對外只出現 public_id,而它的產生位置只有一個)。
 	// NULLIF(...,0):port 的 MatchSeat 用 0 表示「尚未確定」(等上一輪),
@@ -726,6 +786,13 @@ type Querier interface {
 	// rotated_from 撞 sessions_rotated_from_uq = 這條 session 已經被輪替過一次,
 	// 也就是同一個 refresh token 被用了第二次 —— 呼叫端據此觸發重用偵測。
 	InsertSession(ctx context.Context, arg InsertSessionParams) (InsertSessionRow, error)
+	// ══ 季軍戰 ══════════════════════════════════════════════════════
+	// 準決賽兩場都 done 之後建季軍戰(config.format.third_place_match = true 時)。
+	// kind = 'third_place'、雙方已知、狀態 pending(等裁判開盤,與其他場次一樣走完整流程)。
+	// round 記為決賽那一輪、slot 由呼叫端給(bracket 套件決定,這裡不推)。
+	// UNIQUE (tournament_id, round, slot) 讓重複建是 23505,不是靜靜多一場。
+	// 回傳形狀與 LockMatchForJudge 逐字相同。
+	InsertThirdPlaceMatch(ctx context.Context, arg InsertThirdPlaceMatchParams) (InsertThirdPlaceMatchRow, error)
 	InsertTokenEntry(ctx context.Context, arg InsertTokenEntryParams) (InsertTokenEntryRow, error)
 	// 《百業試鋒》賽事核心 query(schemas/20 + schemas/26)。
 	// 對應 port:internal/core/activity/tournament.Repo 與 internal/core/activity/signup.Repo。
@@ -917,9 +984,23 @@ type Querier interface {
 	// 上架時間未到的商品是草稿,任何情況都不對外露出。
 	ListListedItems(ctx context.Context, arg ListListedItemsParams) ([]ListListedItemsRow, error)
 	ListLootBoxes(ctx context.Context, communityID int64) ([]ListLootBoxesRow, error)
+	// 批次讀盤口(GetOdds 一次帶整輪)。順序 (match_id, kind, round_no) 讓前端呈現穩定。
+	ListMarketsByMatches(ctx context.Context, matchIds []int64) ([]ActivityMarket, error)
+	// 一場的全部回合,依 round_no。回合比數與整場勝者都從這裡算(衍生值不存)。
+	// 無鎖:讀取路徑(對戰表、計時器、結算)都用它;寫入路徑已持有 matches 列鎖。
+	ListMatchRounds(ctx context.Context, matchID int64) ([]ActivityMatchRound, error)
+	// 批次版(對戰表一次撈整屆的回合)。順序 (match_id, round_no),呼叫端自己分組。
+	ListMatchRoundsByMatches(ctx context.Context, matchIds []int64) ([]ActivityMatchRound, error)
+	// 一場的全部違規,依發生順序。JOIN 帶回選手與項目的 public_id 與名稱:
+	// 對外只出現 public_id(鐵則 5),而裁判端與賽果公告都要顯示名稱。
+	// item 走 LEFT JOIN:item_id 可為 NULL。走 match_violations_match_idx。
+	ListMatchViolations(ctx context.Context, matchID int64) ([]ListMatchViolationsRow, error)
 	ListOpenGiveaways(ctx context.Context, communityID int64) ([]ListOpenGiveawaysRow, error)
 	// ── 寵物 ──────────────────────────────────────────────────────
 	ListPets(ctx context.Context, ownerID int64) ([]ListPetsRow, error)
+	// 一位選手在本屆的全部違規(選手端「看自己的」、生涯頁)。欄位與 ListMatchViolations 逐字相同。
+	// 帶 match 的 public_id / round / slot,選手看得出是哪一場。走 match_violations_player_idx。
+	ListPlayerViolations(ctx context.Context, playerID int64) ([]ListPlayerViolationsRow, error)
 	ListSpaceChannels(ctx context.Context, spaceID int64) ([]ListSpaceChannelsRow, error)
 	ListSpacePurposes(ctx context.Context, spaceID int64) ([]ListSpacePurposesRow, error)
 	ListSpaces(ctx context.Context) ([]ListSpacesRow, error)
@@ -1370,7 +1451,7 @@ type Querier interface {
 	// **只查請求者自己的票。** user_id 是必填參數,不是可選過濾條件 ——
 	// 沒有它就變成「列出這些場次的所有投票」,那正是 VoteTalliesByMatch 註解裡
 	// 不能存在的那支查詢。要看別人投給誰,這裡沒有路。
-	MyVotesByMatch(ctx context.Context, arg MyVotesByMatchParams) ([]MyVotesByMatchRow, error)
+	MyVotesByMarkets(ctx context.Context, arg MyVotesByMarketsParams) ([]MyVotesByMarketsRow, error)
 	// ══ 即時戰況推播 ════════════════════════════════════════════════
 	// 把一則變化的「信封」送進 LISTEN / NOTIFY 頻道(internal/core/activity/watch)。
 	//
@@ -1422,6 +1503,9 @@ type Querier interface {
 	// 寫成 (NOT $3 OR status = 'open') 的話,prepared statement 的通用計畫看不到布林的值,
 	// 永遠只能退回全表過濾,而已結算的注單會愈積愈多。
 	OpenBetsByUser(ctx context.Context, arg OpenBetsByUserParams) ([]ActivityBet, error)
+	// 場次 done 時要把「沒打到的回合」的盤口標 void(schemas/21「沒打到的回合」):
+	// 這一支列出該場尚未結算的盤口,core 依 kind / round_no 與實際回合數決定各自的命運。
+	OpenMarketsByMatch(ctx context.Context, matchID int64) ([]ActivityMarket, error)
 	// 維運監控指標(schemas/14「監控與告警」)。每支查詢都是單一 SQL,
 	// 目的是讓 HTTP handler 或排程 job 都能便宜地叫,不做應用層彙總。
 	//
@@ -1433,6 +1517,10 @@ type Querier interface {
 	// 一次掃描三個數字——分三句查會在三個時點看到三份不一致的快照。
 	// 沒有 pending 時年齡回 0(NULL 會逼呼叫端處理一個沒有意義的空值)。
 	OutboxBacklog(ctx context.Context) (OutboxBacklogRow, error)
+	// 撈出押到這個盤口、還沒判定的腿(逐盤口結算:round_winner / duration 在該回合結束時,
+	// match_winner / score 在場次 done 時)。走 bet_legs_market_result_idx。
+	// ORDER BY bet_id, id 同 PendingLegsByMatch 的理由:取鎖順序是防死鎖的全部。
+	PendingLegsByMarket(ctx context.Context, marketID int64) ([]ActivityBetLeg, error)
 	// ══ 結算 ════════════════════════════════════════════════════════
 	// 撈出押到這場、還沒判定的腿。
 	//
@@ -1579,6 +1667,11 @@ type Querier interface {
 	// 查詢的參數不可以 —— 「補上分錄 id」傳 NULL 是沒有意義的呼叫,不該在型別上存在。
 	SetBetStakeEntry(ctx context.Context, arg SetBetStakeEntryParams) (int64, error)
 	SetChannelPurpose(ctx context.Context, arg SetChannelPurposeParams) (SetChannelPurposeRow, error)
+	// 寫入抽選結果。draw_result IS NULL 是「一筆選擇只抽一次」的 DB 側保證(封盤不可逆 ⇒ 抽選不可逆)。
+	// drawn_at 與 draw_result 同生共死由 handicap_selections_draw_check 守。
+	// 時間由呼叫端傳入而不是 now():它必須等於封盤時間(LockMatchHandicaps 的 locked_at),
+	// 同一個 tx 內兩個 now() 相等,但「等於封盤時間」是語意,不該靠時鐘巧合。
+	SetHandicapSelectionDraw(ctx context.Context, arg SetHandicapSelectionDrawParams) (int64, error)
 	SetIdempotencyResponse(ctx context.Context, arg SetIdempotencyResponseParams) error
 	// **覆寫,不是增量**。權威值永遠是 RecalcMatchBudgetSpent 的 SUM;
 	// 用 spent = spent + cost 的話,任何一次漏算都會永遠留在資料裡,而且無法事後分辨。
@@ -1632,6 +1725,10 @@ type Querier interface {
 	// 兩次併發改時區會互相回到對方的值(回應與實際狀態不符)。
 	// deleted_at IS NULL 條件讓軟刪除的帳號連 0 列都改不到 → 呼叫端回 NotFound。
 	SetUserTimezone(ctx context.Context, arg SetUserTimezoneParams) (SetUserTimezoneRow, error)
+	// 把一個盤口標成 settled 或 void。status IN ('open','closed') 是「一個盤口只結算一次」
+	// 的 DB 側保證;settled_at 由 DB 給(markets_settled_at_check 要求兩者同生共死)。
+	// 0 列 = 已結算過或查無,adapter 出聲。
+	SettleMarket(ctx context.Context, arg SettleMarketParams) (int64, error)
 	// 對帳 job 用:驗證 SUM(entries) = balance
 	SumEntriesForUser(ctx context.Context, arg SumEntriesForUserParams) (int64, error)
 	// 產出速率:這段時間系統淨吐出多少點。負數 = 淨回收(水槽正常運作)。
@@ -1647,6 +1744,13 @@ type Querier interface {
 	// winner_player_id 一併換是為了不留下例外:drawing 階段不該有勝者,
 	// 但「這欄有值時會怎樣」不該取決於呼叫端記不記得這件事。
 	SwapPlayersInMatches(ctx context.Context, arg SwapPlayersInMatchesParams) (int64, error)
+	// 把目錄的**文字與參數**同步進既有那屆(cmd/admin catalogue sync)。以 key 匹配。
+	//
+	// **不動 cost**:價格是賽制設定,上屆的選購紀錄必須永遠指向上屆的價格。
+	// 前置條件「該屆沒有任何 handicap_selections」由 adapter 用 CountHandicapSelectionsInTournament
+	// 在同一個 tx 裡先驗;已有人依舊說明選購,改文字等於改比賽條件。
+	// 回影響列數,adapter 核對「= 目錄裡在該屆有對應 key 的項數」;對不上代表目錄與該屆不一致。
+	SyncHandicapItems(ctx context.Context, arg SyncHandicapItemsParams) (int64, error)
 	// 修改報名表的第 2 步,**跑在 UpdatePlayerRegistration 之後**(鎖序
 	// tournament_players → fencers)。
 	//
@@ -1786,9 +1890,9 @@ type Querier interface {
 	// 後到的那個看到的是前一個已 commit 的值(read committed 下 DO UPDATE
 	// 會重讀最新版本),不會兩邊各自把對方的欄位覆蓋掉。
 	UpsertUserPrivacy(ctx context.Context, arg UpsertUserPrivacyParams) (UpsertUserPrivacyRow, error)
-	// 一場一票,改票即覆寫。
+	// 一場每盤口一票,改票即覆寫(grill Q19:每個盤口各自投票)。
 	//
-	// 權威是 votes_match_user_uq (match_id, user_id) 這條 UNIQUE,不是應用層的
+	// 權威是 votes_market_user_uq (market_id, user_id) 這條 UNIQUE,不是應用層的
 	// 「先查再決定 insert 還是 update」—— 那個寫法在併發連點下會兩邊都查不到、
 	// 兩邊都 insert,第二筆撞鍵報錯,使用者看到的是「投票失敗」。
 	// ON CONFLICT DO UPDATE 讓連點變成冪等:最後一次的 side 勝出。
@@ -1815,7 +1919,7 @@ type Querier interface {
 	// 讓「檢查」與「授權」不可能被拆開漏掉其中一步。
 	UserHasPermission(ctx context.Context, arg UserHasPermissionParams) (*bool, error)
 	// ══ 投票 ════════════════════════════════════════════════════════
-	// 數票:每場每邊各幾票。**只回票數,永不回傳誰投給誰。**
+	// 數票:每盤口每結果各幾票。**只回票數,永不回傳誰投給誰。**
 	//
 	// 這不是效能考量也不是隱私加分項:票數直接推導賠率,公開投票人等於公開可操縱的標的
 	// (誰灌了票、該去說服誰改票)。所以這支查詢在型別上就沒有 user_id 可以洩漏,
@@ -1823,7 +1927,7 @@ type Querier interface {
 	//
 	// 沒人投票的場次不會有列 —— 呼叫端 map 查不到即零票,零票時平滑參數會給出兩邊
 	// 相同的賠率,不需要在 SQL 補空列。走 votes_match_side_idx。
-	VoteTalliesByMatch(ctx context.Context, matchIds []int64) ([]VoteTalliesByMatchRow, error)
+	VoteTalliesByMarkets(ctx context.Context, marketIds []int64) ([]VoteTalliesByMarketsRow, error)
 }
 
 var _ Querier = (*Queries)(nil)

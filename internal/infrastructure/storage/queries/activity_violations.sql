@@ -1,0 +1,66 @@
+-- 違規紀錄 query(schemas/27,migrations/activity/00006)。
+-- 呼叫端是 internal/core/activity/match 的 Repository[TX] 埠(裁判動作,同一個 tx)。
+--
+-- ── 只記事實,不做規則 ─────────────────────────────────────────
+--
+-- 這裡沒有「第幾次」、沒有累計、沒有任何會觸發後果的敘述(grill Q21)。
+-- 判該回合 / 判整場走 activity_match.sql 的回合與賽果路徑;本檔只留說明。
+--
+-- ── 沿用既有 query,不重寫(專案規則 9)──────────────────────
+--
+--   稽核  裁判「記了一筆違規」這個動作仍寫 admin_audit_logs(actor = 裁判),
+--         由 adapter 在同一個 tx 裡緊接著呼叫 audit.sql 的 InsertAdminAudit。
+--         違規者本人(選手)不進稽核表 —— 他不一定有平台帳號,而稽核表的 actor 是 NOT NULL 外鍵。
+
+-- name: InsertMatchViolation :one
+-- 一筆一列。刻意沒有任何 UNIQUE / ON CONFLICT:同一人同一項在同一回合可以違規兩次。
+-- public_id(ULID)由 adapter 產生;item_id 允許 NULL(違反通則,不對應特定項目)。
+-- note 非空由 match_violations_note_check 守,傳空字串是 23514 而不是靜靜寫進去。
+INSERT INTO activity.match_violations (
+  public_id, match_id, round_no, player_id, item_id, ruling, note, recorded_by
+)
+VALUES (
+  sqlc.arg(public_id), sqlc.arg(match_id), sqlc.narg(round_no)::int,
+  sqlc.arg(player_id), sqlc.narg(item_id)::bigint,
+  sqlc.arg(ruling), sqlc.arg(note), sqlc.arg(recorded_by)
+)
+RETURNING id, public_id, match_id, round_no, player_id, item_id, ruling, note, recorded_by, created_at;
+
+-- name: ListMatchViolations :many
+-- 一場的全部違規,依發生順序。JOIN 帶回選手與項目的 public_id 與名稱:
+-- 對外只出現 public_id(鐵則 5),而裁判端與賽果公告都要顯示名稱。
+-- item 走 LEFT JOIN:item_id 可為 NULL。走 match_violations_match_idx。
+SELECT
+  v.id, v.public_id, v.match_id, v.round_no, v.player_id, v.item_id,
+  v.ruling, v.note, v.recorded_by, v.created_at,
+  p.public_id    AS player_public_id,
+  p.display_name AS player_display_name,
+  i.public_id    AS item_public_id,
+  i.key          AS item_key,
+  i.name         AS item_name
+FROM activity.match_violations v
+JOIN activity.tournament_players p ON p.id = v.player_id
+LEFT JOIN activity.handicap_items i ON i.id = v.item_id
+WHERE v.match_id = sqlc.arg(match_id)::bigint
+ORDER BY v.created_at, v.id;
+
+-- name: ListPlayerViolations :many
+-- 一位選手在本屆的全部違規(選手端「看自己的」、生涯頁)。欄位與 ListMatchViolations 逐字相同。
+-- 帶 match 的 public_id / round / slot,選手看得出是哪一場。走 match_violations_player_idx。
+SELECT
+  v.id, v.public_id, v.match_id, v.round_no, v.player_id, v.item_id,
+  v.ruling, v.note, v.recorded_by, v.created_at,
+  p.public_id    AS player_public_id,
+  p.display_name AS player_display_name,
+  i.public_id    AS item_public_id,
+  i.key          AS item_key,
+  i.name         AS item_name,
+  m.public_id    AS match_public_id,
+  m.round        AS match_round,
+  m.slot         AS match_slot
+FROM activity.match_violations v
+JOIN activity.tournament_players p ON p.id = v.player_id
+JOIN activity.matches m            ON m.id = v.match_id
+LEFT JOIN activity.handicap_items i ON i.id = v.item_id
+WHERE v.player_id = sqlc.arg(player_id)::bigint
+ORDER BY v.created_at, v.id;

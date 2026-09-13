@@ -32,9 +32,10 @@ func (q *Queries) CountTournamentPlayers(ctx context.Context, tournamentID int64
 
 const currentMatchOfPlayer = `-- name: CurrentMatchOfPlayer :one
 SELECT
-  m.id, m.public_id, m.tournament_id, m.round, m.slot,
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
   m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
   m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
   m.p1_player_id,
   p1.public_id    AS p1_public_id,
   p1.fencer_id    AS p1_fencer_id,
@@ -68,6 +69,7 @@ type CurrentMatchOfPlayerRow struct {
 	TournamentID     int64
 	Round            int32
 	Slot             int32
+	Kind             string
 	Status           string
 	ResultKind       string
 	HandicapOpen     bool
@@ -76,6 +78,8 @@ type CurrentMatchOfPlayerRow struct {
 	StartedAt        *time.Time
 	FinishedAt       *time.Time
 	WinnerPlayerID   *int64
+	SetupConfirmedAt *time.Time
+	SetupConfirmedBy *int64
 	P1PlayerID       *int64
 	P1PublicID       *string
 	P1FencerID       *int64
@@ -116,6 +120,7 @@ func (q *Queries) CurrentMatchOfPlayer(ctx context.Context, playerID int64) (Cur
 		&i.TournamentID,
 		&i.Round,
 		&i.Slot,
+		&i.Kind,
 		&i.Status,
 		&i.ResultKind,
 		&i.HandicapOpen,
@@ -124,6 +129,8 @@ func (q *Queries) CurrentMatchOfPlayer(ctx context.Context, playerID int64) (Cur
 		&i.StartedAt,
 		&i.FinishedAt,
 		&i.WinnerPlayerID,
+		&i.SetupConfirmedAt,
+		&i.SetupConfirmedBy,
 		&i.P1PlayerID,
 		&i.P1PublicID,
 		&i.P1FencerID,
@@ -286,9 +293,10 @@ func (q *Queries) ListFencersByIDs(ctx context.Context, fencerIds []int64) ([]Ac
 const listTournamentMatches = `-- name: ListTournamentMatches :many
 
 SELECT
-  m.id, m.public_id, m.tournament_id, m.round, m.slot,
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
   m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
   m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
   m.p1_player_id,
   p1.public_id    AS p1_public_id,
   p1.fencer_id    AS p1_fencer_id,
@@ -314,6 +322,7 @@ type ListTournamentMatchesRow struct {
 	TournamentID     int64
 	Round            int32
 	Slot             int32
+	Kind             string
 	Status           string
 	ResultKind       string
 	HandicapOpen     bool
@@ -322,6 +331,8 @@ type ListTournamentMatchesRow struct {
 	StartedAt        *time.Time
 	FinishedAt       *time.Time
 	WinnerPlayerID   *int64
+	SetupConfirmedAt *time.Time
+	SetupConfirmedBy *int64
 	P1PlayerID       *int64
 	P1PublicID       *string
 	P1FencerID       *int64
@@ -359,6 +370,7 @@ func (q *Queries) ListTournamentMatches(ctx context.Context, tournamentID int64)
 			&i.TournamentID,
 			&i.Round,
 			&i.Slot,
+			&i.Kind,
 			&i.Status,
 			&i.ResultKind,
 			&i.HandicapOpen,
@@ -367,6 +379,8 @@ func (q *Queries) ListTournamentMatches(ctx context.Context, tournamentID int64)
 			&i.StartedAt,
 			&i.FinishedAt,
 			&i.WinnerPlayerID,
+			&i.SetupConfirmedAt,
+			&i.SetupConfirmedBy,
 			&i.P1PlayerID,
 			&i.P1PublicID,
 			&i.P1FencerID,

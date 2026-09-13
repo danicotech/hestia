@@ -97,9 +97,10 @@ ORDER BY tp.seed_no ASC NULLS LAST, tp.id ASC;
 -- 不加任何 FOR SHARE / FOR UPDATE:這是匿名可讀的路徑,決賽當下可能有上百人
 -- 同時在看。對 matches 取鎖會讓觀眾與裁判互相排隊,而觀眾一個字都不會寫。
 SELECT
-  m.id, m.public_id, m.tournament_id, m.round, m.slot,
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
   m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
   m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
   m.p1_player_id,
   p1.public_id    AS p1_public_id,
   p1.fencer_id    AS p1_fencer_id,
@@ -137,9 +138,10 @@ ORDER BY m.round ASC, m.slot ASC;
 -- 排序與 LIMIT 1 缺一不可:一位選手同時有兩場未完賽是可能的(剛晉級、
 -- 下一輪的節點已經建好),沒有排序的話「目前這一場」會在兩者之間跳動。
 SELECT
-  m.id, m.public_id, m.tournament_id, m.round, m.slot,
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
   m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
   m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
   m.p1_player_id,
   p1.public_id    AS p1_public_id,
   p1.fencer_id    AS p1_fencer_id,

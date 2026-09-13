@@ -47,11 +47,255 @@ func (q *Queries) BumpFencerRecord(ctx context.Context, arg BumpFencerRecordPara
 	return result.RowsAffected(), nil
 }
 
-const getMatchForJudge = `-- name: GetMatchForJudge :one
+const confirmMatchSetup = `-- name: ConfirmMatchSetup :one
+
+WITH upd AS (
+  UPDATE activity.matches
+  SET setup_confirmed_at = now(),
+      setup_confirmed_by = $1::bigint,
+      updated_at = now()
+  WHERE id = $2::bigint
+    AND status = 'locked'
+    AND setup_confirmed_at IS NULL
+  RETURNING id, public_id, tournament_id, round, slot, p1_player_id, p2_player_id, winner_player_id, status, handicap_open, handicap_locked_at, stream_url, result_kind, started_at, finished_at, created_at, updated_at, kind, setup_confirmed_at, setup_confirmed_by
+)
 SELECT
-  m.id, m.public_id, m.tournament_id, m.round, m.slot,
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
   m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
   m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
+  m.p1_player_id,
+  p1.public_id    AS p1_public_id,
+  p1.fencer_id    AS p1_fencer_id,
+  p1.display_name AS p1_display_name,
+  p1.rank_level   AS p1_rank_level,
+  p1.status       AS p1_status,
+  m.p2_player_id,
+  p2.public_id    AS p2_public_id,
+  p2.fencer_id    AS p2_fencer_id,
+  p2.display_name AS p2_display_name,
+  p2.rank_level   AS p2_rank_level,
+  p2.status       AS p2_status
+FROM upd m
+LEFT JOIN activity.tournament_players p1 ON p1.id = m.p1_player_id
+LEFT JOIN activity.tournament_players p2 ON p2.id = m.p2_player_id
+`
+
+type ConfirmMatchSetupParams struct {
+	ActorUserID int64
+	MatchID     int64
+}
+
+type ConfirmMatchSetupRow struct {
+	ID               int64
+	PublicID         string
+	TournamentID     int64
+	Round            int32
+	Slot             int32
+	Kind             string
+	Status           string
+	ResultKind       string
+	HandicapOpen     bool
+	HandicapLockedAt *time.Time
+	StreamUrl        *string
+	StartedAt        *time.Time
+	FinishedAt       *time.Time
+	WinnerPlayerID   *int64
+	SetupConfirmedAt *time.Time
+	SetupConfirmedBy *int64
+	P1PlayerID       *int64
+	P1PublicID       *string
+	P1FencerID       *int64
+	P1DisplayName    *string
+	P1RankLevel      *int16
+	P1Status         *string
+	P2PlayerID       *int64
+	P2PublicID       *string
+	P2FencerID       *int64
+	P2DisplayName    *string
+	P2RankLevel      *int16
+	P2Status         *string
+}
+
+// ══ 開賽前設定確認 ══════════════════════════════════════════════
+// 裁判看完整張清單按一次「都確認了」(grill Q1/Q9:整體一次確認,不逐項)。
+// 清單本身是推導值,這裡只寫「誰、什麼時候」。
+//
+// 三道守門同一句:status = 'locked'(封盤前沒有清單可確認,封盤後才有定案的內容)、
+// setup_confirmed_at IS NULL(不可重複確認 —— 第二次會蓋掉第一次的時間與人)。
+// 0 列 → adapter 重讀分辨:查無 / 尚未封盤 / 已確認過。
+// 回傳形狀與 LockMatchForJudge 逐字相同。
+func (q *Queries) ConfirmMatchSetup(ctx context.Context, arg ConfirmMatchSetupParams) (ConfirmMatchSetupRow, error) {
+	row := q.db.QueryRow(ctx, confirmMatchSetup, arg.ActorUserID, arg.MatchID)
+	var i ConfirmMatchSetupRow
+	err := row.Scan(
+		&i.ID,
+		&i.PublicID,
+		&i.TournamentID,
+		&i.Round,
+		&i.Slot,
+		&i.Kind,
+		&i.Status,
+		&i.ResultKind,
+		&i.HandicapOpen,
+		&i.HandicapLockedAt,
+		&i.StreamUrl,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.WinnerPlayerID,
+		&i.SetupConfirmedAt,
+		&i.SetupConfirmedBy,
+		&i.P1PlayerID,
+		&i.P1PublicID,
+		&i.P1FencerID,
+		&i.P1DisplayName,
+		&i.P1RankLevel,
+		&i.P1Status,
+		&i.P2PlayerID,
+		&i.P2PublicID,
+		&i.P2FencerID,
+		&i.P2DisplayName,
+		&i.P2RankLevel,
+		&i.P2Status,
+	)
+	return i, err
+}
+
+const findThirdPlaceMatch = `-- name: FindThirdPlaceMatch :one
+SELECT
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
+  m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
+  m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
+  m.p1_player_id,
+  p1.public_id    AS p1_public_id,
+  p1.fencer_id    AS p1_fencer_id,
+  p1.display_name AS p1_display_name,
+  p1.rank_level   AS p1_rank_level,
+  p1.status       AS p1_status,
+  m.p2_player_id,
+  p2.public_id    AS p2_public_id,
+  p2.fencer_id    AS p2_fencer_id,
+  p2.display_name AS p2_display_name,
+  p2.rank_level   AS p2_rank_level,
+  p2.status       AS p2_status
+FROM activity.matches m
+LEFT JOIN activity.tournament_players p1 ON p1.id = m.p1_player_id
+LEFT JOIN activity.tournament_players p2 ON p2.id = m.p2_player_id
+WHERE m.tournament_id = $1::bigint
+  AND m.kind = 'third_place'
+LIMIT 1
+`
+
+type FindThirdPlaceMatchRow struct {
+	ID               int64
+	PublicID         string
+	TournamentID     int64
+	Round            int32
+	Slot             int32
+	Kind             string
+	Status           string
+	ResultKind       string
+	HandicapOpen     bool
+	HandicapLockedAt *time.Time
+	StreamUrl        *string
+	StartedAt        *time.Time
+	FinishedAt       *time.Time
+	WinnerPlayerID   *int64
+	SetupConfirmedAt *time.Time
+	SetupConfirmedBy *int64
+	P1PlayerID       *int64
+	P1PublicID       *string
+	P1FencerID       *int64
+	P1DisplayName    *string
+	P1RankLevel      *int16
+	P1Status         *string
+	P2PlayerID       *int64
+	P2PublicID       *string
+	P2FencerID       *int64
+	P2DisplayName    *string
+	P2RankLevel      *int16
+	P2Status         *string
+}
+
+// 本屆的季軍戰(至多一場)。查無 0 列 → adapter 回 nil,不是錯誤:
+// 沒建就是「還沒到那一步」或「這屆不打季軍戰」。無鎖。
+func (q *Queries) FindThirdPlaceMatch(ctx context.Context, tournamentID int64) (FindThirdPlaceMatchRow, error) {
+	row := q.db.QueryRow(ctx, findThirdPlaceMatch, tournamentID)
+	var i FindThirdPlaceMatchRow
+	err := row.Scan(
+		&i.ID,
+		&i.PublicID,
+		&i.TournamentID,
+		&i.Round,
+		&i.Slot,
+		&i.Kind,
+		&i.Status,
+		&i.ResultKind,
+		&i.HandicapOpen,
+		&i.HandicapLockedAt,
+		&i.StreamUrl,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.WinnerPlayerID,
+		&i.SetupConfirmedAt,
+		&i.SetupConfirmedBy,
+		&i.P1PlayerID,
+		&i.P1PublicID,
+		&i.P1FencerID,
+		&i.P1DisplayName,
+		&i.P1RankLevel,
+		&i.P1Status,
+		&i.P2PlayerID,
+		&i.P2PublicID,
+		&i.P2FencerID,
+		&i.P2DisplayName,
+		&i.P2RankLevel,
+		&i.P2Status,
+	)
+	return i, err
+}
+
+const finishMatchRound = `-- name: FinishMatchRound :one
+UPDATE activity.match_rounds
+SET winner_player_id = $1::bigint,
+    finished_at = now()
+WHERE match_id = $2::bigint
+  AND round_no = $3::int
+  AND finished_at IS NULL
+RETURNING id, match_id, round_no, started_at, finished_at, winner_player_id, created_at
+`
+
+type FinishMatchRoundParams struct {
+	WinnerPlayerID int64
+	MatchID        int64
+	RoundNo        int32
+}
+
+// 填該回合勝者。finished_at IS NULL 是「一回合只結束一次」的 DB 側保證;
+// 0 列 = 查無此回合或已結束,adapter 重讀分辨。勝者必須是場上兩人之一由 service 擋
+// (DB 無法跨表 CHECK)。finished_at >= started_at 由 match_rounds_order_check 守。
+func (q *Queries) FinishMatchRound(ctx context.Context, arg FinishMatchRoundParams) (ActivityMatchRound, error) {
+	row := q.db.QueryRow(ctx, finishMatchRound, arg.WinnerPlayerID, arg.MatchID, arg.RoundNo)
+	var i ActivityMatchRound
+	err := row.Scan(
+		&i.ID,
+		&i.MatchID,
+		&i.RoundNo,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.WinnerPlayerID,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getMatchForJudge = `-- name: GetMatchForJudge :one
+SELECT
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
+  m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
+  m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
   m.p1_player_id,
   p1.public_id    AS p1_public_id,
   p1.fencer_id    AS p1_fencer_id,
@@ -76,6 +320,7 @@ type GetMatchForJudgeRow struct {
 	TournamentID     int64
 	Round            int32
 	Slot             int32
+	Kind             string
 	Status           string
 	ResultKind       string
 	HandicapOpen     bool
@@ -84,6 +329,8 @@ type GetMatchForJudgeRow struct {
 	StartedAt        *time.Time
 	FinishedAt       *time.Time
 	WinnerPlayerID   *int64
+	SetupConfirmedAt *time.Time
+	SetupConfirmedBy *int64
 	P1PlayerID       *int64
 	P1PublicID       *string
 	P1FencerID       *int64
@@ -111,6 +358,7 @@ func (q *Queries) GetMatchForJudge(ctx context.Context, matchPublicID string) (G
 		&i.TournamentID,
 		&i.Round,
 		&i.Slot,
+		&i.Kind,
 		&i.Status,
 		&i.ResultKind,
 		&i.HandicapOpen,
@@ -119,6 +367,8 @@ func (q *Queries) GetMatchForJudge(ctx context.Context, matchPublicID string) (G
 		&i.StartedAt,
 		&i.FinishedAt,
 		&i.WinnerPlayerID,
+		&i.SetupConfirmedAt,
+		&i.SetupConfirmedBy,
 		&i.P1PlayerID,
 		&i.P1PublicID,
 		&i.P1FencerID,
@@ -137,9 +387,10 @@ func (q *Queries) GetMatchForJudge(ctx context.Context, matchPublicID string) (G
 
 const getMatchForJudgeByID = `-- name: GetMatchForJudgeByID :one
 SELECT
-  m.id, m.public_id, m.tournament_id, m.round, m.slot,
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
   m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
   m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
   m.p1_player_id,
   p1.public_id    AS p1_public_id,
   p1.fencer_id    AS p1_fencer_id,
@@ -164,6 +415,7 @@ type GetMatchForJudgeByIDRow struct {
 	TournamentID     int64
 	Round            int32
 	Slot             int32
+	Kind             string
 	Status           string
 	ResultKind       string
 	HandicapOpen     bool
@@ -172,6 +424,8 @@ type GetMatchForJudgeByIDRow struct {
 	StartedAt        *time.Time
 	FinishedAt       *time.Time
 	WinnerPlayerID   *int64
+	SetupConfirmedAt *time.Time
+	SetupConfirmedBy *int64
 	P1PlayerID       *int64
 	P1PublicID       *string
 	P1FencerID       *int64
@@ -201,6 +455,7 @@ func (q *Queries) GetMatchForJudgeByID(ctx context.Context, id int64) (GetMatchF
 		&i.TournamentID,
 		&i.Round,
 		&i.Slot,
+		&i.Kind,
 		&i.Status,
 		&i.ResultKind,
 		&i.HandicapOpen,
@@ -209,6 +464,165 @@ func (q *Queries) GetMatchForJudgeByID(ctx context.Context, id int64) (GetMatchF
 		&i.StartedAt,
 		&i.FinishedAt,
 		&i.WinnerPlayerID,
+		&i.SetupConfirmedAt,
+		&i.SetupConfirmedBy,
+		&i.P1PlayerID,
+		&i.P1PublicID,
+		&i.P1FencerID,
+		&i.P1DisplayName,
+		&i.P1RankLevel,
+		&i.P1Status,
+		&i.P2PlayerID,
+		&i.P2PublicID,
+		&i.P2FencerID,
+		&i.P2DisplayName,
+		&i.P2RankLevel,
+		&i.P2Status,
+	)
+	return i, err
+}
+
+const insertMatchRound = `-- name: InsertMatchRound :one
+
+INSERT INTO activity.match_rounds (match_id, round_no)
+VALUES ($1::bigint, $2::int)
+RETURNING id, match_id, round_no, started_at, finished_at, winner_player_id, created_at
+`
+
+type InsertMatchRoundParams struct {
+	MatchID int64
+	RoundNo int32
+}
+
+// ══ 回合 ════════════════════════════════════════════════════════
+//
+// 回合列在裁判按「正式決鬥開始」時建,不預建(00006 檔頭)。所以「開始第 N 回合」
+// 就是 INSERT;started_at 由 DEFAULT now() 給 —— core 不該有第二個時鐘。
+// 第一回合開始時 matches.started_at 也要寫(那是下注關盤點),由 MarkMatchLive 負責,
+// 兩句在同一個 tx 裡。match_rounds_match_round_uq 讓「同一回合開始兩次」是 23505。
+func (q *Queries) InsertMatchRound(ctx context.Context, arg InsertMatchRoundParams) (ActivityMatchRound, error) {
+	row := q.db.QueryRow(ctx, insertMatchRound, arg.MatchID, arg.RoundNo)
+	var i ActivityMatchRound
+	err := row.Scan(
+		&i.ID,
+		&i.MatchID,
+		&i.RoundNo,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.WinnerPlayerID,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const insertThirdPlaceMatch = `-- name: InsertThirdPlaceMatch :one
+
+WITH ins AS (
+  INSERT INTO activity.matches (
+    tournament_id, public_id, round, slot, kind, p1_player_id, p2_player_id, status
+  )
+  VALUES (
+    $1::bigint, $2::text,
+    $3::int, $4::int, 'third_place',
+    $5::bigint, $6::bigint, 'pending'
+  )
+  RETURNING id, public_id, tournament_id, round, slot, p1_player_id, p2_player_id, winner_player_id, status, handicap_open, handicap_locked_at, stream_url, result_kind, started_at, finished_at, created_at, updated_at, kind, setup_confirmed_at, setup_confirmed_by
+)
+SELECT
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
+  m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
+  m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
+  m.p1_player_id,
+  p1.public_id    AS p1_public_id,
+  p1.fencer_id    AS p1_fencer_id,
+  p1.display_name AS p1_display_name,
+  p1.rank_level   AS p1_rank_level,
+  p1.status       AS p1_status,
+  m.p2_player_id,
+  p2.public_id    AS p2_public_id,
+  p2.fencer_id    AS p2_fencer_id,
+  p2.display_name AS p2_display_name,
+  p2.rank_level   AS p2_rank_level,
+  p2.status       AS p2_status
+FROM ins m
+LEFT JOIN activity.tournament_players p1 ON p1.id = m.p1_player_id
+LEFT JOIN activity.tournament_players p2 ON p2.id = m.p2_player_id
+`
+
+type InsertThirdPlaceMatchParams struct {
+	TournamentID int64
+	PublicID     string
+	Round        int32
+	Slot         int32
+	P1PlayerID   int64
+	P2PlayerID   int64
+}
+
+type InsertThirdPlaceMatchRow struct {
+	ID               int64
+	PublicID         string
+	TournamentID     int64
+	Round            int32
+	Slot             int32
+	Kind             string
+	Status           string
+	ResultKind       string
+	HandicapOpen     bool
+	HandicapLockedAt *time.Time
+	StreamUrl        *string
+	StartedAt        *time.Time
+	FinishedAt       *time.Time
+	WinnerPlayerID   *int64
+	SetupConfirmedAt *time.Time
+	SetupConfirmedBy *int64
+	P1PlayerID       *int64
+	P1PublicID       *string
+	P1FencerID       *int64
+	P1DisplayName    *string
+	P1RankLevel      *int16
+	P1Status         *string
+	P2PlayerID       *int64
+	P2PublicID       *string
+	P2FencerID       *int64
+	P2DisplayName    *string
+	P2RankLevel      *int16
+	P2Status         *string
+}
+
+// ══ 季軍戰 ══════════════════════════════════════════════════════
+// 準決賽兩場都 done 之後建季軍戰(config.format.third_place_match = true 時)。
+// kind = 'third_place'、雙方已知、狀態 pending(等裁判開盤,與其他場次一樣走完整流程)。
+// round 記為決賽那一輪、slot 由呼叫端給(bracket 套件決定,這裡不推)。
+// UNIQUE (tournament_id, round, slot) 讓重複建是 23505,不是靜靜多一場。
+// 回傳形狀與 LockMatchForJudge 逐字相同。
+func (q *Queries) InsertThirdPlaceMatch(ctx context.Context, arg InsertThirdPlaceMatchParams) (InsertThirdPlaceMatchRow, error) {
+	row := q.db.QueryRow(ctx, insertThirdPlaceMatch,
+		arg.TournamentID,
+		arg.PublicID,
+		arg.Round,
+		arg.Slot,
+		arg.P1PlayerID,
+		arg.P2PlayerID,
+	)
+	var i InsertThirdPlaceMatchRow
+	err := row.Scan(
+		&i.ID,
+		&i.PublicID,
+		&i.TournamentID,
+		&i.Round,
+		&i.Slot,
+		&i.Kind,
+		&i.Status,
+		&i.ResultKind,
+		&i.HandicapOpen,
+		&i.HandicapLockedAt,
+		&i.StreamUrl,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.WinnerPlayerID,
+		&i.SetupConfirmedAt,
+		&i.SetupConfirmedBy,
 		&i.P1PlayerID,
 		&i.P1PublicID,
 		&i.P1FencerID,
@@ -272,11 +686,85 @@ func (q *Queries) JudgeTournamentByID(ctx context.Context, tournamentID int64) (
 	return i, err
 }
 
+const listMatchRounds = `-- name: ListMatchRounds :many
+SELECT id, match_id, round_no, started_at, finished_at, winner_player_id, created_at
+FROM activity.match_rounds
+WHERE match_id = $1::bigint
+ORDER BY round_no
+`
+
+// 一場的全部回合,依 round_no。回合比數與整場勝者都從這裡算(衍生值不存)。
+// 無鎖:讀取路徑(對戰表、計時器、結算)都用它;寫入路徑已持有 matches 列鎖。
+func (q *Queries) ListMatchRounds(ctx context.Context, matchID int64) ([]ActivityMatchRound, error) {
+	rows, err := q.db.Query(ctx, listMatchRounds, matchID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ActivityMatchRound
+	for rows.Next() {
+		var i ActivityMatchRound
+		if err := rows.Scan(
+			&i.ID,
+			&i.MatchID,
+			&i.RoundNo,
+			&i.StartedAt,
+			&i.FinishedAt,
+			&i.WinnerPlayerID,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listMatchRoundsByMatches = `-- name: ListMatchRoundsByMatches :many
+SELECT id, match_id, round_no, started_at, finished_at, winner_player_id, created_at
+FROM activity.match_rounds
+WHERE match_id = ANY($1::bigint[])
+ORDER BY match_id, round_no
+`
+
+// 批次版(對戰表一次撈整屆的回合)。順序 (match_id, round_no),呼叫端自己分組。
+func (q *Queries) ListMatchRoundsByMatches(ctx context.Context, matchIds []int64) ([]ActivityMatchRound, error) {
+	rows, err := q.db.Query(ctx, listMatchRoundsByMatches, matchIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ActivityMatchRound
+	for rows.Next() {
+		var i ActivityMatchRound
+		if err := rows.Scan(
+			&i.ID,
+			&i.MatchID,
+			&i.RoundNo,
+			&i.StartedAt,
+			&i.FinishedAt,
+			&i.WinnerPlayerID,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockMatchAtForJudge = `-- name: LockMatchAtForJudge :one
 SELECT
-  m.id, m.public_id, m.tournament_id, m.round, m.slot,
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
   m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
   m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
   m.p1_player_id,
   p1.public_id    AS p1_public_id,
   p1.fencer_id    AS p1_fencer_id,
@@ -310,6 +798,7 @@ type LockMatchAtForJudgeRow struct {
 	TournamentID     int64
 	Round            int32
 	Slot             int32
+	Kind             string
 	Status           string
 	ResultKind       string
 	HandicapOpen     bool
@@ -318,6 +807,8 @@ type LockMatchAtForJudgeRow struct {
 	StartedAt        *time.Time
 	FinishedAt       *time.Time
 	WinnerPlayerID   *int64
+	SetupConfirmedAt *time.Time
+	SetupConfirmedBy *int64
 	P1PlayerID       *int64
 	P1PublicID       *string
 	P1FencerID       *int64
@@ -345,6 +836,7 @@ func (q *Queries) LockMatchAtForJudge(ctx context.Context, arg LockMatchAtForJud
 		&i.TournamentID,
 		&i.Round,
 		&i.Slot,
+		&i.Kind,
 		&i.Status,
 		&i.ResultKind,
 		&i.HandicapOpen,
@@ -353,6 +845,8 @@ func (q *Queries) LockMatchAtForJudge(ctx context.Context, arg LockMatchAtForJud
 		&i.StartedAt,
 		&i.FinishedAt,
 		&i.WinnerPlayerID,
+		&i.SetupConfirmedAt,
+		&i.SetupConfirmedBy,
 		&i.P1PlayerID,
 		&i.P1PublicID,
 		&i.P1FencerID,
@@ -372,9 +866,10 @@ func (q *Queries) LockMatchAtForJudge(ctx context.Context, arg LockMatchAtForJud
 const lockMatchForJudge = `-- name: LockMatchForJudge :one
 
 SELECT
-  m.id, m.public_id, m.tournament_id, m.round, m.slot,
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
   m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
   m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
   m.p1_player_id,
   p1.public_id    AS p1_public_id,
   p1.fencer_id    AS p1_fencer_id,
@@ -400,6 +895,7 @@ type LockMatchForJudgeRow struct {
 	TournamentID     int64
 	Round            int32
 	Slot             int32
+	Kind             string
 	Status           string
 	ResultKind       string
 	HandicapOpen     bool
@@ -408,6 +904,8 @@ type LockMatchForJudgeRow struct {
 	StartedAt        *time.Time
 	FinishedAt       *time.Time
 	WinnerPlayerID   *int64
+	SetupConfirmedAt *time.Time
+	SetupConfirmedBy *int64
 	P1PlayerID       *int64
 	P1PublicID       *string
 	P1FencerID       *int64
@@ -450,6 +948,7 @@ func (q *Queries) LockMatchForJudge(ctx context.Context, matchPublicID string) (
 		&i.TournamentID,
 		&i.Round,
 		&i.Slot,
+		&i.Kind,
 		&i.Status,
 		&i.ResultKind,
 		&i.HandicapOpen,
@@ -458,6 +957,8 @@ func (q *Queries) LockMatchForJudge(ctx context.Context, matchPublicID string) (
 		&i.StartedAt,
 		&i.FinishedAt,
 		&i.WinnerPlayerID,
+		&i.SetupConfirmedAt,
+		&i.SetupConfirmedBy,
 		&i.P1PlayerID,
 		&i.P1PublicID,
 		&i.P1FencerID,
@@ -614,9 +1115,10 @@ func (q *Queries) LockTournamentForJudgingByPlayer(ctx context.Context, playerPu
 
 const lockUnfinishedMatchesOfPlayer = `-- name: LockUnfinishedMatchesOfPlayer :many
 SELECT
-  m.id, m.public_id, m.tournament_id, m.round, m.slot,
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
   m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
   m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
   m.p1_player_id,
   p1.public_id    AS p1_public_id,
   p1.fencer_id    AS p1_fencer_id,
@@ -645,6 +1147,7 @@ type LockUnfinishedMatchesOfPlayerRow struct {
 	TournamentID     int64
 	Round            int32
 	Slot             int32
+	Kind             string
 	Status           string
 	ResultKind       string
 	HandicapOpen     bool
@@ -653,6 +1156,8 @@ type LockUnfinishedMatchesOfPlayerRow struct {
 	StartedAt        *time.Time
 	FinishedAt       *time.Time
 	WinnerPlayerID   *int64
+	SetupConfirmedAt *time.Time
+	SetupConfirmedBy *int64
 	P1PlayerID       *int64
 	P1PublicID       *string
 	P1FencerID       *int64
@@ -692,6 +1197,7 @@ func (q *Queries) LockUnfinishedMatchesOfPlayer(ctx context.Context, playerID in
 			&i.TournamentID,
 			&i.Round,
 			&i.Slot,
+			&i.Kind,
 			&i.Status,
 			&i.ResultKind,
 			&i.HandicapOpen,
@@ -700,6 +1206,8 @@ func (q *Queries) LockUnfinishedMatchesOfPlayer(ctx context.Context, playerID in
 			&i.StartedAt,
 			&i.FinishedAt,
 			&i.WinnerPlayerID,
+			&i.SetupConfirmedAt,
+			&i.SetupConfirmedBy,
 			&i.P1PlayerID,
 			&i.P1PublicID,
 			&i.P1FencerID,
@@ -733,12 +1241,13 @@ WITH upd AS (
       updated_at = now()
   WHERE id = $3::bigint
     AND status <> 'done'
-  RETURNING id, public_id, tournament_id, round, slot, p1_player_id, p2_player_id, winner_player_id, status, handicap_open, handicap_locked_at, stream_url, result_kind, started_at, finished_at, created_at, updated_at
+  RETURNING id, public_id, tournament_id, round, slot, p1_player_id, p2_player_id, winner_player_id, status, handicap_open, handicap_locked_at, stream_url, result_kind, started_at, finished_at, created_at, updated_at, kind, setup_confirmed_at, setup_confirmed_by
 )
 SELECT
-  m.id, m.public_id, m.tournament_id, m.round, m.slot,
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
   m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
   m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
   m.p1_player_id,
   p1.public_id    AS p1_public_id,
   p1.fencer_id    AS p1_fencer_id,
@@ -768,6 +1277,7 @@ type MarkMatchFinishedRow struct {
 	TournamentID     int64
 	Round            int32
 	Slot             int32
+	Kind             string
 	Status           string
 	ResultKind       string
 	HandicapOpen     bool
@@ -776,6 +1286,8 @@ type MarkMatchFinishedRow struct {
 	StartedAt        *time.Time
 	FinishedAt       *time.Time
 	WinnerPlayerID   *int64
+	SetupConfirmedAt *time.Time
+	SetupConfirmedBy *int64
 	P1PlayerID       *int64
 	P1PublicID       *string
 	P1FencerID       *int64
@@ -814,6 +1326,7 @@ func (q *Queries) MarkMatchFinished(ctx context.Context, arg MarkMatchFinishedPa
 		&i.TournamentID,
 		&i.Round,
 		&i.Slot,
+		&i.Kind,
 		&i.Status,
 		&i.ResultKind,
 		&i.HandicapOpen,
@@ -822,6 +1335,8 @@ func (q *Queries) MarkMatchFinished(ctx context.Context, arg MarkMatchFinishedPa
 		&i.StartedAt,
 		&i.FinishedAt,
 		&i.WinnerPlayerID,
+		&i.SetupConfirmedAt,
+		&i.SetupConfirmedBy,
 		&i.P1PlayerID,
 		&i.P1PublicID,
 		&i.P1FencerID,
@@ -846,12 +1361,14 @@ WITH upd AS (
       updated_at = now()
   WHERE id = $1::bigint
     AND status = 'locked'
-  RETURNING id, public_id, tournament_id, round, slot, p1_player_id, p2_player_id, winner_player_id, status, handicap_open, handicap_locked_at, stream_url, result_kind, started_at, finished_at, created_at, updated_at
+    AND setup_confirmed_at IS NOT NULL
+  RETURNING id, public_id, tournament_id, round, slot, p1_player_id, p2_player_id, winner_player_id, status, handicap_open, handicap_locked_at, stream_url, result_kind, started_at, finished_at, created_at, updated_at, kind, setup_confirmed_at, setup_confirmed_by
 )
 SELECT
-  m.id, m.public_id, m.tournament_id, m.round, m.slot,
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
   m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
   m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
   m.p1_player_id,
   p1.public_id    AS p1_public_id,
   p1.fencer_id    AS p1_fencer_id,
@@ -875,6 +1392,7 @@ type MarkMatchLiveRow struct {
 	TournamentID     int64
 	Round            int32
 	Slot             int32
+	Kind             string
 	Status           string
 	ResultKind       string
 	HandicapOpen     bool
@@ -883,6 +1401,8 @@ type MarkMatchLiveRow struct {
 	StartedAt        *time.Time
 	FinishedAt       *time.Time
 	WinnerPlayerID   *int64
+	SetupConfirmedAt *time.Time
+	SetupConfirmedBy *int64
 	P1PlayerID       *int64
 	P1PublicID       *string
 	P1FencerID       *int64
@@ -913,6 +1433,7 @@ func (q *Queries) MarkMatchLive(ctx context.Context, matchID int64) (MarkMatchLi
 		&i.TournamentID,
 		&i.Round,
 		&i.Slot,
+		&i.Kind,
 		&i.Status,
 		&i.ResultKind,
 		&i.HandicapOpen,
@@ -921,6 +1442,8 @@ func (q *Queries) MarkMatchLive(ctx context.Context, matchID int64) (MarkMatchLi
 		&i.StartedAt,
 		&i.FinishedAt,
 		&i.WinnerPlayerID,
+		&i.SetupConfirmedAt,
+		&i.SetupConfirmedBy,
 		&i.P1PlayerID,
 		&i.P1PublicID,
 		&i.P1FencerID,
@@ -946,12 +1469,13 @@ WITH upd AS (
       updated_at = now()
   WHERE id = $1::bigint
     AND status = 'pending'
-  RETURNING id, public_id, tournament_id, round, slot, p1_player_id, p2_player_id, winner_player_id, status, handicap_open, handicap_locked_at, stream_url, result_kind, started_at, finished_at, created_at, updated_at
+  RETURNING id, public_id, tournament_id, round, slot, p1_player_id, p2_player_id, winner_player_id, status, handicap_open, handicap_locked_at, stream_url, result_kind, started_at, finished_at, created_at, updated_at, kind, setup_confirmed_at, setup_confirmed_by
 )
 SELECT
-  m.id, m.public_id, m.tournament_id, m.round, m.slot,
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
   m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
   m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
   m.p1_player_id,
   p1.public_id    AS p1_public_id,
   p1.fencer_id    AS p1_fencer_id,
@@ -975,6 +1499,7 @@ type MarkMatchReadyRow struct {
 	TournamentID     int64
 	Round            int32
 	Slot             int32
+	Kind             string
 	Status           string
 	ResultKind       string
 	HandicapOpen     bool
@@ -983,6 +1508,8 @@ type MarkMatchReadyRow struct {
 	StartedAt        *time.Time
 	FinishedAt       *time.Time
 	WinnerPlayerID   *int64
+	SetupConfirmedAt *time.Time
+	SetupConfirmedBy *int64
 	P1PlayerID       *int64
 	P1PublicID       *string
 	P1FencerID       *int64
@@ -1022,6 +1549,7 @@ func (q *Queries) MarkMatchReady(ctx context.Context, matchID int64) (MarkMatchR
 		&i.TournamentID,
 		&i.Round,
 		&i.Slot,
+		&i.Kind,
 		&i.Status,
 		&i.ResultKind,
 		&i.HandicapOpen,
@@ -1030,6 +1558,8 @@ func (q *Queries) MarkMatchReady(ctx context.Context, matchID int64) (MarkMatchR
 		&i.StartedAt,
 		&i.FinishedAt,
 		&i.WinnerPlayerID,
+		&i.SetupConfirmedAt,
+		&i.SetupConfirmedBy,
 		&i.P1PlayerID,
 		&i.P1PublicID,
 		&i.P1FencerID,
@@ -1098,12 +1628,13 @@ WITH upd AS (
     AND status = 'pending'
     AND CASE WHEN $1::boolean
              THEN p1_player_id ELSE p2_player_id END IS NULL
-  RETURNING id, public_id, tournament_id, round, slot, p1_player_id, p2_player_id, winner_player_id, status, handicap_open, handicap_locked_at, stream_url, result_kind, started_at, finished_at, created_at, updated_at
+  RETURNING id, public_id, tournament_id, round, slot, p1_player_id, p2_player_id, winner_player_id, status, handicap_open, handicap_locked_at, stream_url, result_kind, started_at, finished_at, created_at, updated_at, kind, setup_confirmed_at, setup_confirmed_by
 )
 SELECT
-  m.id, m.public_id, m.tournament_id, m.round, m.slot,
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
   m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
   m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
   m.p1_player_id,
   p1.public_id    AS p1_public_id,
   p1.fencer_id    AS p1_fencer_id,
@@ -1133,6 +1664,7 @@ type SeatMatchPlayerRow struct {
 	TournamentID     int64
 	Round            int32
 	Slot             int32
+	Kind             string
 	Status           string
 	ResultKind       string
 	HandicapOpen     bool
@@ -1141,6 +1673,8 @@ type SeatMatchPlayerRow struct {
 	StartedAt        *time.Time
 	FinishedAt       *time.Time
 	WinnerPlayerID   *int64
+	SetupConfirmedAt *time.Time
+	SetupConfirmedBy *int64
 	P1PlayerID       *int64
 	P1PublicID       *string
 	P1FencerID       *int64
@@ -1182,6 +1716,7 @@ func (q *Queries) SeatMatchPlayer(ctx context.Context, arg SeatMatchPlayerParams
 		&i.TournamentID,
 		&i.Round,
 		&i.Slot,
+		&i.Kind,
 		&i.Status,
 		&i.ResultKind,
 		&i.HandicapOpen,
@@ -1190,6 +1725,8 @@ func (q *Queries) SeatMatchPlayer(ctx context.Context, arg SeatMatchPlayerParams
 		&i.StartedAt,
 		&i.FinishedAt,
 		&i.WinnerPlayerID,
+		&i.SetupConfirmedAt,
+		&i.SetupConfirmedBy,
 		&i.P1PlayerID,
 		&i.P1PublicID,
 		&i.P1FencerID,
@@ -1212,12 +1749,13 @@ WITH upd AS (
   SET stream_url = NULLIF($1::text, ''),
       updated_at = now()
   WHERE id = $2::bigint
-  RETURNING id, public_id, tournament_id, round, slot, p1_player_id, p2_player_id, winner_player_id, status, handicap_open, handicap_locked_at, stream_url, result_kind, started_at, finished_at, created_at, updated_at
+  RETURNING id, public_id, tournament_id, round, slot, p1_player_id, p2_player_id, winner_player_id, status, handicap_open, handicap_locked_at, stream_url, result_kind, started_at, finished_at, created_at, updated_at, kind, setup_confirmed_at, setup_confirmed_by
 )
 SELECT
-  m.id, m.public_id, m.tournament_id, m.round, m.slot,
+  m.id, m.public_id, m.tournament_id, m.round, m.slot, m.kind,
   m.status, m.result_kind, m.handicap_open, m.handicap_locked_at,
   m.stream_url, m.started_at, m.finished_at, m.winner_player_id,
+  m.setup_confirmed_at, m.setup_confirmed_by,
   m.p1_player_id,
   p1.public_id    AS p1_public_id,
   p1.fencer_id    AS p1_fencer_id,
@@ -1246,6 +1784,7 @@ type SetMatchStreamURLRow struct {
 	TournamentID     int64
 	Round            int32
 	Slot             int32
+	Kind             string
 	Status           string
 	ResultKind       string
 	HandicapOpen     bool
@@ -1254,6 +1793,8 @@ type SetMatchStreamURLRow struct {
 	StartedAt        *time.Time
 	FinishedAt       *time.Time
 	WinnerPlayerID   *int64
+	SetupConfirmedAt *time.Time
+	SetupConfirmedBy *int64
 	P1PlayerID       *int64
 	P1PublicID       *string
 	P1FencerID       *int64
@@ -1283,6 +1824,7 @@ func (q *Queries) SetMatchStreamURL(ctx context.Context, arg SetMatchStreamURLPa
 		&i.TournamentID,
 		&i.Round,
 		&i.Slot,
+		&i.Kind,
 		&i.Status,
 		&i.ResultKind,
 		&i.HandicapOpen,
@@ -1291,6 +1833,8 @@ func (q *Queries) SetMatchStreamURL(ctx context.Context, arg SetMatchStreamURLPa
 		&i.StartedAt,
 		&i.FinishedAt,
 		&i.WinnerPlayerID,
+		&i.SetupConfirmedAt,
+		&i.SetupConfirmedBy,
 		&i.P1PlayerID,
 		&i.P1PublicID,
 		&i.P1FencerID,

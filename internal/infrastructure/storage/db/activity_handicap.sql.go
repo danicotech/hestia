@@ -10,6 +10,21 @@ import (
 	"time"
 )
 
+const countHandicapSelectionsInTournament = `-- name: CountHandicapSelectionsInTournament :one
+SELECT count(*)::bigint AS selections
+FROM activity.handicap_selections s
+JOIN activity.handicap_items i ON i.id = s.item_id
+WHERE i.tournament_id = $1
+`
+
+// 該屆指向任何讓武項目的選擇數,**含已作廢**:退掉的也是「有人依這份文字買過」。
+func (q *Queries) CountHandicapSelectionsInTournament(ctx context.Context, tournamentID int64) (int64, error) {
+	row := q.db.QueryRow(ctx, countHandicapSelectionsInTournament, tournamentID)
+	var selections int64
+	err := row.Scan(&selections)
+	return selections, err
+}
+
 const findMatchBudgetByMatch = `-- name: FindMatchBudgetByMatch :one
 SELECT b.match_id, b.player_id, p.public_id AS player_public_id, b.budget, b.spent
 FROM activity.match_budgets b
@@ -42,9 +57,57 @@ func (q *Queries) FindMatchBudgetByMatch(ctx context.Context, matchID int64) (Fi
 	return i, err
 }
 
+const getHandicapItemByKey = `-- name: GetHandicapItemByKey :one
+SELECT id, public_id, tournament_id, key, category, name, description, referee_note,
+       cost, repeatable, sort_order, params
+FROM activity.handicap_items
+WHERE tournament_id = $1 AND key = $2
+`
+
+type GetHandicapItemByKeyParams struct {
+	TournamentID int64
+	Key          string
+}
+
+type GetHandicapItemByKeyRow struct {
+	ID           int64
+	PublicID     string
+	TournamentID int64
+	Key          string
+	Category     string
+	Name         string
+	Description  *string
+	RefereeNote  *string
+	Cost         int64
+	Repeatable   bool
+	SortOrder    int32
+	Params       []byte
+}
+
+// 以穩定識別定址(封盤時抽選、規則判斷都用 key,不用名稱)。tournament_id 一起進 WHERE 同上。
+func (q *Queries) GetHandicapItemByKey(ctx context.Context, arg GetHandicapItemByKeyParams) (GetHandicapItemByKeyRow, error) {
+	row := q.db.QueryRow(ctx, getHandicapItemByKey, arg.TournamentID, arg.Key)
+	var i GetHandicapItemByKeyRow
+	err := row.Scan(
+		&i.ID,
+		&i.PublicID,
+		&i.TournamentID,
+		&i.Key,
+		&i.Category,
+		&i.Name,
+		&i.Description,
+		&i.RefereeNote,
+		&i.Cost,
+		&i.Repeatable,
+		&i.SortOrder,
+		&i.Params,
+	)
+	return i, err
+}
+
 const getHandicapItemByPublicID = `-- name: GetHandicapItemByPublicID :one
-SELECT id, public_id, tournament_id, category, name, description, referee_note,
-       cost, repeatable, sort_order
+SELECT id, public_id, tournament_id, key, category, name, description, referee_note,
+       cost, repeatable, sort_order, params
 FROM activity.handicap_items
 WHERE tournament_id = $1 AND public_id = $2
 `
@@ -58,6 +121,7 @@ type GetHandicapItemByPublicIDRow struct {
 	ID           int64
 	PublicID     string
 	TournamentID int64
+	Key          string
 	Category     string
 	Name         string
 	Description  *string
@@ -65,6 +129,7 @@ type GetHandicapItemByPublicIDRow struct {
 	Cost         int64
 	Repeatable   bool
 	SortOrder    int32
+	Params       []byte
 }
 
 // tournament_id 一起進 WHERE 而不是查到再比對:項目逐屆一套、價格逐屆可調,
@@ -76,6 +141,7 @@ func (q *Queries) GetHandicapItemByPublicID(ctx context.Context, arg GetHandicap
 		&i.ID,
 		&i.PublicID,
 		&i.TournamentID,
+		&i.Key,
 		&i.Category,
 		&i.Name,
 		&i.Description,
@@ -83,6 +149,7 @@ func (q *Queries) GetHandicapItemByPublicID(ctx context.Context, arg GetHandicap
 		&i.Cost,
 		&i.Repeatable,
 		&i.SortOrder,
+		&i.Params,
 	)
 	return i, err
 }
@@ -90,8 +157,14 @@ func (q *Queries) GetHandicapItemByPublicID(ctx context.Context, arg GetHandicap
 const getHandicapSelection = `-- name: GetHandicapSelection :one
 SELECT s.id, s.public_id, s.match_id, m.public_id AS match_public_id,
        s.player_id, s.item_id,
-       i.public_id AS item_ref, i.name AS item_name, i.category,
-       s.cost, s.target_note, s.voided, s.created_at
+       i.public_id AS item_ref, i.key AS item_key, i.name AS item_name, i.category,
+       i.params AS item_params,
+       -- 執行說明跟著選擇走:開賽前設定確認清單就是「該場每筆選擇的 referee_note + 抽選結果」,
+       -- 不帶的話裁判端要逐項回查。對外仍不離開裁判端(選手端的轉換不輸出它)。
+       COALESCE(i.referee_note, '')::text AS item_referee_note,
+       i.sort_order AS item_sort_order,
+       s.cost, s.target_note, s.voided, s.created_at,
+       s.draw_result, s.drawn_at
 FROM activity.handicap_selections s
 JOIN activity.handicap_items i ON i.id = s.item_id
 JOIN activity.matches m ON m.id = s.match_id
@@ -99,19 +172,25 @@ WHERE s.public_id = $1
 `
 
 type GetHandicapSelectionRow struct {
-	ID            int64
-	PublicID      string
-	MatchID       int64
-	MatchPublicID string
-	PlayerID      int64
-	ItemID        int64
-	ItemRef       string
-	ItemName      string
-	Category      string
-	Cost          int64
-	TargetNote    *string
-	Voided        bool
-	CreatedAt     time.Time
+	ID              int64
+	PublicID        string
+	MatchID         int64
+	MatchPublicID   string
+	PlayerID        int64
+	ItemID          int64
+	ItemRef         string
+	ItemKey         string
+	ItemName        string
+	Category        string
+	ItemParams      []byte
+	ItemRefereeNote string
+	ItemSortOrder   int32
+	Cost            int64
+	TargetNote      *string
+	Voided          bool
+	CreatedAt       time.Time
+	DrawResult      *string
+	DrawnAt         *time.Time
 }
 
 // 與 ListHandicapSelections 相反,這裡**含已作廢者**,voided 原樣回傳:
@@ -131,12 +210,18 @@ func (q *Queries) GetHandicapSelection(ctx context.Context, publicID string) (Ge
 		&i.PlayerID,
 		&i.ItemID,
 		&i.ItemRef,
+		&i.ItemKey,
 		&i.ItemName,
 		&i.Category,
+		&i.ItemParams,
+		&i.ItemRefereeNote,
+		&i.ItemSortOrder,
 		&i.Cost,
 		&i.TargetNote,
 		&i.Voided,
 		&i.CreatedAt,
+		&i.DrawResult,
+		&i.DrawnAt,
 	)
 	return i, err
 }
@@ -189,7 +274,10 @@ SELECT
   p2.public_id AS p2_player_public_id,
   p1.rank_level AS p1_rank_level,
   p2.rank_level AS p2_rank_level,
-  COALESCE(NULLIF(t.config ->> 'bp_per_rank_gap', ''), '0')::bigint AS per_rank_gap
+  -- v2 config 在 bp.per_rank_gap,v1 在頂層 bp_per_rank_gap(schemas/28「從 version 1 升版」)。
+  -- 兩者都缺時回 0,由 bp 套件退回預設值 8。
+  COALESCE(NULLIF(t.config -> 'bp' ->> 'per_rank_gap', ''),
+           NULLIF(t.config ->> 'bp_per_rank_gap', ''), '0')::bigint AS per_rank_gap
 FROM activity.matches m
 JOIN activity.tournaments t ON t.id = m.tournament_id
 LEFT JOIN activity.tournament_players p1 ON p1.id = m.p1_player_id
@@ -241,24 +329,29 @@ func (q *Queries) GetMatchForHandicap(ctx context.Context, matchPublicID string)
 const insertHandicapItems = `-- name: InsertHandicapItems :one
 WITH inserted AS (
   INSERT INTO activity.handicap_items (
-    tournament_id, public_id, category, name, description, referee_note,
-    cost, repeatable, sort_order
+    tournament_id, public_id, key, category, name, description, referee_note,
+    cost, repeatable, sort_order, params
   )
   SELECT
-    $1, v.public_id, v.category, v.name,
+    $1, v.public_id, v.key, v.category, v.name,
     NULLIF(v.description, ''), NULLIF(v.referee_note, ''),
-    v.cost, v.repeatable, v.sort_order
+    v.cost, v.repeatable, v.sort_order, v.params::jsonb
   FROM (
     SELECT
       unnest($2::text[])     AS public_id,
-      unnest($3::text[])     AS category,
-      unnest($4::text[])          AS name,
-      unnest($5::text[])   AS description,
-      unnest($6::text[])  AS referee_note,
-      unnest($7::bigint[])        AS cost,
-      unnest($8::boolean[]) AS repeatable,
-      unnest($9::int[])     AS sort_order
+      unnest($3::text[])           AS key,
+      unnest($4::text[])     AS category,
+      unnest($5::text[])          AS name,
+      unnest($6::text[])   AS description,
+      unnest($7::text[])  AS referee_note,
+      unnest($8::bigint[])        AS cost,
+      unnest($9::boolean[]) AS repeatable,
+      unnest($10::int[])     AS sort_order,
+      -- params 以 text[] 傳入再 cast:pgx 對 jsonb[] 的編碼不穩定,text 最不會出事。
+      unnest($11::text[])         AS params
   ) AS v
+  -- 衝突鍵維持 (category, name):重跑安裝回 0 列不改價格。**key 撞到會是 23505**,
+  -- 那是要的 —— 目錄改了名稱卻用 install 而不是 sync,必須出聲。
   ON CONFLICT (tournament_id, category, name) DO NOTHING
   RETURNING id
 )
@@ -268,6 +361,7 @@ SELECT count(*)::bigint AS inserted FROM inserted
 type InsertHandicapItemsParams struct {
 	TournamentID int64
 	PublicIds    []string
+	Keys         []string
 	Categories   []string
 	Names        []string
 	Descriptions []string
@@ -275,6 +369,7 @@ type InsertHandicapItemsParams struct {
 	Costs        []int64
 	Repeatables  []bool
 	SortOrders   []int32
+	Params       []string
 }
 
 // 把種子定義一次實例化到某一屆,回**實際插入**的列數。
@@ -286,7 +381,7 @@ type InsertHandicapItemsParams struct {
 // 中途失敗不會留下半套項目。public_id(ULID)由 adapter 產生後傳入,SQL 生不出 ULID。
 //
 // NULLIF(..., ”) 把空字串收斂成 NULL:text[] 參數的元素表達不了 NULL,
-// 而「還沒寫」的 referee_note 在 DB 裡就該是 NULL(seed 目前全為 null,待裁判補)。
+// 而「還沒寫」的 referee_note 在 DB 裡就該是 NULL。
 //
 // 八個單引數 unnest 併排在子查詢裡,而不是 unnest(a, b, ...) AS v(...):
 // sqlc 的 catalog 只認單引數 unnest,多引數形式會編譯失敗。兩者語意相同 ——
@@ -295,6 +390,7 @@ func (q *Queries) InsertHandicapItems(ctx context.Context, arg InsertHandicapIte
 	row := q.db.QueryRow(ctx, insertHandicapItems,
 		arg.TournamentID,
 		arg.PublicIds,
+		arg.Keys,
 		arg.Categories,
 		arg.Names,
 		arg.Descriptions,
@@ -302,6 +398,7 @@ func (q *Queries) InsertHandicapItems(ctx context.Context, arg InsertHandicapIte
 		arg.Costs,
 		arg.Repeatables,
 		arg.SortOrders,
+		arg.Params,
 	)
 	var inserted int64
 	err := row.Scan(&inserted)
@@ -317,12 +414,21 @@ WITH ins AS (
     $1, $2, $3, $4,
     $5, NULLIF($6::text, '')
   )
-  RETURNING id, public_id, match_id, player_id, item_id, cost, target_note, voided, created_at
+  -- draw_result / drawn_at 剛插入時必為 NULL,但外層 SELECT 的形狀要與 List/Get 逐字相同,
+  -- 所以 RETURNING 必須帶上它們 —— 少了就是「CTE 裡沒有這欄」,Postgres 與 sqlc 都會擋。
+  RETURNING id, public_id, match_id, player_id, item_id, cost, target_note, voided, created_at,
+            draw_result, drawn_at
 )
 SELECT s.id, s.public_id, s.match_id, m.public_id AS match_public_id,
        s.player_id, s.item_id,
-       i.public_id AS item_ref, i.name AS item_name, i.category,
-       s.cost, s.target_note, s.voided, s.created_at
+       i.public_id AS item_ref, i.key AS item_key, i.name AS item_name, i.category,
+       i.params AS item_params,
+       -- 執行說明跟著選擇走:開賽前設定確認清單就是「該場每筆選擇的 referee_note + 抽選結果」,
+       -- 不帶的話裁判端要逐項回查。對外仍不離開裁判端(選手端的轉換不輸出它)。
+       COALESCE(i.referee_note, '')::text AS item_referee_note,
+       i.sort_order AS item_sort_order,
+       s.cost, s.target_note, s.voided, s.created_at,
+       s.draw_result, s.drawn_at
 FROM ins s
 JOIN activity.handicap_items i ON i.id = s.item_id
 JOIN activity.matches m ON m.id = s.match_id
@@ -338,19 +444,25 @@ type InsertHandicapSelectionParams struct {
 }
 
 type InsertHandicapSelectionRow struct {
-	ID            int64
-	PublicID      string
-	MatchID       int64
-	MatchPublicID string
-	PlayerID      int64
-	ItemID        int64
-	ItemRef       string
-	ItemName      string
-	Category      string
-	Cost          int64
-	TargetNote    *string
-	Voided        bool
-	CreatedAt     time.Time
+	ID              int64
+	PublicID        string
+	MatchID         int64
+	MatchPublicID   string
+	PlayerID        int64
+	ItemID          int64
+	ItemRef         string
+	ItemKey         string
+	ItemName        string
+	Category        string
+	ItemParams      []byte
+	ItemRefereeNote string
+	ItemSortOrder   int32
+	Cost            int64
+	TargetNote      *string
+	Voided          bool
+	CreatedAt       time.Time
+	DrawResult      *string
+	DrawnAt         *time.Time
 }
 
 // 每買一次一列,同一項目買三次就是三列 —— 不是一列 qty=3。
@@ -381,12 +493,18 @@ func (q *Queries) InsertHandicapSelection(ctx context.Context, arg InsertHandica
 		&i.PlayerID,
 		&i.ItemID,
 		&i.ItemRef,
+		&i.ItemKey,
 		&i.ItemName,
 		&i.Category,
+		&i.ItemParams,
+		&i.ItemRefereeNote,
+		&i.ItemSortOrder,
 		&i.Cost,
 		&i.TargetNote,
 		&i.Voided,
 		&i.CreatedAt,
+		&i.DrawResult,
+		&i.DrawnAt,
 	)
 	return i, err
 }
@@ -438,8 +556,8 @@ func (q *Queries) InsertMatchBudget(ctx context.Context, arg InsertMatchBudgetPa
 
 const listHandicapItems = `-- name: ListHandicapItems :many
 
-SELECT id, public_id, tournament_id, category, name, description, referee_note,
-       cost, repeatable, sort_order
+SELECT id, public_id, tournament_id, key, category, name, description, referee_note,
+       cost, repeatable, sort_order, params
 FROM activity.handicap_items
 WHERE tournament_id = $1
 ORDER BY category, sort_order, id
@@ -449,6 +567,7 @@ type ListHandicapItemsRow struct {
 	ID           int64
 	PublicID     string
 	TournamentID int64
+	Key          string
 	Category     string
 	Name         string
 	Description  *string
@@ -456,6 +575,7 @@ type ListHandicapItemsRow struct {
 	Cost         int64
 	Repeatable   bool
 	SortOrder    int32
+	Params       []byte
 }
 
 // ── 讓武項目 ────────────────────────────────────────────────────
@@ -475,6 +595,7 @@ func (q *Queries) ListHandicapItems(ctx context.Context, tournamentID int64) ([]
 			&i.ID,
 			&i.PublicID,
 			&i.TournamentID,
+			&i.Key,
 			&i.Category,
 			&i.Name,
 			&i.Description,
@@ -482,6 +603,7 @@ func (q *Queries) ListHandicapItems(ctx context.Context, tournamentID int64) ([]
 			&i.Cost,
 			&i.Repeatable,
 			&i.SortOrder,
+			&i.Params,
 		); err != nil {
 			return nil, err
 		}
@@ -497,8 +619,14 @@ const listHandicapSelections = `-- name: ListHandicapSelections :many
 
 SELECT s.id, s.public_id, s.match_id, m.public_id AS match_public_id,
        s.player_id, s.item_id,
-       i.public_id AS item_ref, i.name AS item_name, i.category,
-       s.cost, s.target_note, s.voided, s.created_at
+       i.public_id AS item_ref, i.key AS item_key, i.name AS item_name, i.category,
+       i.params AS item_params,
+       -- 執行說明跟著選擇走:開賽前設定確認清單就是「該場每筆選擇的 referee_note + 抽選結果」,
+       -- 不帶的話裁判端要逐項回查。對外仍不離開裁判端(選手端的轉換不輸出它)。
+       COALESCE(i.referee_note, '')::text AS item_referee_note,
+       i.sort_order AS item_sort_order,
+       s.cost, s.target_note, s.voided, s.created_at,
+       s.draw_result, s.drawn_at
 FROM activity.handicap_selections s
 JOIN activity.handicap_items i ON i.id = s.item_id
 JOIN activity.matches m ON m.id = s.match_id
@@ -512,19 +640,25 @@ type ListHandicapSelectionsParams struct {
 }
 
 type ListHandicapSelectionsRow struct {
-	ID            int64
-	PublicID      string
-	MatchID       int64
-	MatchPublicID string
-	PlayerID      int64
-	ItemID        int64
-	ItemRef       string
-	ItemName      string
-	Category      string
-	Cost          int64
-	TargetNote    *string
-	Voided        bool
-	CreatedAt     time.Time
+	ID              int64
+	PublicID        string
+	MatchID         int64
+	MatchPublicID   string
+	PlayerID        int64
+	ItemID          int64
+	ItemRef         string
+	ItemKey         string
+	ItemName        string
+	Category        string
+	ItemParams      []byte
+	ItemRefereeNote string
+	ItemSortOrder   int32
+	Cost            int64
+	TargetNote      *string
+	Voided          bool
+	CreatedAt       time.Time
+	DrawResult      *string
+	DrawnAt         *time.Time
 }
 
 // ── 讓武選擇 ────────────────────────────────────────────────────
@@ -554,12 +688,18 @@ func (q *Queries) ListHandicapSelections(ctx context.Context, arg ListHandicapSe
 			&i.PlayerID,
 			&i.ItemID,
 			&i.ItemRef,
+			&i.ItemKey,
 			&i.ItemName,
 			&i.Category,
+			&i.ItemParams,
+			&i.ItemRefereeNote,
+			&i.ItemSortOrder,
 			&i.Cost,
 			&i.TargetNote,
 			&i.Voided,
 			&i.CreatedAt,
+			&i.DrawResult,
+			&i.DrawnAt,
 		); err != nil {
 			return nil, err
 		}
@@ -581,7 +721,10 @@ SELECT
   p2.public_id AS p2_player_public_id,
   p1.rank_level AS p1_rank_level,
   p2.rank_level AS p2_rank_level,
-  COALESCE(NULLIF(t.config ->> 'bp_per_rank_gap', ''), '0')::bigint AS per_rank_gap
+  -- v2 config 在 bp.per_rank_gap,v1 在頂層 bp_per_rank_gap(schemas/28「從 version 1 升版」)。
+  -- 兩者都缺時回 0,由 bp 套件退回預設值 8。
+  COALESCE(NULLIF(t.config -> 'bp' ->> 'per_rank_gap', ''),
+           NULLIF(t.config ->> 'bp_per_rank_gap', ''), '0')::bigint AS per_rank_gap
 FROM activity.matches m
 JOIN activity.tournaments t ON t.id = m.tournament_id
 LEFT JOIN activity.tournament_players p1 ON p1.id = m.p1_player_id
@@ -699,6 +842,31 @@ func (q *Queries) MarkHandicapSelectionVoided(ctx context.Context, id int64) (in
 	return result.RowsAffected(), nil
 }
 
+const setHandicapSelectionDraw = `-- name: SetHandicapSelectionDraw :execrows
+UPDATE activity.handicap_selections
+SET draw_result = $1::text,
+    drawn_at = $2::timestamptz
+WHERE id = $3 AND draw_result IS NULL
+`
+
+type SetHandicapSelectionDrawParams struct {
+	Result string
+	At     time.Time
+	ID     int64
+}
+
+// 寫入抽選結果。draw_result IS NULL 是「一筆選擇只抽一次」的 DB 側保證(封盤不可逆 ⇒ 抽選不可逆)。
+// drawn_at 與 draw_result 同生共死由 handicap_selections_draw_check 守。
+// 時間由呼叫端傳入而不是 now():它必須等於封盤時間(LockMatchHandicaps 的 locked_at),
+// 同一個 tx 內兩個 now() 相等,但「等於封盤時間」是語意,不該靠時鐘巧合。
+func (q *Queries) SetHandicapSelectionDraw(ctx context.Context, arg SetHandicapSelectionDrawParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setHandicapSelectionDraw, arg.Result, arg.At, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const setMatchBudgetSpent = `-- name: SetMatchBudgetSpent :execrows
 UPDATE activity.match_budgets
 SET spent = $1,
@@ -720,6 +888,62 @@ type SetMatchBudgetSpentParams struct {
 // :execrows 讓 adapter 分得出「預算列不存在」(0 列)與「寫成功」。
 func (q *Queries) SetMatchBudgetSpent(ctx context.Context, arg SetMatchBudgetSpentParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setMatchBudgetSpent, arg.Spent, arg.MatchID, arg.PlayerID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const syncHandicapItems = `-- name: SyncHandicapItems :execrows
+UPDATE activity.handicap_items AS i
+SET name         = v.name,
+    description  = NULLIF(v.description, ''),
+    referee_note = NULLIF(v.referee_note, ''),
+    repeatable   = v.repeatable,
+    sort_order   = v.sort_order,
+    params       = v.params::jsonb,
+    updated_at   = now()
+FROM (
+  SELECT
+    unnest($2::text[])           AS key,
+    unnest($3::text[])          AS name,
+    unnest($4::text[])   AS description,
+    unnest($5::text[])  AS referee_note,
+    unnest($6::boolean[]) AS repeatable,
+    unnest($7::int[])     AS sort_order,
+    unnest($8::text[])         AS params
+) AS v
+WHERE i.tournament_id = $1 AND i.key = v.key
+`
+
+type SyncHandicapItemsParams struct {
+	TournamentID int64
+	Keys         []string
+	Names        []string
+	Descriptions []string
+	RefereeNotes []string
+	Repeatables  []bool
+	SortOrders   []int32
+	Params       []string
+}
+
+// 把目錄的**文字與參數**同步進既有那屆(cmd/admin catalogue sync)。以 key 匹配。
+//
+// **不動 cost**:價格是賽制設定,上屆的選購紀錄必須永遠指向上屆的價格。
+// 前置條件「該屆沒有任何 handicap_selections」由 adapter 用 CountHandicapSelectionsInTournament
+// 在同一個 tx 裡先驗;已有人依舊說明選購,改文字等於改比賽條件。
+// 回影響列數,adapter 核對「= 目錄裡在該屆有對應 key 的項數」;對不上代表目錄與該屆不一致。
+func (q *Queries) SyncHandicapItems(ctx context.Context, arg SyncHandicapItemsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, syncHandicapItems,
+		arg.TournamentID,
+		arg.Keys,
+		arg.Names,
+		arg.Descriptions,
+		arg.RefereeNotes,
+		arg.Repeatables,
+		arg.SortOrders,
+		arg.Params,
+	)
 	if err != nil {
 		return 0, err
 	}

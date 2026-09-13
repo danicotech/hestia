@@ -29,14 +29,15 @@ type ActivityBet struct {
 	LedgerPayoutEntryID *int64
 }
 
-// 串關的每一腿。同輪比賽彼此不共用選手,所以各腿天然無相關 —— 單淘汰的結構性保證。棄賽時該腿標 void 並從乘積中移除,剩餘腿仍用各自鎖定的 odds_milli 重算。
+// 串關的每一腿。UNIQUE (bet_id, match_id) = 同一場只能一腿(grill Q18):同場不同盤口互串會把「同一件事押兩次」的賠率相乘,而派彩從代幣供給出。跨場串不同盤口完全可以。
 type ActivityBetLeg struct {
 	ID        int64
 	BetID     int64
 	MatchID   int64
-	Side      int16
 	OddsMilli int64
 	Result    string
+	MarketID  int64
+	Outcome   string
 }
 
 // 跨屆選手檔案,以遊戲ID 為自然鍵。與 tournament_players 的分工:這裡是跨屆聚合,那裡是報名當下的快照 —— 因為「段位一經確認即為本屆計算依據」,本屆段位不能被下屆覆寫。
@@ -71,6 +72,10 @@ type ActivityHandicapItem struct {
 	UpdatedAt   time.Time
 	// ULID,對外唯一識別。proto 的 HandicapItem.public_id 與 SelectRequest.item_public_id 都指這個。
 	PublicID string
+	// 穩定識別(<category>.<snake_case>)。改名不改 key。目錄同步與程式規則一律以它定址,不再從 (category, name) 推導。
+	Key string
+	// 項目自己的參數(seconds / draw / applies_to_both)。未知鍵由程式的驗證器拒絕,JSONB 不是垃圾桶。
+	Params []byte
 }
 
 // 每次購買一列。退費只是 BP 內部的事(改 spent + 標 voided),不經 Ledger。外鍵指向 match_budgets 的複合鍵 —— 沒有預算的人連一列都插不進來。
@@ -84,6 +89,21 @@ type ActivityHandicapSelection struct {
 	TargetNote *string
 	Voided     bool
 	CreatedAt  time.Time
+	DrawResult *string
+	DrawnAt    *time.Time
+}
+
+// 盤口。哪些存在由 tournaments.config.betting.markets 決定,場次進入 ready 時建列;結果(outcome)由 kind + config 推導,不存:match_winner/round_winner 是 p1/p2,duration 是 over/under,score 是 p1_2_0 這類。
+type ActivityMarket struct {
+	ID        int64
+	PublicID  string
+	MatchID   int64
+	Kind      string
+	RoundNo   *int32
+	Params    []byte
+	Status    string
+	CreatedAt time.Time
+	SettledAt *time.Time
 }
 
 // 單淘汰賽程樹。round 1 = 首輪,slot 為該輪內 0-based 位置。同輪比賽彼此不共用選手 —— 這是串關天然無相關的結構性保證,不需要特判。
@@ -101,10 +121,15 @@ type ActivityMatch struct {
 	HandicapLockedAt *time.Time
 	StreamUrl        *string
 	ResultKind       string
-	StartedAt        *time.Time
-	FinishedAt       *time.Time
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
+	// = 第一回合的正式決鬥開始(match_rounds 第 1 列的 started_at)。這一刻同時關下注、啟動第一回合計時;前置過程在它之前。
+	StartedAt  *time.Time
+	FinishedAt *time.Time
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+	// bracket = 晉級樹上的一場;third_place = 季軍戰。季軍戰不屬於晉級樹,round 記為決賽那一輪、slot 另給,勝者不晉級。
+	Kind             string
+	SetupConfirmedAt *time.Time
+	SetupConfirmedBy *int64
 }
 
 // BP 預算。每輪配對後依當下段位差重算發放,該場有效,賽後作廢 —— 不跨輪累積、不找零。不進平台帳本、不走 Ledger、不需冪等:它不是貨幣。
@@ -115,6 +140,31 @@ type ActivityMatchBudget struct {
 	Spent     int64
 	CreatedAt time.Time
 	UpdatedAt time.Time
+}
+
+// 逐回合結果。回合比數是衍生值(COUNT GROUP BY winner_player_id),整場勝者 = 先拿到 ⌈best_of/2⌉ 勝的一方;matches.winner_player_id 仍存但每次寫入時重算核對(與 match_budgets.spent 同一套紀律)。
+type ActivityMatchRound struct {
+	ID             int64
+	MatchID        int64
+	RoundNo        int32
+	StartedAt      time.Time
+	FinishedAt     *time.Time
+	WinnerPlayerID *int64
+	CreatedAt      time.Time
+}
+
+// 違規紀錄:哪一場、第幾回合、誰、違反哪一項、裁判怎麼判、為什麼。不自動觸發任何後果。「第幾次」不存 —— 那是 COUNT 算得出來的衍生值,而且規則不進系統,由裁判當場判。
+type ActivityMatchViolation struct {
+	ID         int64
+	PublicID   string
+	MatchID    int64
+	RoundNo    *int32
+	PlayerID   int64
+	ItemID     *int64
+	Ruling     string
+	Note       string
+	RecordedBy int64
+	CreatedAt  time.Time
 }
 
 type ActivityTournament struct {
@@ -156,14 +206,14 @@ type ActivityTournamentPlayer struct {
 	UpdatedAt        time.Time
 }
 
-// 觀眾投票,驅動浮動賠率。隱含機率 = (該方票數 + SMOOTHING) / (總票數 + 2×SMOOTHING);賠率 = (1 − VIG) / 隱含機率,夾在 [MIN_ODDS, MAX_ODDS]。參數在 tournaments.config。
+// 觀眾投票,驅動浮動賠率。每個盤口各自投票(grill Q19):p_i = (票_i + S) / (總票 + n·S),賠率 = (1 − VIG) / p_i,夾在 [MIN, MAX]。n = 該盤口的結果數,兩路是 n=2 的特例。
 type ActivityVote struct {
 	ID        int64
-	MatchID   int64
 	UserID    int64
-	Side      int16
 	CreatedAt time.Time
 	UpdatedAt time.Time
+	MarketID  int64
+	Outcome   string
 }
 
 type PlatformActivityDaily struct {
