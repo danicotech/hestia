@@ -232,12 +232,13 @@ func (l *Listener) dispatch(ctx context.Context, payload string) {
 func (l *Listener) resolve(ctx context.Context, env watch.Envelope) (*watch.Update, error) {
 	u := &watch.Update{Tournament: env.Tournament, Kind: env.Kind, EmittedAt: l.now().UTC()}
 	switch env.Kind {
-	case watch.KindMatch:
-		m, err := l.readMatch(ctx, env.Ref)
+	case watch.KindMatch, watch.KindRound:
+		// 兩種都帶回合:場次定案那一則要有最終比數,回合那一則要有計時起點。
+		m, r, err := l.readRounds(ctx, env.Ref)
 		if err != nil {
 			return nil, err
 		}
-		u.Match = m
+		u.Match, u.Rounds = m, r
 	case watch.KindHandicapLocked:
 		h, err := l.readHandicaps(ctx, env.Ref)
 		if err != nil {

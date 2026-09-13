@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"maps"
 	"slices"
+	"strconv"
 	"sync"
 	"time"
 
+	"github.com/danicotech/hestia/internal/core/activity/rules"
 	"github.com/danicotech/hestia/internal/core/platform/ledger"
 )
 
@@ -33,15 +35,17 @@ type fakeEntry struct {
 	RefID   int64
 }
 
-type voteKey struct{ matchID, userID int64 }
+type voteKey struct{ marketID, userID int64 }
 
 type fakeDB struct {
 	mu sync.Mutex
 
 	tournaments map[string]*Tournament
-	cfgs        map[int64]OddsConfig
+	rules       map[int64]Rules
 	matches     map[string]*Match
-	votes       map[voteKey]Side
+	rounds      map[int64][]RoundResult
+	markets     map[int64]*Market
+	votes       map[voteKey]Outcome
 	idem        map[string]*IdempotencyRecord
 	bets        map[int64]*Bet
 	legs        map[int64]*Leg
@@ -50,21 +54,24 @@ type fakeDB struct {
 	entries    []fakeEntry
 	ledgerKeys map[string]*ledger.ApplyResult
 
-	nextBetID, nextLegID, nextEntryID int64
-	now                               time.Time
+	nextBetID, nextLegID, nextEntryID, nextMarketID int64
+	now                                             time.Time
 
 	// 觀測用,不參與 rollback —— 我們要看的是「呼叫了什麼」,不是「留下了什麼」。
-	advisoryLocks []int64
-	lockedUsers   []int64
-	lockedBets    [][]int64
+	advisoryLocks  []int64
+	lockedUsers    []int64
+	lockedBets     [][]int64
+	insertBetCalls int
 }
 
 func newFakeDB() *fakeDB {
 	return &fakeDB{
 		tournaments: map[string]*Tournament{},
-		cfgs:        map[int64]OddsConfig{},
+		rules:       map[int64]Rules{},
 		matches:     map[string]*Match{},
-		votes:       map[voteKey]Side{},
+		rounds:      map[int64][]RoundResult{},
+		markets:     map[int64]*Market{},
+		votes:       map[voteKey]Outcome{},
 		idem:        map[string]*IdempotencyRecord{},
 		bets:        map[int64]*Bet{},
 		legs:        map[int64]*Leg{},
@@ -77,35 +84,39 @@ func newFakeDB() *fakeDB {
 // ── rollback 模擬 ────────────────────────────────────────────────
 
 type dbState struct {
-	votes      map[voteKey]Side
-	idem       map[string]*IdempotencyRecord
-	bets       map[int64]*Bet
-	legs       map[int64]*Leg
-	balances   map[int64]int64
-	entries    []fakeEntry
-	ledgerKeys map[string]*ledger.ApplyResult
-	nextBetID  int64
-	nextLegID  int64
+	markets      map[int64]*Market
+	votes        map[voteKey]Outcome
+	idem         map[string]*IdempotencyRecord
+	bets         map[int64]*Bet
+	legs         map[int64]*Leg
+	balances     map[int64]int64
+	entries      []fakeEntry
+	ledgerKeys   map[string]*ledger.ApplyResult
+	nextBetID    int64
+	nextLegID    int64
+	nextMarketID int64
 }
 
 func (d *fakeDB) snapshot() dbState {
 	return dbState{
-		votes:      maps.Clone(d.votes),
-		idem:       cloneIdem(d.idem),
-		bets:       clonePtrMap(d.bets),
-		legs:       clonePtrMap(d.legs),
-		balances:   maps.Clone(d.balances),
-		entries:    slices.Clone(d.entries),
-		ledgerKeys: maps.Clone(d.ledgerKeys),
-		nextBetID:  d.nextBetID,
-		nextLegID:  d.nextLegID,
+		markets:      clonePtrMap(d.markets),
+		votes:        maps.Clone(d.votes),
+		idem:         cloneIdem(d.idem),
+		bets:         clonePtrMap(d.bets),
+		legs:         clonePtrMap(d.legs),
+		balances:     maps.Clone(d.balances),
+		entries:      slices.Clone(d.entries),
+		ledgerKeys:   maps.Clone(d.ledgerKeys),
+		nextBetID:    d.nextBetID,
+		nextLegID:    d.nextLegID,
+		nextMarketID: d.nextMarketID,
 	}
 }
 
 func (d *fakeDB) restore(s dbState) {
-	d.votes, d.idem, d.bets, d.legs = s.votes, s.idem, s.bets, s.legs
+	d.markets, d.votes, d.idem, d.bets, d.legs = s.markets, s.votes, s.idem, s.bets, s.legs
 	d.balances, d.entries, d.ledgerKeys = s.balances, s.entries, s.ledgerKeys
-	d.nextBetID, d.nextLegID = s.nextBetID, s.nextLegID
+	d.nextBetID, d.nextLegID, d.nextMarketID = s.nextBetID, s.nextLegID, s.nextMarketID
 }
 
 func clonePtrMap[K comparable, V any](m map[K]*V) map[K]*V {
@@ -164,8 +175,8 @@ func (d *fakeDB) TournamentBySlug(_ context.Context, _ fakeTx, slug string) (*To
 	return &cp, nil
 }
 
-func (d *fakeDB) OddsConfig(_ context.Context, _ fakeTx, tournamentID int64) (OddsConfig, error) {
-	return d.cfgs[tournamentID], nil
+func (d *fakeDB) Rules(_ context.Context, _ fakeTx, tournamentID int64) (Rules, error) {
+	return d.rules[tournamentID], nil
 }
 
 func (d *fakeDB) MatchesByPublicIDs(_ context.Context, _ fakeTx, publicIDs []string) ([]Match, error) {
@@ -178,36 +189,121 @@ func (d *fakeDB) MatchesByPublicIDs(_ context.Context, _ fakeTx, publicIDs []str
 	return out, nil
 }
 
-func (d *fakeDB) VoteTallies(_ context.Context, _ fakeTx, matchIDs []int64) (map[int64]Tally, error) {
-	out := make(map[int64]Tally, len(matchIDs))
-	for _, id := range matchIDs {
-		out[id] = Tally{}
-	}
-	for k, side := range d.votes {
-		t, ok := out[k.matchID]
-		if !ok {
-			continue
+func (d *fakeDB) RoundsByMatch(_ context.Context, _ fakeTx, matchID int64) ([]RoundResult, error) {
+	out := slices.Clone(d.rounds[matchID])
+	slices.SortFunc(out, func(a, b RoundResult) int { return cmp.Compare(a.RoundNo, b.RoundNo) })
+	return out, nil
+}
+
+func (d *fakeDB) InsertMarkets(_ context.Context, _ fakeTx, matchID int64, ms []NewMarket) ([]Market, error) {
+	out := make([]Market, 0, len(ms))
+	for _, nm := range ms {
+		// markets_match_kind_line_uq (match_id, kind, COALESCE(round_no,0), line_seconds)。
+		for _, ex := range d.markets {
+			if ex.MatchID == matchID && ex.Kind == nm.Kind && ex.RoundNo == nm.RoundNo && ex.LineSeconds == nm.LineSeconds {
+				return nil, ErrMarketsExist
+			}
 		}
-		if side == SideP1 {
-			t.P1++
-		} else {
-			t.P2++
+		// markets_round_no_check:(kind IN (round_winner,duration)) = (round_no IS NOT NULL)。
+		if nm.Kind.PerRound() != (nm.RoundNo != 0) {
+			return nil, errFake("撞到 markets_round_no_check")
 		}
-		out[k.matchID] = t
+		d.nextMarketID++
+		mk := &Market{
+			ID: d.nextMarketID, PublicID: nm.PublicID, MatchID: matchID,
+			Kind: nm.Kind, RoundNo: nm.RoundNo, LineSeconds: nm.LineSeconds, Status: MarketOpen,
+		}
+		d.markets[mk.ID] = mk
+		out = append(out, *mk)
 	}
 	return out, nil
 }
 
-func (d *fakeDB) UpsertVote(_ context.Context, _ fakeTx, matchID, userID int64, side Side) error {
-	d.votes[voteKey{matchID, userID}] = side
+func (d *fakeDB) MarketsByMatches(_ context.Context, _ fakeTx, matchIDs []int64) ([]Market, error) {
+	var out []Market
+	for _, mk := range d.markets {
+		if slices.Contains(matchIDs, mk.MatchID) {
+			out = append(out, *mk)
+		}
+	}
+	slices.SortFunc(out, func(a, b Market) int { return cmp.Compare(a.ID, b.ID) })
+	return out, nil
+}
+
+func (d *fakeDB) MarketsByPublicIDs(_ context.Context, _ fakeTx, publicIDs []string) ([]MarketRef, error) {
+	var out []MarketRef
+	for _, mk := range d.markets {
+		if !slices.Contains(publicIDs, mk.PublicID) {
+			continue
+		}
+		ref := MarketRef{Market: *mk}
+		for _, m := range d.matches {
+			if m.ID == mk.MatchID {
+				ref.MatchPublicID = m.PublicID
+			}
+		}
+		out = append(out, ref)
+	}
+	return out, nil
+}
+
+func (d *fakeDB) UnsettledMarketsByMatch(_ context.Context, _ fakeTx, matchID int64) ([]Market, error) {
+	var out []Market
+	for _, mk := range d.markets {
+		if mk.MatchID == matchID && (mk.Status == MarketOpen || mk.Status == MarketClosed) {
+			out = append(out, *mk)
+		}
+	}
+	slices.SortFunc(out, func(a, b Market) int { return cmp.Compare(a.ID, b.ID) })
+	return out, nil
+}
+
+func (d *fakeDB) CloseMarkets(_ context.Context, _ fakeTx, matchID int64) (int, error) {
+	n := 0
+	for _, mk := range d.markets {
+		if mk.MatchID == matchID && mk.Status == MarketOpen {
+			mk.Status = MarketClosed
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (d *fakeDB) SettleMarket(_ context.Context, _ fakeTx, marketID int64, status MarketStatus) error {
+	mk, ok := d.markets[marketID]
+	if !ok || (mk.Status != MarketOpen && mk.Status != MarketClosed) {
+		return ErrMarketSettled
+	}
+	mk.Status = status
 	return nil
 }
 
-func (d *fakeDB) MyVotes(_ context.Context, _ fakeTx, matchIDs []int64, userID int64) (map[int64]Side, error) {
-	out := map[int64]Side{}
-	for _, id := range matchIDs {
-		if s, ok := d.votes[voteKey{id, userID}]; ok {
-			out[id] = s
+func (d *fakeDB) VoteTallies(_ context.Context, _ fakeTx, marketIDs []int64) (map[int64]Tally, error) {
+	out := make(map[int64]Tally, len(marketIDs))
+	for k, o := range d.votes {
+		if !slices.Contains(marketIDs, k.marketID) {
+			continue
+		}
+		t := out[k.marketID]
+		if t == nil {
+			t = Tally{}
+			out[k.marketID] = t
+		}
+		t[o]++
+	}
+	return out, nil
+}
+
+func (d *fakeDB) UpsertVote(_ context.Context, _ fakeTx, marketID, userID int64, o Outcome) error {
+	d.votes[voteKey{marketID, userID}] = o
+	return nil
+}
+
+func (d *fakeDB) MyVotes(_ context.Context, _ fakeTx, marketIDs []int64, userID int64) (map[int64]Outcome, error) {
+	out := map[int64]Outcome{}
+	for _, id := range marketIDs {
+		if o, ok := d.votes[voteKey{id, userID}]; ok {
+			out[id] = o
 		}
 	}
 	return out, nil
@@ -237,6 +333,7 @@ func (d *fakeDB) SaveIdempotencyResponse(_ context.Context, _ fakeTx, key string
 }
 
 func (d *fakeDB) InsertBet(_ context.Context, _ fakeTx, b NewBet) (int64, time.Time, error) {
+	d.insertBetCalls++
 	d.nextBetID++
 	d.bets[d.nextBetID] = &Bet{
 		ID:              d.nextBetID,
@@ -256,16 +353,21 @@ func (d *fakeDB) InsertLegs(_ context.Context, _ fakeTx, betID int64, legs []New
 		// bet_legs 的 UNIQUE (bet_id, match_id)。服務層應該在這之前就擋掉。
 		for _, ex := range d.legs {
 			if ex.BetID == betID && ex.MatchID == l.MatchID {
-				return errFake("撞到 bet_legs_bet_match_uq")
+				return ErrDuplicateMatchInParlay
 			}
+		}
+		// bet_legs_market_match_fkey (market_id, match_id) → markets (id, match_id)。
+		mk, ok := d.markets[l.MarketID]
+		if !ok || mk.MatchID != l.MatchID {
+			return errFake("撞到 bet_legs_market_match_fkey")
 		}
 		if l.OddsMilli <= 1000 {
 			return errFake("撞到 bet_legs_odds_check")
 		}
 		d.nextLegID++
 		d.legs[d.nextLegID] = &Leg{
-			ID: d.nextLegID, BetID: betID, MatchID: l.MatchID,
-			Side: l.Side, OddsMilli: l.OddsMilli, Result: LegPending,
+			ID: d.nextLegID, BetID: betID, MatchID: l.MatchID, MarketID: l.MarketID,
+			Outcome: l.Outcome, OddsMilli: l.OddsMilli, Result: LegPending,
 		}
 	}
 	return nil
@@ -280,10 +382,10 @@ func (d *fakeDB) SetBetStakeEntry(_ context.Context, _ fakeTx, betID, entryID in
 	return nil
 }
 
-func (d *fakeDB) PendingLegsByMatch(_ context.Context, _ fakeTx, matchID int64) ([]Leg, error) {
+func (d *fakeDB) PendingLegsByMarket(_ context.Context, _ fakeTx, marketID int64) ([]Leg, error) {
 	var out []Leg
 	for _, l := range d.legs {
-		if l.MatchID == matchID && l.Result == LegPending {
+		if l.MarketID == marketID && l.Result == LegPending {
 			out = append(out, *l)
 		}
 	}
@@ -296,6 +398,9 @@ func (d *fakeDB) UpdateLegResults(_ context.Context, _ fakeTx, legIDs []int64, r
 		l, ok := d.legs[id]
 		if !ok {
 			return errFake("腿不存在")
+		}
+		if l.Result != LegPending {
+			return ErrLedgerStateConflict
 		}
 		l.Result = result
 	}
@@ -334,6 +439,9 @@ func (d *fakeDB) UpdateBet(_ context.Context, _ fakeTx, u BetUpdate) error {
 	if !ok {
 		return errFake("注單不存在")
 	}
+	if b.Status != BetOpen {
+		return ErrLedgerStateConflict
+	}
 	b.Status = u.Status
 	if u.PotentialPayout != nil {
 		b.PotentialPayout = *u.PotentialPayout
@@ -341,6 +449,9 @@ func (d *fakeDB) UpdateBet(_ context.Context, _ fakeTx, u BetUpdate) error {
 	}
 	if u.LedgerRefundEntryID != nil {
 		b.LedgerRefundEntryID = *u.LedgerRefundEntryID
+	}
+	if u.LedgerPayoutEntryID != nil {
+		b.LedgerPayoutEntryID = *u.LedgerPayoutEntryID
 	}
 	// bets_settled_at_check:status='open' ⇔ settled_at IS NULL。
 	if u.Status == BetOpen {
@@ -426,25 +537,78 @@ type fakeErr string
 func (e fakeErr) Error() string { return string(e) }
 func errFake(s string) error    { return fakeErr(s) }
 
-func (d *fakeDB) addTournament(id int64, slug string, cfg OddsConfig) {
-	d.tournaments[slug] = &Tournament{ID: id, Slug: slug}
-	d.cfgs[id] = cfg
+// fullRules 是開發庫那種 config:三局兩勝、四種盤口、duration 線 90 秒。
+func fullRules() Rules {
+	cfg := rules.Default()
+	cfg.Format.BestOf = 3
+	cfg.Betting.Markets = []rules.MarketRule{
+		{Kind: rules.MarketMatchWinner},
+		{Kind: rules.MarketRoundWinner},
+		{Kind: rules.MarketDuration, LineSeconds: 90},
+		{Kind: rules.MarketScore},
+	}
+	return Rules{Config: cfg, MaxStake: DefaultMaxStake}
 }
 
+func (d *fakeDB) addTournament(id int64, slug string, r Rules) {
+	d.tournaments[slug] = &Tournament{ID: id, Slug: slug}
+	d.rules[id] = r
+}
+
+// addMatch 建一場 ready 的比賽並依該屆規則建好盤口(與 OpenMarketsInTx 同一條路)。
 func (d *fakeDB) addMatch(id int64, publicID string, tournamentID int64, status MatchStatus, p1, p2 Participant) {
 	d.matches[publicID] = &Match{
 		ID: id, PublicID: publicID, TournamentID: tournamentID,
 		Round: 1, Slot: int(id), Status: status, ResultKind: ResultNormal,
 		P1: p1, P2: p2,
 	}
+	plan := d.rules[tournamentID].MarketsFor()
+	for i := range plan {
+		plan[i].PublicID = publicID + "-" + string(plan[i].Kind) + "-" + strconv.Itoa(plan[i].RoundNo)
+	}
+	if _, err := d.InsertMarkets(context.Background(), fakeTx{}, id, plan); err != nil {
+		panic(err)
+	}
+}
+
+// market 找某場某種盤口(逐回合盤口指定 roundNo,其餘傳 0)。
+func (d *fakeDB) market(matchPublicID string, kind MarketKind, roundNo int) *Market {
+	m := d.matches[matchPublicID]
+	for _, mk := range d.markets {
+		if mk.MatchID == m.ID && mk.Kind == kind && mk.RoundNo == roundNo {
+			return mk
+		}
+	}
+	return nil
+}
+
+// playRound 記一回合:seconds 是時長,winner 是 p1 / p2。
+func (d *fakeDB) playRound(matchPublicID string, roundNo int, winner Outcome, seconds int64) {
+	m := d.matches[matchPublicID]
+	start := d.now.Add(time.Duration(roundNo) * time.Hour)
+	end := start.Add(time.Duration(seconds) * time.Second)
+	var winnerID int64
+	if winner == OutcomeP1 {
+		winnerID = m.P1.PlayerID
+	} else {
+		winnerID = m.P2.PlayerID
+	}
+	d.rounds[m.ID] = append(d.rounds[m.ID], RoundResult{
+		RoundNo: roundNo, StartedAt: start, FinishedAt: &end, WinnerPlayerID: winnerID,
+	})
 }
 
 // finish 把場次標成已分勝負。kind 決定走結算還是退款路徑。
-func (d *fakeDB) finish(publicID string, winner Side, kind ResultKind) {
+func (d *fakeDB) finish(publicID string, winner Outcome, kind ResultKind) {
 	m := d.matches[publicID]
 	m.Status = MatchDone
 	m.ResultKind = kind
-	m.WinnerPlayerID = m.Participant(winner).PlayerID
+	switch winner {
+	case OutcomeP1:
+		m.WinnerPlayerID = m.P1.PlayerID
+	case OutcomeP2:
+		m.WinnerPlayerID = m.P2.PlayerID
+	}
 }
 
 func (d *fakeDB) credit(userID, amount int64) { d.balances[userID] += amount }

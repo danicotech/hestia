@@ -83,6 +83,7 @@ func TestVoteNotifyOnlyOnCommit(t *testing.T) {
 	f := newFixture(t)
 	a, b := f.player("李璃", 1), f.player("A冷", 3)
 	m := f.match(1, 0, a, b, match.StatusReady)
+	mk := f.market(m)
 	raw := newRawListener(t)
 	ctx := context.Background()
 	repo := bettingpg.NewRepository(pool)
@@ -92,7 +93,7 @@ func TestVoteNotifyOnlyOnCommit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("開 transaction: %v", err)
 	}
-	if err := repo.UpsertVote(ctx, tx, m.id, 1001, betting.SideP1); err != nil {
+	if err := repo.UpsertVote(ctx, tx, mk, 1001, betting.OutcomeP1); err != nil {
 		t.Fatalf("UpsertVote: %v", err)
 	}
 	raw.expectSilence(700*time.Millisecond, "投票的交易還沒 commit,通知不該送出")
@@ -106,7 +107,7 @@ func TestVoteNotifyOnlyOnCommit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("開 transaction: %v", err)
 	}
-	if err := repo.UpsertVote(ctx, tx2, m.id, 1001, betting.SideP1); err != nil {
+	if err := repo.UpsertVote(ctx, tx2, mk, 1001, betting.OutcomeP1); err != nil {
 		t.Fatalf("UpsertVote: %v", err)
 	}
 	if err := tx2.Commit(ctx); err != nil {
@@ -116,6 +117,8 @@ func TestVoteNotifyOnlyOnCommit(t *testing.T) {
 	if !ok {
 		t.Fatal("投票 commit 之後應該收得到通知")
 	}
+	// 信封的 Ref 是**場次**的 public_id,不是盤口的:一票只動一個盤口,但畫面
+	// 顯示的是整場的盤口清單,收端會一次解出該場全部盤口的賠率。
 	if e.Tournament != f.slug || e.Kind != watch.KindOdds || e.Ref != m.publicID {
 		t.Fatalf("投票信封 = %+v,要 {%s odds %s}", e, f.slug, m.publicID)
 	}
@@ -262,11 +265,20 @@ func TestListenerPushesHandicapReveal(t *testing.T) {
 	}
 }
 
-// TestListenerPushesOdds 驗票數變動推出來的賠率是算出來的,不是讀出來的。
+// TestListenerPushesOdds 驗票數變動推出來的賠率是算出來的,不是讀出來的,
+// 而且一則推播帶的是**該場全部盤口**(投的是勝負盤,比分盤也要在裡面)。
 func TestListenerPushesOdds(t *testing.T) {
 	f := newFixture(t)
 	a, b := f.player("李璃", 1), f.player("A冷", 3)
 	m := f.match(1, 0, a, b, match.StatusReady)
+	mk := f.market(m)
+	// 第二個盤口:比分盤,沒有人投。best_of 沒設 → 預設 1 → 兩個結果(p1_1_0 / p2_1_0)。
+	var score int64
+	if err := pool.QueryRow(context.Background(), `
+		INSERT INTO activity.markets (public_id, match_id, kind)
+		VALUES (gen_random_uuid()::text, $1, 'score') RETURNING id`, m.id).Scan(&score); err != nil {
+		t.Fatalf("建比分盤: %v", err)
+	}
 
 	hub, waitListening := startListener(t)
 	waitListening(1)
@@ -280,7 +292,7 @@ func TestListenerPushesOdds(t *testing.T) {
 		t.Fatalf("開 transaction: %v", err)
 	}
 	for _, uid := range []int64{2001, 2002, 2003} {
-		if err := repo.UpsertVote(ctx, tx, m.id, uid, betting.SideP1); err != nil {
+		if err := repo.UpsertVote(ctx, tx, mk, uid, betting.OutcomeP1); err != nil {
 			t.Fatalf("UpsertVote: %v", err)
 		}
 	}
@@ -293,22 +305,40 @@ func TestListenerPushesOdds(t *testing.T) {
 		t.Fatalf("推播 = %+v,要一則賠率變動", u)
 	}
 	o := u.Odds
-	if o.P1Votes != 3 || o.P2Votes != 0 {
-		t.Errorf("票數 = %d / %d,要 3 / 0", o.P1Votes, o.P2Votes)
-	}
-	// 三票全押 p1:p1 的賠率必須比 p2 低(賠率是機率的倒數)。
-	if o.P1OddsMilli >= o.P2OddsMilli {
-		t.Errorf("賠率 = %d / %d,一面倒那邊應該比較低", o.P1OddsMilli, o.P2OddsMilli)
-	}
-	if o.P1OddsMilli <= betting.OddsScale {
-		t.Errorf("賠率 %d 不合法(必須 > 1.0)", o.P1OddsMilli)
-	}
-	// 廣播不可能因人而異 —— 這個欄位在推播裡永遠是空的。
-	if o.MyVote != betting.SideNone {
-		t.Errorf("推播不該帶 MyVote,得到 %v", o.MyVote)
+	if o.MatchPublicID != m.publicID || len(o.Markets) != 2 {
+		t.Fatalf("推播 = %+v,要 %s 的兩個盤口", o, m.publicID)
 	}
 	if !o.OpenForBets {
 		t.Error("ready 的場次應該還能下注")
+	}
+	var mw, sc betting.MarketOdds
+	for _, x := range o.Markets {
+		switch x.Kind {
+		case betting.MarketMatchWinner:
+			mw = x
+		case betting.MarketScore:
+			sc = x
+		}
+	}
+	if mw.ID != mk || mw.Votes[betting.OutcomeP1] != 3 || mw.Votes[betting.OutcomeP2] != 0 {
+		t.Errorf("勝負盤票數 = %v,要 p1=3 p2=0", mw.Votes)
+	}
+	// 三票全押 p1:p1 的賠率必須比 p2 低(賠率是機率的倒數)。
+	if mw.Odds[betting.OutcomeP1] >= mw.Odds[betting.OutcomeP2] {
+		t.Errorf("賠率 = %v,一面倒那邊應該比較低", mw.Odds)
+	}
+	if mw.Odds[betting.OutcomeP1] <= betting.OddsScale {
+		t.Errorf("賠率 %d 不合法(必須 > 1.0)", mw.Odds[betting.OutcomeP1])
+	}
+	// 沒人投的比分盤:結果由 best_of 推導、各格零票、賠率均等。
+	if sc.ID != score || len(sc.Outcomes) != 2 || sc.Odds[sc.Outcomes[0]] != sc.Odds[sc.Outcomes[1]] || sc.Votes[sc.Outcomes[0]] != 0 {
+		t.Errorf("比分盤 = %+v,要兩格零票、賠率相同", sc)
+	}
+	// 廣播不可能因人而異 —— 這個欄位在推播裡永遠是空的。
+	for _, x := range o.Markets {
+		if x.MyVote != betting.OutcomeNone {
+			t.Errorf("推播不該帶 MyVote,得到 %v", x.MyVote)
+		}
 	}
 }
 
@@ -586,4 +616,46 @@ func newBadPool(t *testing.T) *pgxpool.Pool {
 		t.Fatalf("建壞掉的 pool: %v", err)
 	}
 	return p
+}
+
+// TestListenerPushesRounds 驗回合那一則帶得出全部回合與比數(多回合制)。
+//
+// 回合的勝者在 DB 是內部 id,推播出去的必須是 public_id(鐵則 5);
+// 進行中的那一回合 FinishedAt 為 nil,前端靠它決定計時器跑不跑。
+func TestListenerPushesRounds(t *testing.T) {
+	f := newFixture(t)
+	a, b := f.player("李璃", 1), f.player("A冷", 3)
+	m := f.match(1, 0, a, b, match.StatusLive)
+	// 第一回合 a 贏、第二回合進行中。直接寫列,不走裁判流程 —— 本套件測的是推播。
+	if _, err := pool.Exec(context.Background(), `
+		INSERT INTO activity.match_rounds (match_id, round_no, started_at, finished_at, winner_player_id)
+		VALUES ($1, 1, now() - interval '3 minutes', now() - interval '1 minute', $2),
+		       ($1, 2, now(), NULL, NULL)`, m.id, a.id); err != nil {
+		t.Fatalf("建回合: %v", err)
+	}
+
+	hub, waitListening := startListener(t)
+	waitListening(1)
+	sub := hub.Subscribe(f.slug)
+	defer sub.Close()
+
+	f.appendEvent(match.TopicRoundStarted, m, true)
+
+	u := recv(t, sub, 10*time.Second)
+	if u.Kind != watch.KindRound || u.Rounds == nil || u.Match == nil {
+		t.Fatalf("推播 = %+v,要一則帶場次的回合更新", u)
+	}
+	if u.Rounds.MatchPublicID != m.publicID || len(u.Rounds.Rounds) != 2 {
+		t.Fatalf("回合 = %+v,要該場的 2 回合", u.Rounds)
+	}
+	first, second := u.Rounds.Rounds[0], u.Rounds.Rounds[1]
+	if first.RoundNo != 1 || first.WinnerPublicID != a.publicID || first.FinishedAt == nil {
+		t.Errorf("第一回合 = %+v,要 a 贏且已結束", first)
+	}
+	if second.RoundNo != 2 || second.FinishedAt != nil || second.WinnerPublicID != "" {
+		t.Errorf("第二回合 = %+v,要進行中", second)
+	}
+	if !second.StartedAt.After(first.StartedAt) {
+		t.Errorf("回合順序錯:%v 應晚於 %v", second.StartedAt, first.StartedAt)
+	}
 }

@@ -4,7 +4,7 @@
 //
 // 下注、派彩、退款動的都是平台代幣,所以本套件比照 ledger-invariants:
 //
-//   - 一次操作的全部效果(注單、腿、帳本分錄、餘額、冪等鍵)都在**同一個 tx**。
+//   - 一次操作的全部效果(注單、腿、盤口、帳本分錄、餘額、冪等鍵)都在**同一個 tx**。
 //     InTx 開 tx、把它交給 core,core 回錯即 rollback —— 要嘛全在要嘛全不在。
 //   - 本套件**沒有一行**碰 platform.token_entries / platform.user_balances。
 //     動錢一律經 betting.Ledger 埠(實際是 ledgerpg.Service.ApplyInTx,同 tx)。
@@ -35,16 +35,24 @@
 //
 // # 影響列數即斷言
 //
-// SetBetStakeEntry / UpdateBet / UpdateLegResults / InsertBetLegs 的 WHERE 條件都帶著
-// 「這件事只能發生一次」的守衛(ledger_stake_entry_id IS NULL、status='open'、
-// result='pending'、UNIQUE(bet_id, match_id))。影響列數與預期不符代表狀態已被別人動過,
-// 一律回 betting.ErrLedgerStateConflict 失敗出聲 —— 絕不回成功但錢不對。
+// SetBetStakeEntry / UpdateBet / UpdateLegResults / InsertBetLegs / SettleMarket 的
+// WHERE 條件都帶著「這件事只能發生一次」的守衛(ledger_stake_entry_id IS NULL、
+// status='open'、result='pending'、UNIQUE(bet_id, match_id)、status IN (open, closed))。
+// 影響列數與預期不符代表狀態已被別人動過,一律失敗出聲 —— 絕不回成功但錢不對。
+//
+// # 規則從哪裡來
+//
+// 逐屆旋鈕(盤口清單、賠率參數、賽制)= tournaments.config 經 rules.Parse,那是唯一契約;
+// 本套件不自己解 config JSON。BettingOddsConfig 那支查詢只取用它回的 max_stake ——
+// 單注上限的權威在 platform.economy_configs,不在 config 裡。
 package bettingpg
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -52,6 +60,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/danicotech/hestia/internal/core/activity/betting"
+	"github.com/danicotech/hestia/internal/core/activity/rules"
 	"github.com/danicotech/hestia/internal/core/activity/watch"
 	"github.com/danicotech/hestia/internal/core/platform/ledger"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/db"
@@ -163,30 +172,31 @@ func (r *Repository) TournamentBySlug(ctx context.Context, tx pgx.Tx, slug strin
 	return &betting.Tournament{ID: row.ID, Slug: row.Slug}, nil
 }
 
-// OddsConfig 讀賠率參數(tournaments.config)與單注上限(platform 的 economy_configs)。
+// Rules 讀這一屆的規則與平台的單注上限。
 //
-// 兩個來源刻意不同:前五項是逐屆玩法旋鈕,max_stake 是平台層的風險控制 ——
+// 兩個來源刻意不同:config 是逐屆玩法旋鈕(rules.Parse 是唯一解析器,壞欄位退回預設、
+// 錯誤只是診斷,這裡不因此失敗);max_stake 是平台層的風險控制(economy_configs)——
 // 兩邊都放會漂移,而漂移的症狀是「同一顆按鈕在不同賽事有不同上限」。
-//
-// 查無列回零值而不是錯誤:零值一律由 betting.OddsConfig.Normalize() 補成預設值,
-// 那是「預設值長什麼樣」的唯一權威。這層多補一次就是第二份會漂移的預設值。
-// PayoutToleranceBps 不讀:它不是 schemas/21 訂的設定鍵(見 activity_betting.sql)。
-func (r *Repository) OddsConfig(ctx context.Context, tx pgx.Tx, tournamentID int64) (betting.OddsConfig, error) {
-	row, err := r.q.WithTx(tx).BettingOddsConfig(ctx, tournamentID)
+// max_stake 讀不到回 0,由 betting.OddsConfig.Normalize 補預設值,這層不補第二份。
+func (r *Repository) Rules(ctx context.Context, tx pgx.Tx, tournamentID int64) (betting.Rules, error) {
+	q := r.q.WithTx(tx)
+	t, err := q.GetTournamentByID(ctx, tournamentID)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return betting.OddsConfig{}, nil
-		}
-		return betting.OddsConfig{}, fmt.Errorf("讀賠率參數 tournament=%d: %w", tournamentID, err)
+		return betting.Rules{}, fmt.Errorf("讀賽事 %d: %w", tournamentID, err)
 	}
-	return betting.OddsConfig{
-		SmoothingVotes: row.SmoothingVotes,
-		VigBps:         row.VigBps,
-		MinOddsMilli:   row.MinOddsMilli,
-		MaxOddsMilli:   row.MaxOddsMilli,
-		MaxParlayMilli: row.MaxParlayMilli,
-		MaxStake:       row.MaxStake,
-	}, nil
+	// 診斷錯誤刻意丟掉:Config 仍可用(rules.Parse 的約定),而下注路徑不是記 log 的地方 ——
+	// 壞設定要在建賽事那條路(rules.Validate)被擋,不是在每一注時重報一次。
+	cfg, _ := rules.Parse(t.Config)
+
+	var maxStake int64
+	oc, err := q.BettingOddsConfig(ctx, tournamentID)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return betting.Rules{}, fmt.Errorf("讀單注上限 tournament=%d: %w", tournamentID, err)
+	}
+	if err == nil {
+		maxStake = oc.MaxStake
+	}
+	return betting.Rules{Config: cfg, MaxStake: maxStake}, nil
 }
 
 // MatchesByPublicIDs 批次讀場次。回傳順序不拘(呼叫端自行用 public_id 索引)。
@@ -228,69 +238,224 @@ func (r *Repository) MatchesByPublicIDs(ctx context.Context, tx pgx.Tx, publicID
 	return out, nil
 }
 
-// ── 投票 ──────────────────────────────────────────────────────────
-
-// VoteTallies 數票。沒人投票的場次不會有列 —— map 查不到即零票,
-// 不在這裡補零值進去:betting.Tally 的零值本來就是零票,補一次只是多一份假資料。
-func (r *Repository) VoteTallies(ctx context.Context, tx pgx.Tx, matchIDs []int64) (map[int64]betting.Tally, error) {
-	out := make(map[int64]betting.Tally, len(matchIDs))
-	if len(matchIDs) == 0 {
-		return out, nil
-	}
-	rows, err := r.q.WithTx(tx).VoteTalliesByMatch(ctx, matchIDs)
+// RoundsByMatch 讀一場的全部回合(ListMatchRounds,依 round_no)。沒打的回合沒有列。
+func (r *Repository) RoundsByMatch(ctx context.Context, tx pgx.Tx, matchID int64) ([]betting.RoundResult, error) {
+	rows, err := r.q.WithTx(tx).ListMatchRounds(ctx, matchID)
 	if err != nil {
-		return nil, fmt.Errorf("數票 %v: %w", matchIDs, err)
+		return nil, fmt.Errorf("讀回合 match=%d: %w", matchID, err)
 	}
-	for _, t := range rows {
-		out[t.MatchID] = betting.Tally{P1: t.P1Votes, P2: t.P2Votes}
+	out := make([]betting.RoundResult, 0, len(rows))
+	for _, rd := range rows {
+		out = append(out, betting.RoundResult{
+			RoundNo:        int(rd.RoundNo),
+			StartedAt:      rd.StartedAt,
+			FinishedAt:     rd.FinishedAt,
+			WinnerPlayerID: deref(rd.WinnerPlayerID),
+		})
 	}
 	return out, nil
 }
 
-// UpsertVote 一場一票,改票即覆蓋。權威是 votes_match_user_uq 這條 UNIQUE
+// ── 盤口 ──────────────────────────────────────────────────────────
+
+// marketParams 是 markets.params 的形狀。目前只有 duration 用 line_seconds。
+type marketParams struct {
+	LineSeconds int64 `json:"line_seconds,omitempty"`
+}
+
+// InsertMarkets 一次建齊一場的盤口(unnest 批次:半套盤口比整批失敗糟)。
+//
+// round_no 為 NULL 的盤口以 0 佔位,SQL 用 NULLIF 轉回 NULL(陣列元素表達不了 NULL)。
+// params 序列化成 JSON 文字再由 SQL cast。撞 markets_match_kind_line_uq 轉成
+// ErrMarketsExist,錯誤照樣中止整筆(tx 一起 rollback)—— 同一場建兩次必須出聲。
+func (r *Repository) InsertMarkets(ctx context.Context, tx pgx.Tx, matchID int64, ms []betting.NewMarket) ([]betting.Market, error) {
+	if len(ms) == 0 {
+		return nil, nil
+	}
+	// 四個平行陣列在**同一個迴圈**組出來(同 InsertLegs 的理由):錯位的盤口比失敗糟。
+	pubIDs := make([]string, 0, len(ms))
+	kinds := make([]string, 0, len(ms))
+	roundNos := make([]int32, 0, len(ms))
+	params := make([]string, 0, len(ms))
+	for _, nm := range ms {
+		if nm.PublicID == "" {
+			return nil, fmt.Errorf("盤口 %s round=%d 缺 public_id: %w", nm.Kind, nm.RoundNo, betting.ErrInvalidRequest)
+		}
+		raw, err := json.Marshal(marketParams{LineSeconds: nm.LineSeconds})
+		if err != nil {
+			return nil, fmt.Errorf("序列化盤口參數: %w", err)
+		}
+		pubIDs = append(pubIDs, nm.PublicID)
+		kinds = append(kinds, string(nm.Kind))
+		roundNos = append(roundNos, int32(nm.RoundNo))
+		params = append(params, string(raw))
+	}
+	rows, err := r.q.WithTx(tx).InsertMarkets(ctx, db.InsertMarketsParams{
+		MatchID: matchID, PublicIds: pubIDs, Kinds: kinds, RoundNos: roundNos, Params: params,
+	})
+	if err != nil {
+		if isUniqueViolation(err, "markets_match_kind_line_uq") {
+			return nil, fmt.Errorf("match=%d: %w", matchID, betting.ErrMarketsExist)
+		}
+		return nil, fmt.Errorf("建盤口 match=%d: %w", matchID, err)
+	}
+	if len(rows) != len(ms) {
+		return nil, fmt.Errorf("match=%d 應建 %d 個盤口實建 %d: %w", matchID, len(ms), len(rows), betting.ErrLedgerStateConflict)
+	}
+	return toMarkets(rows)
+}
+
+// MarketsByMatches 批次讀盤口,順序 (match_id, kind, round_no)。
+func (r *Repository) MarketsByMatches(ctx context.Context, tx pgx.Tx, matchIDs []int64) ([]betting.Market, error) {
+	if len(matchIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := r.q.WithTx(tx).ListMarketsByMatches(ctx, matchIDs)
+	if err != nil {
+		return nil, fmt.Errorf("讀盤口 matches=%v: %w", matchIDs, err)
+	}
+	return toMarkets(rows)
+}
+
+// MarketsByPublicIDs 以 public_id 批次讀盤口,連帶所屬場次的 public_id。
+//
+// 場次的 public_id 走 GetMatchForJudgeByID(每個不同的場次一次):投票與下注的請求
+// 只帶 market_public_id,而讀場次(含「選手不得賭自己」要的兩組 user_id)的查詢
+// 以 public_id 定址 —— 這一步是兩者之間的橋,不為它多開一支「以內部 id 讀場次」的查詢。
+func (r *Repository) MarketsByPublicIDs(ctx context.Context, tx pgx.Tx, publicIDs []string) ([]betting.MarketRef, error) {
+	if len(publicIDs) == 0 {
+		return nil, nil
+	}
+	q := r.q.WithTx(tx)
+	rows, err := q.GetMarketsByPublicIDs(ctx, publicIDs)
+	if err != nil {
+		return nil, fmt.Errorf("讀盤口 %v: %w", publicIDs, err)
+	}
+	markets, err := toMarkets(rows)
+	if err != nil {
+		return nil, err
+	}
+	matchPub := map[int64]string{}
+	out := make([]betting.MarketRef, 0, len(markets))
+	for _, mk := range markets {
+		pub, ok := matchPub[mk.MatchID]
+		if !ok {
+			m, err := q.GetMatchForJudgeByID(ctx, mk.MatchID)
+			if err != nil {
+				return nil, fmt.Errorf("讀盤口 %s 的場次 %d: %w", mk.PublicID, mk.MatchID, err)
+			}
+			pub = m.PublicID
+			matchPub[mk.MatchID] = pub
+		}
+		out = append(out, betting.MarketRef{Market: mk, MatchPublicID: pub})
+	}
+	return out, nil
+}
+
+// UnsettledMarketsByMatch 列出該場 status 仍為 open / closed 的盤口。
+func (r *Repository) UnsettledMarketsByMatch(ctx context.Context, tx pgx.Tx, matchID int64) ([]betting.Market, error) {
+	rows, err := r.q.WithTx(tx).OpenMarketsByMatch(ctx, matchID)
+	if err != nil {
+		return nil, fmt.Errorf("讀未結算盤口 match=%d: %w", matchID, err)
+	}
+	return toMarkets(rows)
+}
+
+// CloseMarkets 把該場所有 open 的盤口標 closed,回關掉的數量(0 不是錯誤:重複關盤或本屆不開盤)。
+func (r *Repository) CloseMarkets(ctx context.Context, tx pgx.Tx, matchID int64) (int, error) {
+	n, err := r.q.WithTx(tx).CloseMatchMarkets(ctx, matchID)
+	if err != nil {
+		return 0, fmt.Errorf("關盤 match=%d: %w", matchID, err)
+	}
+	return int(n), nil
+}
+
+// SettleMarket 把一個盤口標 settled 或 void。
+//
+// SQL 帶 status IN ('open','closed'):影響 0 列 = 已結算過或查無。結算是真錢,
+// 這時候回成功就是重複派彩的起點 —— 一律失敗出聲(ErrMarketSettled)。
+func (r *Repository) SettleMarket(ctx context.Context, tx pgx.Tx, marketID int64, status betting.MarketStatus) error {
+	if status != betting.MarketSettled && status != betting.MarketVoid {
+		return fmt.Errorf("market=%d status=%s 不是結算狀態: %w", marketID, status, betting.ErrInvalidRequest)
+	}
+	n, err := r.q.WithTx(tx).SettleMarket(ctx, db.SettleMarketParams{Status: string(status), MarketID: marketID})
+	if err != nil {
+		return fmt.Errorf("盤口 %d 標 %s: %w", marketID, status, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("market=%d: %w", marketID, betting.ErrMarketSettled)
+	}
+	return nil
+}
+
+// ── 投票 ──────────────────────────────────────────────────────────
+
+// VoteTallies 數票。沒人投票的盤口不會有列 —— map 查不到即零票,
+// 不在這裡補零值進去:betting.Tally 的 nil 本來就是零票,補一次只是多一份假資料。
+func (r *Repository) VoteTallies(ctx context.Context, tx pgx.Tx, marketIDs []int64) (map[int64]betting.Tally, error) {
+	out := make(map[int64]betting.Tally, len(marketIDs))
+	if len(marketIDs) == 0 {
+		return out, nil
+	}
+	rows, err := r.q.WithTx(tx).VoteTalliesByMarkets(ctx, marketIDs)
+	if err != nil {
+		return nil, fmt.Errorf("數票 %v: %w", marketIDs, err)
+	}
+	for _, t := range rows {
+		tally := out[t.MarketID]
+		if tally == nil {
+			tally = betting.Tally{}
+			out[t.MarketID] = tally
+		}
+		tally[betting.Outcome(t.Outcome)] = t.Votes
+	}
+	return out, nil
+}
+
+// UpsertVote 一盤口一票,改票即覆蓋。權威是 votes_market_user_uq 這條 UNIQUE
 // (SQL 的 ON CONFLICT DO UPDATE),不是應用層的「先查再決定 insert 還是 update」。
 //
 // 投票**不寫 outbox**(一票不值得發一則 Discord 公告),但它會直接改變賠率,
 // 而賠率是觀眾盯著看的數字 —— 所以這裡單獨送一則即時戰況的推播通知。
 // 與寫票同一個 tx:NOTIFY 只在 commit 時送出,rollback 的投票不會讓任何人
 // 看到一個沒有發生的賠率變動。
-func (r *Repository) UpsertVote(ctx context.Context, tx pgx.Tx, matchID, userID int64, side betting.Side) error {
+func (r *Repository) UpsertVote(ctx context.Context, tx pgx.Tx, marketID, userID int64, outcome betting.Outcome) error {
 	q := r.q.WithTx(tx)
 	err := q.UpsertVote(ctx, db.UpsertVoteParams{
-		MatchID: matchID, UserID: userID, Side: int16(side),
+		MarketID: marketID, UserID: userID, Outcome: string(outcome),
 	})
 	if err != nil {
-		return fmt.Errorf("寫入投票 match=%d user=%d: %w", matchID, userID, err)
+		return fmt.Errorf("寫入投票 market=%d user=%d: %w", marketID, userID, err)
 	}
 	// 信封由 SQL 組(投票路徑手上只有內部 id,在 Go 組就得多一次往返);
 	// 頻道與種類仍然來自 watch 的常數,不在 SQL 裡寫死。理由見 NotifyWatchOdds。
 	if err := q.NotifyWatchOdds(ctx, db.NotifyWatchOddsParams{
-		Channel: watch.Channel,
-		Kind:    string(watch.KindOdds),
-		MatchID: matchID,
+		Channel:  watch.Channel,
+		Kind:     string(watch.KindOdds),
+		MarketID: marketID,
 	}); err != nil {
 		// 不吞:pg_notify 出錯代表這個 transaction 已經 aborted,
 		// 繼續下去只會把成因換成一個看不懂的錯誤。
-		return fmt.Errorf("送賠率推播通知 match=%d: %w", matchID, err)
+		return fmt.Errorf("送賠率推播通知 market=%d: %w", marketID, err)
 	}
 	return nil
 }
 
 // MyVotes 只查 userID 自己的票。這裡沒有、也不會有查別人投給誰的版本 ——
 // 票數直接推導賠率,公開投票人等於公開可操縱的標的。
-func (r *Repository) MyVotes(ctx context.Context, tx pgx.Tx, matchIDs []int64, userID int64) (map[int64]betting.Side, error) {
-	out := make(map[int64]betting.Side, len(matchIDs))
-	if len(matchIDs) == 0 || userID <= 0 {
+func (r *Repository) MyVotes(ctx context.Context, tx pgx.Tx, marketIDs []int64, userID int64) (map[int64]betting.Outcome, error) {
+	out := make(map[int64]betting.Outcome, len(marketIDs))
+	if len(marketIDs) == 0 || userID <= 0 {
 		return out, nil
 	}
-	rows, err := r.q.WithTx(tx).MyVotesByMatch(ctx, db.MyVotesByMatchParams{
-		UserID: userID, MatchIds: matchIDs,
+	rows, err := r.q.WithTx(tx).MyVotesByMarkets(ctx, db.MyVotesByMarketsParams{
+		UserID: userID, MarketIds: marketIDs,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("讀自己的投票 user=%d: %w", userID, err)
 	}
 	for _, v := range rows {
-		out[v.MatchID] = betting.Side(v.Side)
+		out[v.MarketID] = betting.Outcome(v.Outcome)
 	}
 	return out, nil
 }
@@ -358,32 +523,35 @@ func (r *Repository) InsertBet(ctx context.Context, tx pgx.Tx, b betting.NewBet)
 
 // InsertLegs 一次寫入整張注單的腿(unnest 批次,一次往返、同一個敘述)。
 //
-// 三個平行陣列刻意在**同一個迴圈**組出來:拆成三個迴圈就讓「其中一個少一格」
+// 四個平行陣列刻意在**同一個迴圈**組出來:拆成四個迴圈就讓「其中一個少一格」
 // 這種寫法存在,而 unnest 會把短的補 NULL 撞上 NOT NULL —— 那還算好的,
-// 更糟的是三者錯位,插進去的是一張賠率對到別場的注單。
+// 更糟的是四者錯位,插進去的是一張賠率對到別場的注單。
 //
-// 撞 bet_legs_bet_match_uq(同一注單押同一場兩次 = 押完 p1 再押 p2 穩賺)一律失敗,
-// **不做 ON CONFLICT**:少插一腿的注單會用多一腿算出來的賠付派彩。
-// 轉成 ErrDuplicateLeg 只是給呼叫端可讀的語意,錯誤照樣中止整筆(tx 一起 rollback)。
+// 撞 bet_legs_bet_match_uq(同一注單同一場兩腿)一律失敗,**不做 ON CONFLICT**:
+// 少插一腿的注單會用多一腿算出來的賠付派彩。轉成 ErrDuplicateMatchInParlay 只是
+// 給呼叫端可讀的語意,錯誤照樣中止整筆(tx 一起 rollback)。
+// 複合外鍵 bet_legs_market_match_fkey 撞上(盤口不屬於那場)同樣冒上來 —— 那是 core 的 bug。
 func (r *Repository) InsertLegs(ctx context.Context, tx pgx.Tx, betID int64, legs []betting.NewLeg) error {
 	if len(legs) == 0 {
 		return fmt.Errorf("bet=%d 沒有任何一腿: %w", betID, betting.ErrInvalidRequest)
 	}
 	matchIDs := make([]int64, 0, len(legs))
-	sides := make([]int16, 0, len(legs))
+	marketIDs := make([]int64, 0, len(legs))
+	outcomes := make([]string, 0, len(legs))
 	odds := make([]int64, 0, len(legs))
 	for _, l := range legs {
 		matchIDs = append(matchIDs, l.MatchID)
-		sides = append(sides, int16(l.Side))
+		marketIDs = append(marketIDs, l.MarketID)
+		outcomes = append(outcomes, string(l.Outcome))
 		odds = append(odds, l.OddsMilli)
 	}
 
 	n, err := r.q.WithTx(tx).InsertBetLegs(ctx, db.InsertBetLegsParams{
-		BetID: betID, MatchIds: matchIDs, Sides: sides, OddsMilli: odds,
+		BetID: betID, MatchIds: matchIDs, MarketIds: marketIDs, Outcomes: outcomes, OddsMilli: odds,
 	})
 	if err != nil {
 		if isUniqueViolation(err, "bet_legs_bet_match_uq") {
-			return fmt.Errorf("bet=%d 重複押同一場: %w", betID, betting.ErrDuplicateLeg)
+			return fmt.Errorf("bet=%d 同一場兩腿: %w", betID, betting.ErrDuplicateMatchInParlay)
 		}
 		return fmt.Errorf("寫入注單 %d 的腿: %w", betID, err)
 	}
@@ -414,22 +582,23 @@ func (r *Repository) SetBetStakeEntry(ctx context.Context, tx pgx.Tx, betID, ent
 
 // ── 結算 ──────────────────────────────────────────────────────────
 
-// PendingLegsByMatch 撈出押到這場、還沒判定的腿(ORDER BY bet_id, id)。
+// PendingLegsByMarket 撈出押到這個盤口、還沒判定的腿(ORDER BY bet_id, id)。
 // 順序穩定是必要的:呼叫端據此推出取鎖順序,而取鎖順序是防死鎖的全部。
-func (r *Repository) PendingLegsByMatch(ctx context.Context, tx pgx.Tx, matchID int64) ([]betting.Leg, error) {
-	rows, err := r.q.WithTx(tx).PendingLegsByMatch(ctx, matchID)
+func (r *Repository) PendingLegsByMarket(ctx context.Context, tx pgx.Tx, marketID int64) ([]betting.Leg, error) {
+	rows, err := r.q.WithTx(tx).PendingLegsByMarket(ctx, marketID)
 	if err != nil {
-		return nil, fmt.Errorf("讀待判定的腿 match=%d: %w", matchID, err)
+		return nil, fmt.Errorf("讀待判定的腿 market=%d: %w", marketID, err)
 	}
 	out := make([]betting.Leg, 0, len(rows))
 	for _, l := range rows {
-		// 展示欄位(match_public_id / round / slot / 顯示名)刻意留空:
-		// 結算路徑用不到,為它多 join 四欄是白工。要展示的路徑走 LegsByBetIDs。
+		// 展示欄位(match_public_id / round / slot / 盤口快照 / 顯示名)刻意留空:
+		// 結算路徑用不到,為它多 join 是白工。要展示的路徑走 LegsByBetIDs。
 		out = append(out, betting.Leg{
 			ID:        l.ID,
 			BetID:     l.BetID,
 			MatchID:   l.MatchID,
-			Side:      betting.Side(l.Side),
+			MarketID:  l.MarketID,
+			Outcome:   betting.Outcome(l.Outcome),
 			OddsMilli: l.OddsMilli,
 			Result:    betting.LegResult(l.Result),
 		})
@@ -476,6 +645,9 @@ func (r *Repository) BetsByIDs(ctx context.Context, tx pgx.Tx, betIDs []int64) (
 //
 // 不能只讀 pending:注單的狀態是所有腿的合成,只看這一場的腿會把串關的另一腿
 // 當成不存在,一張還在等的注單會被判成全贏。
+//
+// 結果的顯示名由 core 依 kind 組(betting.OutcomeLabel):SQL 只把兩位選手的名字
+// 與盤口參數帶回來,不在資料庫重做一次 outcome 的語意。
 func (r *Repository) LegsByBetIDs(ctx context.Context, tx pgx.Tx, betIDs []int64) (map[int64][]betting.Leg, error) {
 	out := make(map[int64][]betting.Leg, len(betIDs))
 	if len(betIDs) == 0 {
@@ -486,17 +658,28 @@ func (r *Repository) LegsByBetIDs(ctx context.Context, tx pgx.Tx, betIDs []int64
 		return nil, fmt.Errorf("讀注單的腿 %v: %w", betIDs, err)
 	}
 	for _, l := range rows {
+		line, err := lineSecondsOf(l.MarketParams)
+		if err != nil {
+			return nil, fmt.Errorf("盤口 %s 的參數: %w", l.MarketPublicID, err)
+		}
+		kind := betting.MarketKind(l.MarketKind)
+		outcome := betting.Outcome(l.Outcome)
 		out[l.BetID] = append(out[l.BetID], betting.Leg{
-			ID:              l.ID,
-			BetID:           l.BetID,
-			MatchID:         l.MatchID,
-			MatchPublicID:   l.MatchPublicID,
-			Round:           int(l.Round),
-			Slot:            int(l.Slot),
-			Side:            betting.Side(l.Side),
-			SideDisplayName: l.SideDisplayName,
-			OddsMilli:       l.OddsMilli,
-			Result:          betting.LegResult(l.Result),
+			ID:             l.ID,
+			BetID:          l.BetID,
+			MatchID:        l.MatchID,
+			MatchPublicID:  l.MatchPublicID,
+			Round:          int(l.Round),
+			Slot:           int(l.Slot),
+			MarketID:       l.MarketID,
+			MarketPublicID: l.MarketPublicID,
+			MarketKind:     kind,
+			MarketRoundNo:  int(deref(l.MarketRoundNo)),
+			LineSeconds:    line,
+			Outcome:        outcome,
+			OutcomeLabel:   betting.OutcomeLabel(kind, outcome, l.P1DisplayName, l.P2DisplayName, line),
+			OddsMilli:      l.OddsMilli,
+			Result:         betting.LegResult(l.Result),
 		})
 	}
 	return out, nil
@@ -574,6 +757,40 @@ func (r *Repository) BetsByUser(ctx context.Context, tx pgx.Tx, tournamentID, us
 
 // ── 轉換與工具 ────────────────────────────────────────────────────
 
+// toMarkets 把 markets 列轉成領域物件。params 只認 line_seconds;讀不懂的 JSON 失敗出聲 ——
+// 盤口參數決定結算結果(over/under 的線),一個壞掉的參數不該靜靜變成 0 秒。
+func toMarkets(rows []db.ActivityMarket) ([]betting.Market, error) {
+	out := make([]betting.Market, 0, len(rows))
+	for _, mk := range rows {
+		line, err := lineSecondsOf(mk.Params)
+		if err != nil {
+			return nil, fmt.Errorf("盤口 %s 的參數: %w", mk.PublicID, err)
+		}
+		out = append(out, betting.Market{
+			ID:          mk.ID,
+			PublicID:    mk.PublicID,
+			MatchID:     mk.MatchID,
+			Kind:        betting.MarketKind(mk.Kind),
+			RoundNo:     int(deref(mk.RoundNo)),
+			LineSeconds: line,
+			Status:      betting.MarketStatus(mk.Status),
+		})
+	}
+	return out, nil
+}
+
+// lineSecondsOf 從 markets.params 取 line_seconds(缺鍵 = 0)。
+func lineSecondsOf(raw []byte) (int64, error) {
+	if len(raw) == 0 {
+		return 0, nil
+	}
+	var p marketParams
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return 0, fmt.Errorf("解析 params %s: %w", strconv.Quote(string(raw)), err)
+	}
+	return p.LineSeconds, nil
+}
+
 // toBets 把資料列轉成領域物件。三個分錄 id 在資料庫可為 NULL(那筆金流還沒發生),
 // 領域型別用 0 表示「沒有」—— 0 不是合法的分錄 id,不需要指標。
 func toBets(rows []db.ActivityBet) []betting.Bet {
@@ -598,7 +815,7 @@ func toBets(rows []db.ActivityBet) []betting.Bet {
 	return out
 }
 
-func deref(p *int64) int64 {
+func deref[T int64 | int32](p *T) T {
 	if p == nil {
 		return 0
 	}

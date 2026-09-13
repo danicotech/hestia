@@ -1,5 +1,7 @@
 package betting
 
+import "github.com/danicotech/hestia/internal/core/activity/rules"
+
 // 賠率與賠付的計算。整個檔案沒有一個浮點數,也沒有任何 I/O ——
 // 這是刻意的:賠率會參與串關連乘,誤差會直接乘進派彩金額,而派彩是真錢。
 // 純函數也才有辦法窮舉測邊界(零票、一面倒、夾擠點、封頂點)。
@@ -12,13 +14,15 @@ const (
 	bpsScale int64 = 10000
 )
 
-// 預設參數(schemas/21)。逐屆可在 tournaments.config 覆寫,這裡只是預設值。
+// 預設參數。逐屆旋鈕的權威在 rules(config 契約),這裡只是引用,不另寫一份數字 ——
+// 同一個概念兩個字面值遲早會有一邊被改掉。MaxStake 的權威在 platform.economy_configs,
+// 這個預設只在讀不到時兜底。
 const (
-	DefaultSmoothingVotes int64 = 5
-	DefaultVigBps         int64 = 800
-	DefaultMinOddsMilli   int64 = 1050
-	DefaultMaxOddsMilli   int64 = 12000
-	DefaultMaxParlayMilli int64 = 300_000
+	DefaultSmoothingVotes int64 = rules.DefaultOddsSmoothing
+	DefaultVigBps         int64 = rules.DefaultVigBPS
+	DefaultMinOddsMilli   int64 = rules.DefaultMinOddsMilli
+	DefaultMaxOddsMilli   int64 = rules.DefaultMaxOddsMilli
+	DefaultMaxParlayMilli int64 = rules.DefaultMaxParlayMilli
 	DefaultMaxStake       int64 = 500
 	// DefaultPayoutToleranceBps 是 expected_payout 比對的容差(2%)。
 	// schema 沒有訂這個數字 —— 容差太緊會讓正常的票數波動一直退單,
@@ -29,7 +33,10 @@ const (
 // 防溢位的硬上限。這些數字都遠超任何真實情境,存在只是為了讓整數乘法在
 // **任何**輸入下都不可能溢位 —— 金額計算溢位的後果是憑空生出或蒸發代幣。
 const (
-	maxSafeVotes       int64 = 1 << 40
+	maxSafeVotes int64 = 1 << 40
+	// maxOutcomes 是一個盤口的結果數上限。比分盤 best_of=2047 才會碰到,
+	// 存在只是讓 n·S 這一項有界。
+	maxOutcomes              = 2048
 	maxSafeOddsMilli   int64 = 1_000_000_000
 	maxSafeParlayMilli int64 = 1_000_000_000
 	maxSafeStake       int64 = 1_000_000_000
@@ -117,39 +124,54 @@ func (c OddsConfig) Normalize() OddsConfig {
 	return c
 }
 
-// OddsMilli 算出某一方的賠率 ×1000。
+// OddsMilli 算出某個結果的賠率 ×1000(n 路,schemas/21「賠率公式」)。
 //
-//	隱含機率 = (該方票數 + S) / (總票數 + 2S)
-//	賠率     = (1 − VIG) / 隱含機率,夾在 [MIN_ODDS, MAX_ODDS]
+//	隱含機率 p_i = (票_i + S) / (總票 + n·S)        n = 該盤口的結果數
+//	賠率_i      = (1 − VIG) / p_i,夾在 [MIN_ODDS, MAX_ODDS]
 //
+// 兩路盤是 n=2 的特例(2S 就是 n·S),既有的兩路對照表輸出不變。
 // 代入後展開成一次整數除法:
 //
-//	odds_milli = (10000 − vig_bps) × (total + 2S) × 1000 / (10000 × (side + S))
+//	odds_milli = (10000 − vig_bps) × (total + n·S) × 1000 / (10000 × (votes + S))
 //
 // 1000/10000 先約掉成 1/10,分子小一個數量級,溢位餘裕就多一個數量級。
 // 除法無條件捨去:方向固定且永遠對平台有利(每筆最多少 0.001 倍),
 // 重點不是誰佔便宜,而是**同一組輸入永遠得到同一個答案** ——
-// 下注當下算的乘積,和棄賽重算時用的乘積,必須出自同一條規則。
-func OddsMilli(sideVotes, totalVotes int64, c OddsConfig) int64 {
+// 下注當下算的乘積,和作廢重算時用的乘積,必須出自同一條規則。
+//
+// Σp_i = 1(真實機率歸一),Σ(1/賠率_i) = 1/(1−VIG) —— 那就是抽水,測試釘住。
+// 夾擠會破壞歸一,是票數少時必要的安全欄杆,接受。
+func OddsMilli(outcomeVotes, totalVotes int64, n int, c OddsConfig) int64 {
 	c = c.Normalize()
 
-	if sideVotes < 0 {
-		sideVotes = 0
+	if n < 2 {
+		// 少於兩個結果不是盤口。當兩路算,不讓分母縮到只剩平滑量。
+		n = 2
 	}
-	if totalVotes < sideVotes {
-		// 總票數小於單邊票數是資料異常。就低不就高:寧可算出偏保守的賠率。
-		totalVotes = sideVotes
+	if n > maxOutcomes {
+		n = maxOutcomes
+	}
+	if outcomeVotes < 0 {
+		outcomeVotes = 0
+	}
+	if totalVotes < outcomeVotes {
+		// 總票數小於單一結果的票數是資料異常。就低不就高:寧可算出偏保守的賠率。
+		totalVotes = outcomeVotes
 	}
 	if totalVotes > maxSafeVotes {
 		totalVotes = maxSafeVotes
-		if sideVotes > totalVotes {
-			sideVotes = totalVotes
+		if outcomeVotes > totalVotes {
+			outcomeVotes = totalVotes
 		}
 	}
 
 	s := c.SmoothingVotes
-	num := (bpsScale - c.VigBps) * (totalVotes + 2*s)
-	den := (bpsScale / OddsScale) * (sideVotes + s)
+	if s > maxSafeVotes/int64(n) {
+		// n·S 也要有界,否則極端的平滑量乘上結果數會把分子推出 int64。
+		s = maxSafeVotes / int64(n)
+	}
+	num := (bpsScale - c.VigBps) * (totalVotes + int64(n)*s)
+	den := (bpsScale / OddsScale) * (outcomeVotes + s)
 	odds := num / den
 
 	if odds < c.MinOddsMilli {
@@ -161,10 +183,14 @@ func OddsMilli(sideVotes, totalVotes int64, c OddsConfig) int64 {
 	return odds
 }
 
-// MatchOddsOf 算出一場比賽兩邊的賠率。
-func MatchOddsOf(t Tally, c OddsConfig) (p1, p2 int64) {
+// MarketOddsOf 算出一個盤口每個結果的賠率。n 就是 outcomes 的長度。
+func MarketOddsOf(t Tally, outcomes []Outcome, c OddsConfig) map[Outcome]int64 {
 	total := t.Total()
-	return OddsMilli(t.P1, total, c), OddsMilli(t.P2, total, c)
+	out := make(map[Outcome]int64, len(outcomes))
+	for _, o := range outcomes {
+		out[o] = OddsMilli(t[o], total, len(outcomes), c)
+	}
+	return out
 }
 
 // ParlayMultiplierMilli 是各腿賠率的連乘 ×1000,受 MAX_PARLAY 封頂。

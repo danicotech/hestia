@@ -2,12 +2,14 @@ package watchpg
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/danicotech/hestia/internal/core/activity/betting"
 	"github.com/danicotech/hestia/internal/core/activity/bp"
 	"github.com/danicotech/hestia/internal/core/activity/handicap"
 	"github.com/danicotech/hestia/internal/core/activity/match"
+	"github.com/danicotech/hestia/internal/core/activity/rules"
 	"github.com/danicotech/hestia/internal/core/activity/tournament"
 	"github.com/danicotech/hestia/internal/core/activity/watch"
 	"github.com/danicotech/hestia/internal/infrastructure/storage/db"
@@ -18,12 +20,13 @@ import (
 // # 一支新查詢都沒有(除了那兩支 pg_notify)
 //
 // 推播要讀的東西,查詢頁本來就在讀:場次走 GetMatchForJudge、讓武走
-// FindMatchBudgetByMatch + ListHandicapSelections、票數走 VoteTalliesByMatch、
-// 賠率參數走 BettingOddsConfig、階段走 GetTournamentBySlug。
+// FindMatchBudgetByMatch + ListHandicapSelections、盤口走 ListMarketsByMatches、
+// 票數走 VoteTalliesByMarkets、規則走 GetTournamentByID + rules.Parse、階段走 GetTournamentBySlug。
 //
 // 為推播另寫一套「差不多但欄位少一點」的查詢,會讓同一個畫面上的同一個數字
 // 有兩條產生路徑 —— 而它們會在某次改動之後給出不同答案(專案規則 9)。
-// 賠率尤其不能有第二條路:它的公式在 betting 套件,這裡只負責把票數餵進去。
+// 賠率尤其不能有第二條路:它的公式在 betting 套件,連「把票數與盤口組成一場的賠率」
+// 這一步也走 betting.BuildMatchOdds,這裡只負責把資料列翻成它要的形狀。
 
 // readMatch 讀一場比賽的完整狀態。
 func (l *Listener) readMatch(ctx context.Context, matchPublicID string) (*match.Match, error) {
@@ -33,6 +36,27 @@ func (l *Listener) readMatch(ctx context.Context, matchPublicID string) (*match.
 	}
 	m := toMatch(row)
 	return &m, nil
+}
+
+// readRounds 讀一場比賽與它的全部回合(回合開始 / 結束、場次定案的推播內容)。
+//
+// 回合勝者在列上是內部 id,這裡用場上兩人對回 public_id(Match.ResolveRoundWinners),
+// 訂閱者收到的就是對戰表頁查詢會回的同一個形狀。
+func (l *Listener) readRounds(ctx context.Context, matchPublicID string) (*match.Match, *watch.MatchRounds, error) {
+	m, err := l.readMatch(ctx, matchPublicID)
+	if err != nil {
+		return nil, nil, err
+	}
+	rows, err := l.q.ListMatchRounds(ctx, m.ID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("讀回合 %s: %w", matchPublicID, err)
+	}
+	rounds := make([]match.Round, 0, len(rows))
+	for _, r := range rows {
+		rounds = append(rounds, toRound(r))
+	}
+	m.ResolveRoundWinners(rounds)
+	return m, &watch.MatchRounds{MatchPublicID: m.PublicID, Rounds: rounds}, nil
 }
 
 // readHandicaps 讀封盤後的完整讓武清單。
@@ -100,12 +124,13 @@ func (l *Listener) readHandicaps(ctx context.Context, matchPublicID string) (*ha
 	return out, nil
 }
 
-// readOdds 讀票數並算出當下的賠率。
+// readOdds 讀一場全部盤口的票數並算出當下的賠率。
 //
 // **賠率不從資料庫讀,是算出來的** —— 它沒有被存在任何地方(存了就會與票數
-// 不同步)。公式的權威在 betting.MatchOddsOf,這裡只負責把票數與設定餵進去。
+// 不同步)。信封的 Ref 是場次 public_id(一票只動一個盤口,但畫面上顯示的是整場
+// 的盤口清單),所以這裡一次解出該場所有盤口,與 GetOdds 回的是同一個東西。
 //
-// MyVote 刻意留空:推播是廣播,一則訊息要送給這一屆的所有訂閱者,
+// MyVote 刻意留空(mine 傳 nil):推播是廣播,一則訊息要送給這一屆的所有訂閱者,
 // 不可能因人而異(watch.proto 的「匿名可讀」)。
 func (l *Listener) readOdds(ctx context.Context, matchPublicID string) (*betting.MatchOdds, error) {
 	row, err := l.q.GetMatchForJudge(ctx, matchPublicID)
@@ -114,42 +139,83 @@ func (l *Listener) readOdds(ctx context.Context, matchPublicID string) (*betting
 	}
 	m := toMatch(row)
 
-	tallies, err := l.q.VoteTalliesByMatch(ctx, []int64{m.ID})
+	marketRows, err := l.q.ListMarketsByMatches(ctx, []int64{m.ID})
 	if err != nil {
-		return nil, fmt.Errorf("數票 %s: %w", matchPublicID, err)
+		return nil, fmt.Errorf("讀盤口 %s: %w", matchPublicID, err)
 	}
-	var tally betting.Tally
-	for _, t := range tallies {
-		if t.MatchID == m.ID {
-			tally = betting.Tally{P1: t.P1Votes, P2: t.P2Votes}
+	markets := make([]betting.Market, 0, len(marketRows))
+	marketIDs := make([]int64, 0, len(marketRows))
+	for _, mk := range marketRows {
+		line, err := lineSecondsOf(mk.Params)
+		if err != nil {
+			return nil, fmt.Errorf("盤口 %s 的參數: %w", mk.PublicID, err)
+		}
+		markets = append(markets, betting.Market{
+			ID:          mk.ID,
+			PublicID:    mk.PublicID,
+			MatchID:     mk.MatchID,
+			Kind:        betting.MarketKind(mk.Kind),
+			RoundNo:     int(deref(mk.RoundNo)),
+			LineSeconds: line,
+			Status:      betting.MarketStatus(mk.Status),
+		})
+		marketIDs = append(marketIDs, mk.ID)
+	}
+
+	// 沒有任何人投票的盤口不會有列 —— 零票是合法輸入,平滑參數會給出各結果
+	// 相同的賠率,不需要在這裡補特例。
+	tallies := map[int64]betting.Tally{}
+	if len(marketIDs) > 0 {
+		rows, err := l.q.VoteTalliesByMarkets(ctx, marketIDs)
+		if err != nil {
+			return nil, fmt.Errorf("數票 %s: %w", matchPublicID, err)
+		}
+		for _, t := range rows {
+			tally := tallies[t.MarketID]
+			if tally == nil {
+				tally = betting.Tally{}
+				tallies[t.MarketID] = tally
+			}
+			tally[betting.Outcome(t.Outcome)] = t.Votes
 		}
 	}
-	// 沒有任何人投票的場次不會有列 —— 零票是合法輸入,平滑參數會給出兩邊
-	// 相同的賠率,不需要在這裡補特例。
 
-	cfgRow, err := l.q.BettingOddsConfig(ctx, m.TournamentID)
+	// 規則(賠率參數、best_of → 比分盤的結果數)= tournaments.config 經 rules.Parse。
+	// 壞設定退回預設、錯誤只是診斷,推播不是記它的地方(rules.Validate 在建賽事時擋)。
+	// MaxStake 對賠率無關,推播不讀 economy_configs。
+	t, err := l.q.GetTournamentByID(ctx, m.TournamentID)
 	if err != nil {
-		return nil, fmt.Errorf("讀賠率設定 %s: %w", matchPublicID, err)
+		return nil, notFound("賽事", matchPublicID, err)
 	}
-	cfg := betting.OddsConfig{
-		SmoothingVotes: cfgRow.SmoothingVotes,
-		VigBps:         cfgRow.VigBps,
-		MinOddsMilli:   cfgRow.MinOddsMilli,
-		MaxOddsMilli:   cfgRow.MaxOddsMilli,
-		MaxParlayMilli: cfgRow.MaxParlayMilli,
-		MaxStake:       cfgRow.MaxStake,
-	}.Normalize()
+	cfg, _ := rules.Parse(t.Config)
 
-	p1, p2 := betting.MatchOddsOf(tally, cfg)
-	return &betting.MatchOdds{
-		MatchPublicID: m.PublicID,
-		P1Votes:       tally.P1,
-		P2Votes:       tally.P2,
-		P1OddsMilli:   p1,
-		P2OddsMilli:   p2,
-		OpenForBets:   betting.MatchStatus(m.Status).OpenForBets(),
-		MyVote:        betting.SideNone,
-	}, nil
+	// 選手名要帶:p1 / p2 類結果的顯示名由 betting.OutcomeLabel 用它組,
+	// 少了名字,推播回的 label 會是空的而查詢回的不是(同一欄位兩種答案)。
+	bm := betting.Match{
+		PublicID: m.PublicID, Status: betting.MatchStatus(m.Status),
+		P1: betting.Participant{PlayerID: m.P1.ID, DisplayName: m.P1.DisplayName},
+		P2: betting.Participant{PlayerID: m.P2.ID, DisplayName: m.P2.DisplayName},
+	}
+	out := betting.BuildMatchOdds(bm, markets, tallies, betting.Rules{Config: cfg}, nil)
+	return &out, nil
+}
+
+// marketParams 是 markets.params 的形狀(與 bettingpg 同一份 JSON 鍵,權威是 migration 00007)。
+type marketParams struct {
+	LineSeconds int64 `json:"line_seconds,omitempty"`
+}
+
+// lineSecondsOf 從 markets.params 取 line_seconds(缺鍵 = 0)。讀不懂的 JSON 失敗出聲:
+// 這條線決定 over/under 的顯示,壞掉的參數不該靜靜變成 0 秒。
+func lineSecondsOf(raw []byte) (int64, error) {
+	if len(raw) == 0 {
+		return 0, nil
+	}
+	var p marketParams
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return 0, fmt.Errorf("解析 params %q: %w", string(raw), err)
+	}
+	return p.LineSeconds, nil
 }
 
 // readPhase 讀賽事當前階段。
@@ -249,4 +315,13 @@ func deref[T any](p *T) T {
 		return zero
 	}
 	return *p
+}
+
+// toRound 把回合列翻成 core 型別。WinnerPublicID 留給 ResolveRoundWinners 填。
+func toRound(r db.ActivityMatchRound) match.Round {
+	out := match.Round{RoundNo: int(r.RoundNo), StartedAt: r.StartedAt, FinishedAt: r.FinishedAt}
+	if r.WinnerPlayerID != nil {
+		out.WinnerPlayerID = *r.WinnerPlayerID
+	}
+	return out
 }

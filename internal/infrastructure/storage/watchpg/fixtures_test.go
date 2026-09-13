@@ -126,6 +126,19 @@ func (f *fixture) match(round, slot int, p1, p2 player, status match.Status) mre
 	return m
 }
 
+// market 給一場開一個 match_winner 盤口(直接寫,不走開盤流程 —— 本套件測的是推播,
+// 開盤的路徑在 bettingpg 驗)。回盤口的內部 id,投票要用。
+func (f *fixture) market(m mrec) int64 {
+	f.t.Helper()
+	var id int64
+	if err := pool.QueryRow(context.Background(), `
+		INSERT INTO activity.markets (public_id, match_id, kind)
+		VALUES (gen_random_uuid()::text, $1, 'match_winner') RETURNING id`, m.id).Scan(&id); err != nil {
+		f.t.Fatalf("建盤口: %v", err)
+	}
+	return id
+}
+
 // finish 判一場的勝負(直接寫,不走裁判流程 —— 本套件測的是推播不是判決)。
 func (f *fixture) finish(m mrec, winner player) {
 	f.t.Helper()
@@ -143,8 +156,8 @@ func (f *fixture) lockHandicaps(m mrec, holder player) {
 	ctx := context.Background()
 	var itemID int64
 	if err := pool.QueryRow(ctx, `
-		INSERT INTO activity.handicap_items (public_id, tournament_id, category, name, cost)
-		VALUES (gen_random_uuid()::text, $1, 'weapon', '禁切武器', 8)
+		INSERT INTO activity.handicap_items (public_id, tournament_id, category, name, cost, key)
+		VALUES (gen_random_uuid()::text, $1, 'weapon', '禁切武器', 8, 'weapon.no_switch')
 		RETURNING id`, f.id).Scan(&itemID); err != nil {
 		f.t.Fatalf("建讓武項目: %v", err)
 	}

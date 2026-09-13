@@ -5,7 +5,11 @@ import (
 	"fmt"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5"
+
+	"github.com/danicotech/hestia/internal/core/activity/betting"
 	"github.com/danicotech/hestia/internal/core/platform/ledger"
 	"github.com/danicotech/hestia/internal/shared/ulid"
 )
@@ -13,10 +17,31 @@ import (
 // 測試資料一律直接寫 SQL 建立,不繞道別的服務:
 // 這裡要驗的是 bettingpg 的行為,前置資料越少間接層越好查。
 // public_id 一律用 internal/shared/ulid(專案鐵則 5:對外只出現 ULID)。
+//
+// 唯一的例外是盤口:它走 svc.OpenMarketsInTx 建,因為那正是本套件要驗的路徑之一
+// (依 config 展開、public_id 由 adapter 給、撞唯一索引出聲)。
 
 // voteUserSeq 給投票用的假使用者 id。votes.user_id 是弱參照(不設 FK),
 // 只用來擋灌票 —— 測試不需要為了數票去建真的帳號。
 var voteUserSeq atomic.Int64
+
+// fullConfig 是開發庫那種 config:三局兩勝、四種盤口、duration 線 90 秒(migration 00008)。
+const fullConfig = `{
+  "version": 2,
+  "format": {"best_of": 3, "preamble_every_round": true, "third_place_match": true},
+  "betting": {
+    "enabled": true,
+    "markets": [
+      {"kind": "match_winner"},
+      {"kind": "round_winner"},
+      {"kind": "duration", "line_seconds": 90},
+      {"kind": "score"}
+    ],
+    "odds": {"kind": "vote_share"},
+    "parlay": {"legs_per_match": 1},
+    "close_at": "first_round_start"
+  }
+}`
 
 func newULID(t *testing.T) string {
 	t.Helper()
@@ -64,7 +89,7 @@ func balanceOf(t *testing.T, userID int64) int64 {
 	return bal
 }
 
-// newTournament 建一屆賽事。config 傳 "{}" 即全部走 OddsConfig.Normalize() 的預設值。
+// newTournament 建一屆賽事。config 傳 "{}" 即 rules.Default()(v1 語意:只有勝負盤、單場定勝負)。
 func newTournament(t *testing.T, config string) (id int64, slug string) {
 	t.Helper()
 	slug = "t-" + newULID(t)
@@ -118,61 +143,165 @@ func newPlayerSplit(t *testing.T, tournamentID int64, playerUserID, fencerUserID
 // matchSlotSeq 讓同一屆的場次不撞 UNIQUE(tournament_id, round, slot)。
 var matchSlotSeq atomic.Int64
 
-// newMatch 建一場可下注的比賽(status='ready')。
-func newMatch(t *testing.T, tournamentID, p1, p2 int64) (id int64, publicID string) {
+// mrec 是一場可下注的比賽:場次 + 依該屆規則開好的盤口。
+type mrec struct {
+	id      int64
+	pub     string
+	p1, p2  int64
+	markets []betting.Market
+}
+
+// market 找某種盤口(逐回合盤口指定 roundNo,其餘傳 0)。
+func (m mrec) market(t *testing.T, kind betting.MarketKind, roundNo int) betting.Market {
 	t.Helper()
-	publicID = newULID(t)
+	for _, mk := range m.markets {
+		if mk.Kind == kind && mk.RoundNo == roundNo {
+			return mk
+		}
+	}
+	t.Fatalf("場次 %s 沒有 %s round=%d 的盤口", m.pub, kind, roundNo)
+	return betting.Market{}
+}
+
+// leg 組一腿。
+func (m mrec) leg(t *testing.T, kind betting.MarketKind, roundNo int, o betting.Outcome) betting.LegInput {
+	t.Helper()
+	return betting.LegInput{MatchPublicID: m.pub, MarketPublicID: m.market(t, kind, roundNo).PublicID, Outcome: o}
+}
+
+// winner 是最常用的一腿:整場勝負。
+func (m mrec) winner(t *testing.T, o betting.Outcome) betting.LegInput {
+	t.Helper()
+	return m.leg(t, betting.MarketMatchWinner, 0, o)
+}
+
+// newMatch 建一場 ready 的比賽並開盤(走 OpenMarketsInTx)。
+func newMatch(t *testing.T, tournamentID, p1, p2 int64) mrec {
+	t.Helper()
+	m := mrec{pub: newULID(t), p1: p1, p2: p2}
 	err := pool.QueryRow(context.Background(),
 		`INSERT INTO activity.matches
 		   (public_id, tournament_id, round, slot, p1_player_id, p2_player_id, status)
 		 VALUES ($1, $2, 1, $3, $4, $5, 'ready') RETURNING id`,
-		publicID, tournamentID, matchSlotSeq.Add(1), p1, p2,
-	).Scan(&id)
+		m.pub, tournamentID, matchSlotSeq.Add(1), p1, p2,
+	).Scan(&m.id)
 	if err != nil {
 		t.Fatalf("建場次: %v", err)
 	}
-	return id, publicID
+	m.markets = openMarkets(t, m.pub)
+	return m
+}
+
+// openMarkets 走正式路徑開盤。
+func openMarkets(t *testing.T, matchPub string) []betting.Market {
+	t.Helper()
+	var out []betting.Market
+	err := repo.InTx(context.Background(), func(ctx context.Context, tx pgx.Tx) error {
+		var err error
+		out, err = svc.OpenMarketsInTx(ctx, tx, matchPub)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("開盤 %s: %v", matchPub, err)
+	}
+	return out
+}
+
+// startMatch 場次開打:status live、started_at、關盤(走 CloseMarketsInTx)。回關掉的盤口數。
+func startMatch(t *testing.T, m mrec) int {
+	t.Helper()
+	ctx := context.Background()
+	// setup_confirmed_at 一併寫:matches_started_requires_setup_check 要求未確認設定不得開打
+	// (裁判流程的事,這裡只是讓資料合法)。
+	if _, err := pool.Exec(ctx,
+		`UPDATE activity.matches
+		    SET status = 'live', started_at = now(), setup_confirmed_at = now()
+		  WHERE id = $1`, m.id); err != nil {
+		t.Fatalf("開打 %d: %v", m.id, err)
+	}
+	var n int
+	err := repo.InTx(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		var err error
+		n, err = svc.CloseMarketsInTx(ctx, tx, m.pub)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("關盤 %s: %v", m.pub, err)
+	}
+	return n
+}
+
+// playRound 記一回合:seconds 是時長(started_at 往回推),winner 是選手 id。
+func playRound(t *testing.T, m mrec, roundNo int, winnerPlayerID int64, seconds int64) {
+	t.Helper()
+	// 時間全由 SQL 算(now() − seconds),不讓 Go 的時鐘與 DB 的時鐘混用。
+	_, err := pool.Exec(context.Background(),
+		`INSERT INTO activity.match_rounds (match_id, round_no, started_at, finished_at, winner_player_id)
+		 VALUES ($1, $2, now() - make_interval(secs => $3), now(), $4)`,
+		m.id, roundNo, seconds, winnerPlayerID)
+	if err != nil {
+		t.Fatalf("記回合 match=%d round=%d: %v", m.id, roundNo, err)
+	}
+}
+
+// playRoundExact 記一回合,時長精確到奈秒(邊界測試用)。
+func playRoundExact(t *testing.T, m mrec, roundNo int, winnerPlayerID int64, d time.Duration) {
+	t.Helper()
+	_, err := pool.Exec(context.Background(),
+		`INSERT INTO activity.match_rounds (match_id, round_no, started_at, finished_at, winner_player_id)
+		 VALUES ($1, $2, $3, $4, $5)`,
+		m.id, roundNo, time.Unix(1_800_000_000, 0).UTC(), time.Unix(1_800_000_000, 0).UTC().Add(d), winnerPlayerID)
+	if err != nil {
+		t.Fatalf("記回合 match=%d round=%d: %v", m.id, roundNo, err)
+	}
 }
 
 // finishMatch 把場次判成 done + 勝者(正常賽果)。賽事服務的職責,測試直接寫。
-func finishMatch(t *testing.T, matchID, winnerPlayerID int64) {
+func finishMatch(t *testing.T, m mrec, winnerPlayerID int64) {
 	t.Helper()
 	_, err := pool.Exec(context.Background(),
 		`UPDATE activity.matches
 		    SET status = 'done', winner_player_id = $2, finished_at = now()
-		  WHERE id = $1`, matchID, winnerPlayerID)
+		  WHERE id = $1`, m.id, winnerPlayerID)
 	if err != nil {
-		t.Fatalf("判定場次 %d: %v", matchID, err)
+		t.Fatalf("判定場次 %d: %v", m.id, err)
 	}
+}
+
+// finishBestOf3 記完一場三局兩勝並判定整場。winners 是逐回合勝者,seconds 是逐回合時長。
+func finishBestOf3(t *testing.T, m mrec, winners []int64, seconds []int64) {
+	t.Helper()
+	for i, w := range winners {
+		playRound(t, m, i+1, w, seconds[i])
+	}
+	finishMatch(t, m, winners[len(winners)-1])
 }
 
 // walkoverMatch 把場次判成不戰而勝。賠率是按「真的打一場」算的,
 // 所以這種場次走 VoidMatch 退款,不走 SettleMatch。
-func walkoverMatch(t *testing.T, matchID int64) {
+func walkoverMatch(t *testing.T, m mrec) {
 	t.Helper()
 	_, err := pool.Exec(context.Background(),
 		`UPDATE activity.matches
 		    SET status = 'done', result_kind = 'walkover', finished_at = now()
-		  WHERE id = $1`, matchID)
+		  WHERE id = $1`, m.id)
 	if err != nil {
-		t.Fatalf("判定棄賽 %d: %v", matchID, err)
+		t.Fatalf("判定棄賽 %d: %v", m.id, err)
 	}
 }
 
-// castVotes 灌票(每票一個不同的假使用者,對應 votes_match_user_uq)。
-func castVotes(t *testing.T, matchID int64, p1, p2 int) {
+// castVotes 對一個盤口灌票(每票一個不同的假使用者,對應 votes_market_user_uq)。
+func castVotes(t *testing.T, mk betting.Market, votes map[betting.Outcome]int) {
 	t.Helper()
 	ctx := context.Background()
-	for i := 0; i < p1+p2; i++ {
-		side := 1
-		if i >= p1 {
-			side = 2
-		}
-		_, err := pool.Exec(ctx,
-			`INSERT INTO activity.votes (match_id, user_id, side) VALUES ($1, $2, $3)`,
-			matchID, voteUserSeq.Add(1)+900_000_000, side)
-		if err != nil {
-			t.Fatalf("灌票 match=%d: %v", matchID, err)
+	for o, n := range votes {
+		for i := 0; i < n; i++ {
+			_, err := pool.Exec(ctx,
+				`INSERT INTO activity.votes (market_id, user_id, outcome) VALUES ($1, $2, $3)`,
+				mk.ID, voteUserSeq.Add(1)+900_000_000, string(o))
+			if err != nil {
+				t.Fatalf("灌票 market=%d: %v", mk.ID, err)
+			}
 		}
 	}
 }
@@ -204,6 +333,28 @@ func readBet(t *testing.T, publicID string) betRow {
 		t.Fatalf("讀注單 %s: %v", publicID, err)
 	}
 	return b
+}
+
+// marketStatus 讀盤口目前的狀態。
+func marketStatus(t *testing.T, marketID int64) string {
+	t.Helper()
+	var s string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT status FROM activity.markets WHERE id = $1`, marketID).Scan(&s); err != nil {
+		t.Fatalf("讀盤口 %d: %v", marketID, err)
+	}
+	return s
+}
+
+// legResult 讀某張注單在某盤口那一腿的 result。
+func legResult(t *testing.T, betID, marketID int64) string {
+	t.Helper()
+	var s string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT result FROM activity.bet_legs WHERE bet_id = $1 AND market_id = $2`, betID, marketID).Scan(&s); err != nil {
+		t.Fatalf("讀腿 bet=%d market=%d: %v", betID, marketID, err)
+	}
+	return s
 }
 
 func countRows(t *testing.T, query string, args ...any) int64 {
