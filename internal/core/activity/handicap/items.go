@@ -4,6 +4,8 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"strings"
 	"sync"
 )
 
@@ -35,7 +37,8 @@ var loadSeed = sync.OnceValues(func() ([]ItemSpec, error) {
 	if len(f.Items) == 0 {
 		return nil, fmt.Errorf("讓武項目 seed 是空的")
 	}
-	seen := make(map[string]struct{}, len(f.Items))
+	seenKey := make(map[string]struct{}, len(f.Items))
+	seenName := make(map[string]struct{}, len(f.Items))
 	for i, it := range f.Items {
 		if !it.Category.Valid() {
 			return nil, fmt.Errorf("第 %d 項 %q 的分類 %q 不是六大類之一", i, it.Name, it.Category)
@@ -43,19 +46,45 @@ var loadSeed = sync.OnceValues(func() ([]ItemSpec, error) {
 		if it.Name == "" {
 			return nil, fmt.Errorf("第 %d 項沒有名稱", i)
 		}
+		if err := validateKey(it.Key, it.Category); err != nil {
+			return nil, fmt.Errorf("第 %d 項 %q: %w", i, it.Name, err)
+		}
 		// cost > 0 是 DB 的 CHECK;在這裡先擋住,免得 seed 打錯字要等到 migration 才炸。
 		if it.Cost <= 0 {
 			return nil, fmt.Errorf("項目 %q 的 cost 必須為正,實際是 %d", it.Name, it.Cost)
 		}
-		key := itemKey(it.Category, it.Name)
-		if _, dup := seen[key]; dup {
-			// 對應 UNIQUE (tournament_id, category, name)。
-			return nil, fmt.Errorf("項目 %s 重複", key)
+		// params 的鍵與值域已在 ItemParams.UnmarshalJSON 驗過;這裡只剩唯一性。
+		if _, dup := seenKey[it.Key]; dup {
+			// 對應 UNIQUE (tournament_id, key)。
+			return nil, fmt.Errorf("項目 key %s 重複", it.Key)
 		}
-		seen[key] = struct{}{}
+		seenKey[it.Key] = struct{}{}
+		name := string(it.Category) + "/" + it.Name
+		if _, dup := seenName[name]; dup {
+			// 對應 UNIQUE (tournament_id, category, name):InsertItems 的衝突鍵仍是它。
+			return nil, fmt.Errorf("項目 %s 重複", name)
+		}
+		seenName[name] = struct{}{}
 	}
 	return f.Items, nil
 })
+
+// keyPattern 是 key 的形狀,與 DB 的 handicap_items_key_format_check 同一條正規式。
+var keyPattern = regexp.MustCompile(`^[a-z]+\.[a-z0-9_]+$`)
+
+// validateKey 檢查 key 的形狀且前綴等於分類。
+//
+// 兩個地方各寫一次分類(key 的前綴、category 欄位)本來就是重複,
+// 這條檢查讓漂移在載入 seed 時就被擋下,而不是等 DB 的 CHECK。
+func validateKey(key string, c Category) error {
+	if !keyPattern.MatchString(key) {
+		return fmt.Errorf("key %q 不符合 <category>.<snake_case>", key)
+	}
+	if prefix, _, _ := strings.Cut(key, "."); prefix != string(c) {
+		return fmt.Errorf("key %q 的前綴 %q 與分類 %q 不一致", key, prefix, c)
+	}
+	return nil
+}
 
 // SeedItems 回傳內嵌的讓武項目定義。
 //
@@ -70,9 +99,7 @@ func SeedItems() ([]ItemSpec, error) {
 	return out, nil
 }
 
-func itemKey(c Category, name string) string { return string(c) + "/" + name }
-
-// targetNoteRequired 列出「必須填指定內容」的項目。
+// targetNoteRequired 列出「必須填指定內容」的項目,以 key 定址。
 //
 // 為什麼是程式裡的一份表而不是 handicap_items 的欄位:這個判斷是項目**語意**
 // 的一部分(「指定對手武學」不填武學名就沒有意義),不是逐屆可調的設定。
@@ -100,32 +127,22 @@ func itemKey(c Category, name string) string { return string(c) + "/" + name }
 //
 // 新增項目時若忘了登記,預設是 false(不強制)—— 選擇寬鬆的預設是因為
 // 漏擋的後果是裁判臨場問一句,誤擋的後果是選手買不了東西。
+//
+// 以 key 而不是 (category, name) 定址:2026-09-13 審定時「16 級武庫」改成「46 級」,
+// 名稱會變、key 不會。items_test.go 驗每一個 key 都存在於 seed,刪項時測試會紅。
 var targetNoteRequired = map[string]struct{}{
-	itemKeyWeaponDesignatedArt:   {},
-	itemKeySkillBanTwo:           {},
-	itemKeySkillBanOne:           {},
-	itemKeySkillRemap:            {},
-	itemKeySkillBanOneArcane:     {},
-	itemKeyPoisonSwapKeys:        {},
-	itemKeyRuleDesignateAppear:   {},
-	itemKeyRuleDesignateOpenLine: {},
+	"weapon.designated_art":      {}, // 指定對手武學
+	"skill.ban_two":              {}, // 禁用兩種技能
+	"skill.ban_one":              {}, // 禁用一種技能
+	"skill.remap":                {}, // 指定並更改技能位子
+	"skill.ban_arcane_one":       {}, // 禁用任意奇術
+	"poison.swap_keys":           {}, // 互換任意兩個按鍵
+	"rule.designated_appearance": {}, // 指定對手外觀
+	"rule.opening_line":          {}, // 指定對手開局時講一句話
 }
 
-// 這些 key 與 seed JSON 的 (category, name) 必須逐字相同 ——
-// items_test.go 會驗證每一個 key 都真的存在於 seed 裡,改名時測試會紅。
-const (
-	itemKeyWeaponDesignatedArt   = "weapon/指定對手武學"
-	itemKeySkillBanTwo           = "skill/禁用兩種技能"
-	itemKeySkillBanOne           = "skill/禁用一種技能"
-	itemKeySkillRemap            = "skill/指定並更改技能位子"
-	itemKeySkillBanOneArcane     = "skill/禁用任意奇術"
-	itemKeyPoisonSwapKeys        = "poison/互換任意兩個按鍵"
-	itemKeyRuleDesignateAppear   = "rule/指定對手外觀"
-	itemKeyRuleDesignateOpenLine = "rule/指定對手開局時講一句話"
-)
-
-// RequiresTargetNote 回報某個項目是否必須填指定內容。
-func RequiresTargetNote(c Category, name string) bool {
-	_, ok := targetNoteRequired[itemKey(c, name)]
+// RequiresTargetNote 回報某個項目(以 key 指定)是否必須填指定內容。
+func RequiresTargetNote(key string) bool {
+	_, ok := targetNoteRequired[key]
 	return ok
 }

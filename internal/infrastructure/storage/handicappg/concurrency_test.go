@@ -151,6 +151,138 @@ func TestConcurrentSelectAndLock(t *testing.T) {
 	assertSpentConsistent(t, f.matchID, f.holderID)
 }
 
+// TestConcurrentRefundSelection 驗證兩個裁判同時退同一筆時只退一次。
+//
+// 這條要用真 Postgres 測的理由與 TestConcurrentSelectSameItem 相同,但方向相反:
+// 那邊怕的是「兩個請求同時看到還剩 24 BP」,這邊怕的是「兩個請求同時看到
+// 這筆還沒退」—— 兩個都通過 sel.Voided 檢查,BP 就會退兩次,而 spent 會變成負的。
+//
+// 擋住它的有兩道:LockMatch 的 FOR UPDATE(鎖後重讀才是權威),
+// 以及 MarkSelectionVoided 的 AND NOT voided(0 列 = 已經退過)。
+// core 的測試用一把 Go mutex 模擬第一道,前提本身只有真的 Postgres 答得出來。
+func TestConcurrentRefundSelection(t *testing.T) {
+	setup(t)
+	ctx := context.Background()
+	repo := handicappg.New(pool)
+	svc := handicap.New(repo)
+	f := newFixture(t, defaultOpt())
+	items := installItems(t, repo, f.tournamentID, testSpecs())
+	if _, err := svc.GrantBudget(ctx, f.matchRef); err != nil {
+		t.Fatalf("GrantBudget: %v", err)
+	}
+	sel, err := svc.Select(ctx, handicap.SelectParams{
+		MatchPublicID: f.matchRef, PlayerID: f.holderID, ItemRef: items["測試_十點"].Ref,
+	})
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+
+	const judges = 8
+	var wg sync.WaitGroup
+	errs := make([]error, judges)
+	start := make(chan struct{})
+	for i := range judges {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, errs[i] = svc.RefundSelection(ctx, sel.Selection.PublicID)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	ok, already := 0, 0
+	for _, err := range errs {
+		switch {
+		case err == nil:
+			ok++
+		case errors.Is(err, handicap.ErrSelectionAlreadyVoided):
+			already++
+		default:
+			t.Errorf("非預期的錯誤:%v", err)
+		}
+	}
+	if ok != 1 || already != judges-1 {
+		t.Fatalf("成功 %d / 已退 %d,想要 1 / %d", ok, already, judges-1)
+	}
+	assertSpentConsistent(t, f.matchID, f.holderID)
+	b, err := repo.GetBudget(ctx, f.matchID, f.holderID)
+	if err != nil {
+		t.Fatalf("GetBudget: %v", err)
+	}
+	if b.Spent != 0 {
+		t.Errorf("spent = %d,想要 0(只退一次 10 BP)", b.Spent)
+	}
+}
+
+// TestConcurrentRefundAndLock 驗證代退不會跨過封盤那條線。
+//
+// 封盤與代退撞在一起時,代退只可能成功或 ErrHandicapLocked;
+// 而封盤當下回傳的清單就是最終清單 —— 封盤之後不可能再少一項,
+// 否則對手照著公告準備的條件會被事後拿掉一條。
+func TestConcurrentRefundAndLock(t *testing.T) {
+	setup(t)
+	ctx := context.Background()
+	repo := handicappg.New(pool)
+	svc := handicap.New(repo)
+	f := newFixture(t, defaultOpt())
+	items := installItems(t, repo, f.tournamentID, testSpecs())
+	if _, err := svc.GrantBudget(ctx, f.matchRef); err != nil {
+		t.Fatalf("GrantBudget: %v", err)
+	}
+	a, err := svc.Select(ctx, handicap.SelectParams{
+		MatchPublicID: f.matchRef, PlayerID: f.holderID, ItemRef: items["測試_十點"].Ref,
+	})
+	if err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+	if _, err := svc.Select(ctx, handicap.SelectParams{
+		MatchPublicID: f.matchRef, PlayerID: f.holderID, ItemRef: items["測試_四點"].Ref,
+	}); err != nil {
+		t.Fatalf("Select: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	var refundErr, lockErr error
+	var view *handicap.MatchHandicaps
+	start := make(chan struct{})
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		_, refundErr = svc.RefundSelection(ctx, a.Selection.PublicID)
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		view, lockErr = svc.Lock(ctx, f.matchRef)
+	}()
+	close(start)
+	wg.Wait()
+
+	if lockErr != nil {
+		t.Fatalf("Lock: %v", lockErr)
+	}
+	if refundErr != nil && !errors.Is(refundErr, handicap.ErrHandicapLocked) {
+		t.Fatalf("代退只該成功或被封盤擋下,實際:%v", refundErr)
+	}
+	// 封盤後清單不再變動。
+	after, err := repo.ListSelections(ctx, f.matchID, f.holderID)
+	if err != nil {
+		t.Fatalf("ListSelections: %v", err)
+	}
+	if len(after) != len(view.Selections) {
+		t.Fatalf("封盤後清單長度 = %d,封盤當下 = %d", len(after), len(view.Selections))
+	}
+	assertSpentConsistent(t, f.matchID, f.holderID)
+
+	// 封盤之後再退一定失敗 —— 封盤不可逆,裁判也不例外。
+	if _, err := svc.RefundSelection(ctx, a.Selection.PublicID); err == nil {
+		t.Fatal("封盤後還退得掉")
+	}
+}
+
 // TestConcurrentGrantBudget 驗證同一場被重複發預算時只會建一列。
 //
 // 賽程推進與裁判手動觸發可能同時呼叫 GrantBudget;預期結果是其中一個建列、

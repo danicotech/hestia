@@ -10,7 +10,7 @@
 //
 // 平台鐵則是「動錢一律要 Idempotency-Key」。這裡刻意沒有,因為 BP 的四個性質
 // 沒有一個符合貨幣:每輪依段位差重發、沒花完即作廢、不可交易、不可累積。
-// 重複扣一次 BP 的後果是使用者看到數字不對(裁判封盤前退掉即可),
+// 重複扣一次 BP 的後果是使用者看到數字不對(選手自己封盤前退掉即可),
 // 不是對不上帳(那個無法事後修復)。詳見 migrations/activity/00002_handicap.sql。
 //
 // 真正動錢的是報名獎勵、賽事獎金與下注派彩,那三處才走 Ledger 與冪等鍵。
@@ -28,18 +28,30 @@
 // 這條界線寫在 MatchHandicaps 的組裝邏輯裡,不是前端隱藏 ——
 // 前端隱藏等於沒隱藏,對手打開 devtools 就知道自己會被禁什麼。
 //
+// 唯一的例外是 RefereeMatchHandicaps:裁判要執行的規則就寫在買下的項目裡
+// (「禁用奇術」的 referee_note 要求裁判確認後返還另一項的 BP),封盤前看不到
+// 內容的話那條規則在場上沒有人執行得了。例外開在一支**另外命名**的方法上,
+// 不是給 MatchHandicaps 加一個 bool 參數 —— 前者漏掛權限是編譯得過但
+// 呼叫點顯眼的錯,後者是一個容易被複製貼上帶過去的 true。
+//
 // # 分層
 //
-// 這個 package 只認標準庫與 activity/bp。持久化以 Repository 介面表達,
+// 這個 package 只認標準庫、activity/bp 與 activity/rules(抽選池的定義在那裡)。
+// 持久化以 Repository 介面表達,
 // 方法刻意貼著單一 SQL 敘述設計,讓 pg adapter 不必在裡面再做決策。
 package handicap
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"sort"
 	"time"
 
 	"github.com/danicotech/hestia/internal/core/activity/bp"
+	"github.com/danicotech/hestia/internal/core/activity/rules"
 )
 
 // Category 是讓武項目的六大分類,字面值即資料庫 handicap_items.category 的 CHECK 值。
@@ -105,7 +117,10 @@ type Item struct {
 	// 沒有沿用 token_entries.entry_ref 那個「以十進位 id 當 ref」的先例:
 	// 那個例外的成立條件是「最大的表 + 分區表無法由 DB 保證全域唯一」,
 	// handicap_items 逐屆 34 列又不分區,兩個條件都不符合。
-	Ref         string
+	Ref string
+	// Key 是穩定識別(<category>.<snake_case>,如 weapon.designated_art)。
+	// 改名不改 key:目錄同步與程式規則一律以它定址(migration 00006)。
+	Key         string
 	Category    Category
 	Name        string
 	Description string
@@ -116,30 +131,123 @@ type Item struct {
 	// Repeatable 只供 UI 標示「(可重複)」,**不作強制**:所有項目都能重複買。
 	Repeatable bool
 	SortOrder  int32
+	// Params 是項目自己的參數(handicap_items.params),鍵的定義見 ItemParams。
+	Params ItemParams
 }
 
 // RequiresTargetNote 回報買這一項時是否必須填指定內容。
 //
 // 這是**推導值不是欄位**:handicap_items 沒有對應的欄位,判斷完全由項目語意決定,
 // 規則寫在 items.go 的 targetNoteRequired。
-func (i Item) RequiresTargetNote() bool { return RequiresTargetNote(i.Category, i.Name) }
+func (i Item) RequiresTargetNote() bool { return RequiresTargetNote(i.Key) }
 
 // ItemSpec 是 seed JSON 裡的一列項目定義(尚未綁定到任何一屆賽事)。
 type ItemSpec struct {
-	Category    Category `json:"category"`
-	Name        string   `json:"name"`
-	Description string   `json:"description"`
+	Category Category `json:"category"`
+	// Key 見 Item.Key。loadSeed 驗它唯一、形狀合法且前綴等於 Category
+	// (與 DB 的 handicap_items_key_format_check 同一條規則)。
+	Key         string `json:"key"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
 	// RefereeNote 是指標而不是字串:目錄補齊的過程中,「還沒寫」與
 	// 「寫了空字串」是兩件事。
-	RefereeNote *string `json:"referee_note"`
-	Cost        int64   `json:"cost"`
-	Repeatable  bool    `json:"repeatable"`
-	SortOrder   int32   `json:"sort_order"`
+	RefereeNote *string    `json:"referee_note"`
+	Cost        int64      `json:"cost"`
+	Repeatable  bool       `json:"repeatable"`
+	SortOrder   int32      `json:"sort_order"`
+	Params      ItemParams `json:"params"`
+}
+
+// ItemParams 是讓武項目的參數(handicap_items.params JSONB)。
+//
+// **這裡是 params 鍵的唯一定義處。** JSONB 不是垃圾桶:解析時未知鍵一律回錯
+// (seed 與 DB 讀回都驗),所以任何新鍵都得先在這裡登記並說明意義。
+//
+//	seconds          「撐過 N 秒即獲勝」的 N。0 = 這一項沒有秒數。
+//	draw             封盤時系統要代抽的東西:DrawWuxue / DrawDirectionKeys。空 = 不抽。
+//	applies_to_both  對施加方同樣生效(「雙方使用 46 級武庫」),設定確認清單要看兩邊。
+type ItemParams struct {
+	Seconds       int64  `json:"seconds,omitempty"`
+	Draw          string `json:"draw,omitempty"`
+	AppliesToBoth bool   `json:"applies_to_both,omitempty"`
+}
+
+// Draw 的合法值。字面值即 catalogue.json 與 DB 裡的字串。
+const (
+	// DrawWuxue 從賽事 config 的 handicap.draw_pools.wuxue 抽一個武學名稱(「隨機武學」)。
+	// 值就是池名:池的名字只在 rules 定義一次,這裡引用而不是再寫一個 "wuxue"。
+	DrawWuxue = rules.PoolWuxue
+	// DrawDirectionKeys 對上下左右抽一個非恆等的排列(「打亂方向鍵」)。
+	// 不需要候選清單:四個鍵是固定的。
+	DrawDirectionKeys = "direction_keys"
+)
+
+// Validate 檢查值域。鍵的存在與否由 UnmarshalJSON 的 DisallowUnknownFields 擋。
+func (p ItemParams) Validate() error {
+	if p.Seconds < 0 {
+		return fmt.Errorf("%w: seconds 不得為負,實際 %d", ErrInvalidItemParams, p.Seconds)
+	}
+	switch p.Draw {
+	case "", DrawWuxue, DrawDirectionKeys:
+		return nil
+	default:
+		return fmt.Errorf("%w: 未知的 draw %q", ErrInvalidItemParams, p.Draw)
+	}
+}
+
+// UnmarshalJSON 嚴格解析:未知鍵回錯、值域不合回錯。
+//
+// 掛在型別上而不是另寫一支 parse 函式,是為了讓 seed(經 ItemSpec)與 adapter
+// (經 ParseItemParams)走**同一條**驗證 —— 兩條路遲早會有一條漏掉新鍵。
+func (p *ItemParams) UnmarshalJSON(data []byte) error {
+	type raw ItemParams // 去掉方法,免得遞迴
+	var r raw
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&r); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidItemParams, err)
+	}
+	// 一份 JSON 只該有一個值:後面還有東西代表不是單一物件。
+	if dec.More() {
+		return fmt.Errorf("%w: params 後面有多餘內容", ErrInvalidItemParams)
+	}
+	out := ItemParams(r)
+	if err := out.Validate(); err != nil {
+		return err
+	}
+	*p = out
+	return nil
+}
+
+// ParseItemParams 把 DB 讀回的 JSONB 文字解成 ItemParams。空輸入視同 {}。
+func ParseItemParams(data []byte) (ItemParams, error) {
+	var p ItemParams
+	if len(bytes.TrimSpace(data)) == 0 {
+		return p, nil
+	}
+	if err := json.Unmarshal(data, &p); err != nil {
+		// json.Unmarshal 先做整段語法檢查才呼叫 UnmarshalJSON,那一層的錯還沒被包過。
+		if errors.Is(err, ErrInvalidItemParams) {
+			return ItemParams{}, err
+		}
+		return ItemParams{}, fmt.Errorf("%w: %w", ErrInvalidItemParams, err)
+	}
+	return p, nil
+}
+
+// JSON 是寫進 DB 的形狀。omitempty 讓沒有參數的項目存成 {},而不是三個零值 ——
+// 那樣 DB 裡的每一列都會長出 "seconds": 0,讀的人得先知道 0 代表「沒有」。
+func (p ItemParams) JSON() (string, error) {
+	b, err := json.Marshal(p)
+	if err != nil {
+		return "", fmt.Errorf("序列化讓武參數: %w", err)
+	}
+	return string(b), nil
 }
 
 // Match 是讓武需要知道的那部分場次資料。
 //
-// adapter 以 matches JOIN tournaments(取 config 的 bp_per_rank_gap)
+// adapter 以 matches JOIN tournaments(取 config 的 bp.per_rank_gap)
 // JOIN tournament_players ×2(取雙方段位與 public_id)一次撈齊 ——
 // 讓武的每個判斷都同時要用到狀態、段位與設定,分三次查會讓它們來自不同的快照。
 type Match struct {
@@ -159,7 +267,7 @@ type Match struct {
 	P2PlayerPublicID string
 	P1Rank           bp.Rank
 	P2Rank           bp.Rank
-	// PerRankGap 取自 tournaments.config.bp_per_rank_gap;0 時 bp 套件會退回預設值 8。
+	// PerRankGap 取自 tournaments.config.bp.per_rank_gap;0 時 bp 套件會退回預設值 8。
 	PerRankGap int64
 }
 
@@ -190,16 +298,28 @@ type Selection struct {
 	MatchPublicID string
 	PlayerID      int64
 	ItemID        int64
-	// ItemRef / ItemName / Category 是項目快照,由 adapter JOIN handicap_items 填入,
-	// 前端顯示一張清單時不必再逐項回查。
-	ItemRef  string
-	ItemName string
-	Category Category
+	// ItemRef / ItemKey / ItemName / Category / ItemParams 是項目快照,
+	// 由 adapter JOIN handicap_items 填入,前端顯示一張清單時不必再逐項回查。
+	ItemRef    string
+	ItemKey    string
+	ItemName   string
+	Category   Category
+	ItemParams ItemParams
+	// ItemRefereeNote 是項目的執行說明,跟著選擇走:設定確認清單(Checklist)
+	// 就是它加上抽選結果。對外只到裁判端,選手端的轉換不輸出它。
+	ItemRefereeNote string
+	// ItemSortOrder 是項目在目錄裡的順序,Checklist 依它排 —— 裁判逐項對照時
+	// 看到的順序要跟目錄一致,不是誰先買誰在前。
+	ItemSortOrder int32
 	// Cost 是購買當下的價格快照。項目改價不影響已成立的選擇。
 	Cost       int64
 	TargetNote string
 	Voided     bool
 	CreatedAt  time.Time
+	// DrawResult / DrawnAt 是封盤時系統抽選的結果,只有 ItemParams.Draw 非空的
+	// 項目會有值。nil = 尚未封盤(或這一項不抽)。兩者同生共死(DB CHECK)。
+	DrawResult *string
+	DrawnAt    *time.Time
 }
 
 // NewSelection 是寫入一列 handicap_selections 所需的全部欄位。
@@ -242,6 +362,22 @@ type VoidParams struct {
 	PlayerID          int64
 }
 
+// RefundResult 是一次退選的完整結果(自助與裁判代退共用同一個形狀)。
+//
+// 帶上場次與被退掉的那一筆,是因為裁判代退的呼叫端要拿它去寫稽核紀錄:
+// 請求只帶 selection_public_id,而稽核要記「哪一場、退了什麼、值多少 BP」。
+// 讓呼叫端自己再查一次,就是同一份資料在兩個時間點各讀一次 —— 中間那一瞬間
+// 的差異會變成一筆說謊的稽核紀錄。
+type RefundResult struct {
+	// MatchID 是內部 id,給同 tx 的呼叫端當稽核 target(對外一律用 public_id)。
+	MatchID       int64
+	MatchPublicID string
+	// Selection 是被退掉的那一筆,Voided 已為 true。
+	Selection Selection
+	// Budget 是退款後的預算,Spent 已經扣掉那一筆。
+	Budget Budget
+}
+
 // MyBudget 是選手自己看到的本場讓武狀態。
 type MyBudget struct {
 	// HasBudget 為 false 時 Budget 是零值 —— 表示同段對決或自己是高段位方。
@@ -259,6 +395,10 @@ type MyBudget struct {
 // 可見性在這裡決定,不在前端:Revealed 為 false 時 Selections 只會包含請求者
 // 自己買的(非施加者本人則為空),且 Budget 為 nil —— 對手在封盤前連
 // 「已經花了多少」都不該知道,那會洩漏對方還剩幾 BP 可用。
+//
+// RefereeMatchHandicaps 是那句話唯一的例外:它在 Revealed 為 false 時也填滿
+// Selections 與 Budget。所以 **Revealed 不能拿來當「這份內容可以公開嗎」**——
+// 它的意思一直是「已封盤」,兩者只在選手與觀眾那條路上剛好一致。
 type MatchHandicaps struct {
 	MatchPublicID string
 	Status        string
@@ -273,6 +413,78 @@ type MatchHandicaps struct {
 	Revealed bool
 }
 
+// ChecklistEntry 是「開賽前設定確認」清單的一列(schemas/20 裁判動線)。
+//
+// 清單是**推導值,不另存**:matches.setup_confirmed_at 只記「誰、什麼時候」按了確認,
+// 內容永遠從當下的選擇重算。這裡就是那個重算。
+type ChecklistEntry struct {
+	SelectionPublicID string
+	ItemKey           string
+	ItemName          string
+	// RefereeNote 是裁判要執行的說明;空 = 目錄還沒寫。
+	RefereeNote string
+	// TargetNote 是買方指定的內容(哪個武學、哪兩個鍵)。
+	TargetNote string
+	// DrawResult 是封盤時抽出的結果;nil = 這一項不抽。
+	DrawResult *string
+	// AppliesToBoth 為 true 時裁判要看兩邊,只看對手是漏的。
+	AppliesToBoth bool
+}
+
+// Checklist 依 Selections 組出設定確認清單:未作廢的每一筆一列,依分類、購買順序排。
+//
+// 分類順序沿用 SQL 的 ORDER BY category(字面值排序),與選購頁的項目順序一致 ——
+// 裁判對著清單找項目時,兩張表長得一樣才不必來回對。分類內維持 Selections 的順序
+// (adapter 依 created_at, id 排,即購買順序)。
+func (mh *MatchHandicaps) Checklist() []ChecklistEntry {
+	sels := make([]Selection, 0, len(mh.Selections))
+	for _, s := range mh.Selections {
+		if !s.Voided {
+			sels = append(sels, s)
+		}
+	}
+	// 分類 → 項目在目錄裡的順序 → 購買順序(SliceStable 保住最後那層):
+	// 裁判逐項對照時看到的順序要跟目錄一致,不是誰先買誰在前。
+	sort.SliceStable(sels, func(i, j int) bool {
+		if sels[i].Category != sels[j].Category {
+			return sels[i].Category < sels[j].Category
+		}
+		return sels[i].ItemSortOrder < sels[j].ItemSortOrder
+	})
+
+	out := make([]ChecklistEntry, 0, len(sels))
+	for _, s := range sels {
+		out = append(out, ChecklistEntry{
+			SelectionPublicID: s.PublicID,
+			ItemKey:           s.ItemKey,
+			ItemName:          s.ItemName,
+			RefereeNote:       s.ItemRefereeNote,
+			TargetNote:        s.TargetNote,
+			DrawResult:        s.DrawResult,
+			AppliesToBoth:     s.ItemParams.AppliesToBoth,
+		})
+	}
+	return out
+}
+
+// SyncReport 是一次目錄同步的結果,給 CLI 印出來、也寫進稽核的 after。
+type SyncReport struct {
+	TournamentID int64 `json:"tournament_id"`
+	// Updated 是實際更新的列數(= seed 中在該屆有對應 key 的項數)。
+	Updated int `json:"updated"`
+	// ExtraKeys 是該屆有、seed 沒有的 key:同步不會動它們。
+	ExtraKeys []string `json:"extra_keys,omitempty"`
+}
+
+// DrawPools 是封盤抽選要的候選清單來源。
+//
+// 池的內容與驗證的權威在 rules 套件(tournaments.config 的 handicap.draw_pools),
+// 這裡只宣告「給我一個名字,回一份清單」—— rules.Config 逐字元滿足它。
+// 用介面而不是直接吃 rules.Config,是讓 core 的 fake 不必解析整份 config。
+type DrawPools interface {
+	DrawPool(name string) ([]string, bool)
+}
+
 // ── 錯誤 ────────────────────────────────────────────────────────
 //
 // 全部是 package 層級 sentinel,transport 用 errors.Is 分辨後決定 HTTP 狀態碼與文案。
@@ -280,6 +492,20 @@ type MatchHandicaps struct {
 var (
 	// ErrInvalidRequest 表示請求參數不合法(缺 id、target_note 過長等)。
 	ErrInvalidRequest = errors.New("請求參數不合法")
+	// ErrInvalidItemParams 表示 handicap_items.params 有未登記的鍵或值域不合。
+	// seed 讀到它是編譯期就該修的錯;DB 讀到它代表有人繞過程式直接改了 JSONB。
+	ErrInvalidItemParams = errors.New("讓武項目參數不合法")
+	// ErrCatalogueInUse 表示該屆已有人依目前的項目文字選購過(含已退掉的),
+	// 改文字等於改比賽條件,同步被拒。
+	ErrCatalogueInUse = errors.New("該屆已有讓武選擇,不可同步目錄")
+	// ErrCatalogueMismatch 表示同步影響的列數與預期不符 —— 目錄與該屆的項目對不上。
+	ErrCatalogueMismatch = errors.New("目錄同步影響列數與預期不符")
+	// ErrDrawPoolEmpty 表示封盤時要抽的池是空的(或 config 沒有這個池)。
+	// 整個封盤失敗:不可以封了盤卻沒抽到 —— 封盤公示必須是完整的。
+	ErrDrawPoolEmpty = errors.New("抽選池是空的")
+	// ErrAlreadyDrawn 表示這筆選擇已經抽過了。抽選與封盤同一個 tx、封盤不可逆,
+	// 所以正常路徑不會發生;發生就是資料被動過,不能靜靜跳過。
+	ErrAlreadyDrawn = errors.New("這筆讓武選擇已經抽過")
 	// ErrItemNotFound 表示讓武項目不存在,或不屬於這場比賽所在的賽事。
 	ErrItemNotFound = errors.New("讓武項目不存在")
 	// ErrHandicapNotOpen 表示裁判尚未開盤。
@@ -347,6 +573,17 @@ type Repository interface {
 	// 語意是 ON CONFLICT (tournament_id, category, name) DO NOTHING:重跑不改價格。
 	// 改價是裁判的明確動作,不該由「不小心重跑一次 seed」造成。
 	InsertItems(ctx context.Context, tournamentID int64, specs []ItemSpec) (int, error)
+	// SyncItems 以 key 匹配,把 specs 的文字與參數(name / description / referee_note /
+	// repeatable / sort_order / params)寫進該屆既有的項目,回實際更新的列數。
+	//
+	// **不動 cost**,也不補建 key 不存在的項目 —— 前者是價格逐屆定案,
+	// 後者是 InsertItems 的事。前置條件(該屆沒有選擇)由 Service 在同一個 tx 內先驗。
+	SyncItems(ctx context.Context, tournamentID int64, specs []ItemSpec) (int, error)
+	// CountSelections 數該屆指向任何讓武項目的選擇,**含已作廢**:
+	// 退掉的也是「有人依這份文字買過」。
+	CountSelections(ctx context.Context, tournamentID int64) (int64, error)
+	// DrawPools 取該屆 config 裡的抽選池。解析的權威在 rules 套件,adapter 只是轉接。
+	DrawPools(ctx context.Context, tournamentID int64) (DrawPools, error)
 
 	// GetBudget 取某人在某場的預算。沒有列時回 ErrNoBudget。
 	GetBudget(ctx context.Context, matchID, playerID int64) (*Budget, error)
@@ -369,6 +606,11 @@ type Repository interface {
 	InsertSelection(ctx context.Context, ns NewSelection) (*Selection, error)
 	// MarkSelectionVoided 標記作廢。voided 之外的欄位一律不動 —— 退費只是 BP 內部的事。
 	MarkSelectionVoided(ctx context.Context, selectionID int64) error
+	// SetSelectionDraw 寫入抽選結果,at 必須等於封盤時間(同一個值,不是同一時刻)。
+	//
+	// 只更新 draw_result IS NULL 的列;0 列 = 已抽過 → ErrAlreadyDrawn。
+	// 「一筆只抽一次」的權威是這個述詞,不是呼叫端先讀再判。
+	SetSelectionDraw(ctx context.Context, selectionID int64, result string, at time.Time) error
 
 	// LockHandicaps 封盤:handicap_open = false、handicap_locked_at = at、status = 'locked'。
 	//

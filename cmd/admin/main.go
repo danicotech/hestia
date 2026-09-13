@@ -11,6 +11,7 @@
 //	go run ./cmd/admin register-space   --guild <snowflake> --name "測試伺服器"
 //	go run ./cmd/admin register-channel --guild <snowflake> --channel <snowflake> --kind text --log-messages
 //	go run ./cmd/admin create-judge     --login lin --name "林裁判"
+//	go run ./cmd/admin catalogue-sync   --tournament 2026-baiye-shifeng --actor <user public_id>
 //
 // 連線字串從 PLATFORM_DATABASE_URL 讀(與 migrate 同一個變數,
 // 不另外發明一個——一個概念一個位置)。
@@ -69,6 +70,12 @@ const usage = `用法:
         --reset-passcode:帳號已存在時改成重新產生通行碼(忘記時的唯一修復路徑
         —— 雜湊格式手寫不出來)。不會踢掉既有 session,那是另一件事。
 
+  admin catalogue-sync --tournament <slug> --actor <使用者 public_id> [--reason <理由>]
+        把 binary 內嵌的讓武目錄(catalogue.json)同步進既有的一屆:以 key 匹配,
+        更新 name / description / referee_note / params,**不動 cost**。
+        該屆已有任何讓武選擇(含退掉的)就拒絕 —— 已有人依舊文字選購,改文字等於改比賽條件。
+        寫 admin_audit_logs,與同步同一個 transaction。
+
 環境變數:
   PLATFORM_DATABASE_URL   必填,與 cmd/migrate 相同`
 
@@ -110,6 +117,8 @@ func run() error {
 		return clearChannel(ctx, pool, os.Args[2:])
 	case "create-judge":
 		return createJudge(ctx, pool, os.Args[2:])
+	case "catalogue-sync":
+		return catalogueSync(ctx, pool, os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Println(usage)
 		return nil

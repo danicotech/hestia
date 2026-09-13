@@ -24,21 +24,31 @@ func (r *Repo) ListSelections(ctx context.Context, matchID, playerID int64) ([]h
 	}
 	out := make([]handicap.Selection, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, selectionFields{
-			ID:            row.ID,
-			PublicID:      row.PublicID,
-			MatchID:       row.MatchID,
-			MatchPublicID: row.MatchPublicID,
-			PlayerID:      row.PlayerID,
-			ItemID:        row.ItemID,
-			ItemRef:       row.ItemRef,
-			ItemName:      row.ItemName,
-			Category:      row.Category,
-			Cost:          row.Cost,
-			TargetNote:    row.TargetNote,
-			Voided:        row.Voided,
-			CreatedAt:     row.CreatedAt,
-		}.toSelection())
+		sel, err := selectionFields{
+			ID:              row.ID,
+			PublicID:        row.PublicID,
+			MatchID:         row.MatchID,
+			MatchPublicID:   row.MatchPublicID,
+			PlayerID:        row.PlayerID,
+			ItemID:          row.ItemID,
+			ItemRef:         row.ItemRef,
+			ItemKey:         row.ItemKey,
+			ItemName:        row.ItemName,
+			Category:        row.Category,
+			ItemParams:      row.ItemParams,
+			ItemRefereeNote: row.ItemRefereeNote,
+			ItemSortOrder:   row.ItemSortOrder,
+			Cost:            row.Cost,
+			TargetNote:      row.TargetNote,
+			Voided:          row.Voided,
+			CreatedAt:       row.CreatedAt,
+			DrawResult:      row.DrawResult,
+			DrawnAt:         row.DrawnAt,
+		}.toSelection()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sel)
 	}
 	return out, nil
 }
@@ -55,21 +65,30 @@ func (r *Repo) GetSelection(ctx context.Context, selectionPublicID string) (*han
 		}
 		return nil, fmt.Errorf("讀讓武選擇 %s: %w", selectionPublicID, err)
 	}
-	sel := selectionFields{
-		ID:            row.ID,
-		PublicID:      row.PublicID,
-		MatchID:       row.MatchID,
-		MatchPublicID: row.MatchPublicID,
-		PlayerID:      row.PlayerID,
-		ItemID:        row.ItemID,
-		ItemRef:       row.ItemRef,
-		ItemName:      row.ItemName,
-		Category:      row.Category,
-		Cost:          row.Cost,
-		TargetNote:    row.TargetNote,
-		Voided:        row.Voided,
-		CreatedAt:     row.CreatedAt,
+	sel, err := selectionFields{
+		ID:              row.ID,
+		PublicID:        row.PublicID,
+		MatchID:         row.MatchID,
+		MatchPublicID:   row.MatchPublicID,
+		PlayerID:        row.PlayerID,
+		ItemID:          row.ItemID,
+		ItemRef:         row.ItemRef,
+		ItemKey:         row.ItemKey,
+		ItemName:        row.ItemName,
+		Category:        row.Category,
+		ItemParams:      row.ItemParams,
+		ItemRefereeNote: row.ItemRefereeNote,
+		ItemSortOrder:   row.ItemSortOrder,
+		Cost:            row.Cost,
+		TargetNote:      row.TargetNote,
+		Voided:          row.Voided,
+		CreatedAt:       row.CreatedAt,
+		DrawResult:      row.DrawResult,
+		DrawnAt:         row.DrawnAt,
 	}.toSelection()
+	if err != nil {
+		return nil, err
+	}
 	return &sel, nil
 }
 
@@ -99,21 +118,30 @@ func (r *Repo) InsertSelection(ctx context.Context, ns handicap.NewSelection) (*
 		}
 		return nil, fmt.Errorf("寫入讓武選擇 match=%d player=%d: %w", ns.MatchID, ns.PlayerID, err)
 	}
-	sel := selectionFields{
-		ID:            row.ID,
-		PublicID:      row.PublicID,
-		MatchID:       row.MatchID,
-		MatchPublicID: row.MatchPublicID,
-		PlayerID:      row.PlayerID,
-		ItemID:        row.ItemID,
-		ItemRef:       row.ItemRef,
-		ItemName:      row.ItemName,
-		Category:      row.Category,
-		Cost:          row.Cost,
-		TargetNote:    row.TargetNote,
-		Voided:        row.Voided,
-		CreatedAt:     row.CreatedAt,
+	sel, err := selectionFields{
+		ID:              row.ID,
+		PublicID:        row.PublicID,
+		MatchID:         row.MatchID,
+		MatchPublicID:   row.MatchPublicID,
+		PlayerID:        row.PlayerID,
+		ItemID:          row.ItemID,
+		ItemRef:         row.ItemRef,
+		ItemKey:         row.ItemKey,
+		ItemName:        row.ItemName,
+		Category:        row.Category,
+		ItemParams:      row.ItemParams,
+		ItemRefereeNote: row.ItemRefereeNote,
+		ItemSortOrder:   row.ItemSortOrder,
+		Cost:            row.Cost,
+		TargetNote:      row.TargetNote,
+		Voided:          row.Voided,
+		CreatedAt:       row.CreatedAt,
+		DrawResult:      row.DrawResult,
+		DrawnAt:         row.DrawnAt,
 	}.toSelection()
+	if err != nil {
+		return nil, err
+	}
 	return &sel, nil
 }
 
@@ -134,35 +162,53 @@ func (r *Repo) MarkSelectionVoided(ctx context.Context, selectionID int64) error
 // 三支查詢的 select list 逐字相同,sqlc 卻生出三個型別。轉換只寫一份的理由
 // 與 matchFields 相同:三份拷貝遲早會有一份在加欄位時被漏掉。
 type selectionFields struct {
-	ID            int64
-	PublicID      string
-	MatchID       int64
-	MatchPublicID string
-	PlayerID      int64
-	ItemID        int64
-	ItemRef       string
-	ItemName      string
-	Category      string
-	Cost          int64
-	TargetNote    *string
-	Voided        bool
-	CreatedAt     time.Time
+	ID              int64
+	PublicID        string
+	MatchID         int64
+	MatchPublicID   string
+	PlayerID        int64
+	ItemID          int64
+	ItemRef         string
+	ItemKey         string
+	ItemName        string
+	Category        string
+	ItemParams      []byte
+	ItemRefereeNote string
+	ItemSortOrder   int32
+	Cost            int64
+	TargetNote      *string
+	Voided          bool
+	CreatedAt       time.Time
+	DrawResult      *string
+	DrawnAt         *time.Time
 }
 
-func (f selectionFields) toSelection() handicap.Selection {
-	return handicap.Selection{
-		ID:            f.ID,
-		PublicID:      f.PublicID,
-		MatchID:       f.MatchID,
-		MatchPublicID: f.MatchPublicID,
-		PlayerID:      f.PlayerID,
-		ItemID:        f.ItemID,
-		ItemRef:       f.ItemRef,
-		ItemName:      f.ItemName,
-		Category:      handicap.Category(f.Category),
-		Cost:          f.Cost,
-		TargetNote:    deref(f.TargetNote),
-		Voided:        f.Voided,
-		CreatedAt:     f.CreatedAt,
+// toSelection 轉成 core 型別。params 在這裡驗(理由見 itemFields.toItem):
+// 封盤抽選依 ItemParams.Draw 決定要不要抽,一個沒驗過的值進到那裡就是一場封不了的盤。
+func (f selectionFields) toSelection() (handicap.Selection, error) {
+	params, err := handicap.ParseItemParams(f.ItemParams)
+	if err != nil {
+		return handicap.Selection{}, fmt.Errorf("讓武選擇 %s 的項目 %s: %w", f.PublicID, f.ItemKey, err)
 	}
+	return handicap.Selection{
+		ID:              f.ID,
+		PublicID:        f.PublicID,
+		MatchID:         f.MatchID,
+		MatchPublicID:   f.MatchPublicID,
+		PlayerID:        f.PlayerID,
+		ItemID:          f.ItemID,
+		ItemRef:         f.ItemRef,
+		ItemKey:         f.ItemKey,
+		ItemName:        f.ItemName,
+		Category:        handicap.Category(f.Category),
+		ItemParams:      params,
+		ItemRefereeNote: f.ItemRefereeNote,
+		ItemSortOrder:   f.ItemSortOrder,
+		Cost:            f.Cost,
+		TargetNote:      deref(f.TargetNote),
+		Voided:          f.Voided,
+		CreatedAt:       f.CreatedAt,
+		DrawResult:      f.DrawResult,
+		DrawnAt:         f.DrawnAt,
+	}, nil
 }

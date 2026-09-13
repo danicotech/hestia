@@ -2,6 +2,7 @@ package handicappg_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -71,6 +72,8 @@ type fixtureOpt struct {
 	status     string
 	open       bool
 	perRankGap string // 空字串 = config 不放這個鍵(驗證退回預設值的路徑)
+	// wuxuePool 非 nil 時 config 改用 v2 形狀並帶 handicap.draw_pools.wuxue(可為空切片)。
+	wuxuePool []string
 }
 
 func defaultOpt() fixtureOpt {
@@ -84,6 +87,15 @@ func newFixture(t *testing.T, opt fixtureOpt) fixture {
 	config := "{}"
 	if opt.perRankGap != "" {
 		config = fmt.Sprintf(`{"bp_per_rank_gap": %s}`, opt.perRankGap)
+	}
+	if opt.wuxuePool != nil {
+		// v2 形狀:封盤抽選要讀 handicap.draw_pools(rules.Parse 的契約,schemas/28)。
+		pool, err := json.Marshal(opt.wuxuePool)
+		if err != nil {
+			t.Fatalf("序列化武學池: %v", err)
+		}
+		config = fmt.Sprintf(`{"version": 2, "bp": {"kind": "linear_gap", "per_rank_gap": %s},
+		                       "handicap": {"draw_pools": {"wuxue": %s}}}`, opt.perRankGap, pool)
 	}
 	var tournamentID int64
 	if err := pool.QueryRow(ctx,
@@ -162,10 +174,10 @@ func note(s string) *string { return &s }
 // 而這裡測的是餘額與併發,不是表單驗證。
 func testSpecs() []handicap.ItemSpec {
 	return []handicap.ItemSpec{
-		{Category: handicap.CategoryWeapon, Name: "測試_十點", Description: "值十點", Cost: 10, SortOrder: 1},
-		{Category: handicap.CategorySkill, Name: "測試_四點", RefereeNote: note("裁判說明"), Cost: 4, Repeatable: true, SortOrder: 2},
-		{Category: handicap.CategoryVictory, Name: "測試_勝利甲", Cost: 6, SortOrder: 3},
-		{Category: handicap.CategoryVictory, Name: "測試_勝利乙", Cost: 6, SortOrder: 4},
+		{Category: handicap.CategoryWeapon, Key: "weapon.test_ten", Name: "測試_十點", Description: "值十點", Cost: 10, SortOrder: 1},
+		{Category: handicap.CategorySkill, Key: "skill.test_four", Name: "測試_四點", RefereeNote: note("裁判說明"), Cost: 4, Repeatable: true, SortOrder: 2},
+		{Category: handicap.CategoryVictory, Key: "victory.test_a", Name: "測試_勝利甲", Cost: 6, SortOrder: 3},
+		{Category: handicap.CategoryVictory, Key: "victory.test_b", Name: "測試_勝利乙", Cost: 6, SortOrder: 4},
 	}
 }
 

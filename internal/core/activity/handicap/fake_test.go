@@ -24,6 +24,10 @@ type fakeRepo struct {
 	items      []*Item
 	budgets    map[[2]int64]*Budget
 	selections []*Selection
+	// pools 是各屆 config 的抽選池(tournamentID → 池名 → 清單)。
+	pools map[int64]fakePools
+	// syncShortfall 讓 SyncItems 少報幾列,用來模擬影響列數對不上。
+	syncShortfall int
 
 	nextSelectionID int64
 }
@@ -34,6 +38,7 @@ func newFakeRepo() *fakeRepo {
 	return &fakeRepo{
 		matches: map[string]*Match{},
 		budgets: map[[2]int64]*Budget{},
+		pools:   map[int64]fakePools{},
 	}
 }
 
@@ -132,17 +137,26 @@ func (f *fakeRepo) GetItem(_ context.Context, tournamentID int64, ref string) (*
 	return nil, ErrItemNotFound
 }
 
+// fakeNameKey 對應 UNIQUE (tournament_id, category, name),InsertItems 的衝突鍵。
+func fakeNameKey(c Category, name string) string { return string(c) + "/" + name }
+
 func (f *fakeRepo) InsertItems(_ context.Context, tournamentID int64, specs []ItemSpec) (int, error) {
 	exists := map[string]bool{}
+	keys := map[string]bool{}
 	for _, it := range f.items {
 		if it.TournamentID == tournamentID {
-			exists[itemKey(it.Category, it.Name)] = true
+			exists[fakeNameKey(it.Category, it.Name)] = true
+			keys[it.Key] = true
 		}
 	}
 	inserted := 0
 	for _, sp := range specs {
-		if exists[itemKey(sp.Category, sp.Name)] {
+		if exists[fakeNameKey(sp.Category, sp.Name)] {
 			continue // ON CONFLICT DO NOTHING
+		}
+		if keys[sp.Key] {
+			// 對應 UNIQUE (tournament_id, key) 的 23505:改了名稱卻用 install 不用 sync。
+			return inserted, fmt.Errorf("key %s 重複", sp.Key)
 		}
 		id := int64(len(f.items) + 1)
 		note := ""
@@ -153,6 +167,7 @@ func (f *fakeRepo) InsertItems(_ context.Context, tournamentID int64, specs []It
 			ID:           id,
 			TournamentID: tournamentID,
 			Ref:          strconv.FormatInt(id, 10),
+			Key:          sp.Key,
 			Category:     sp.Category,
 			Name:         sp.Name,
 			Description:  sp.Description,
@@ -160,11 +175,80 @@ func (f *fakeRepo) InsertItems(_ context.Context, tournamentID int64, specs []It
 			Cost:         sp.Cost,
 			Repeatable:   sp.Repeatable,
 			SortOrder:    sp.SortOrder,
+			Params:       sp.Params,
 		})
-		exists[itemKey(sp.Category, sp.Name)] = true
+		exists[fakeNameKey(sp.Category, sp.Name)] = true
+		keys[sp.Key] = true
 		inserted++
 	}
 	return inserted, nil
+}
+
+func (f *fakeRepo) SyncItems(_ context.Context, tournamentID int64, specs []ItemSpec) (int, error) {
+	byKey := map[string]ItemSpec{}
+	for _, sp := range specs {
+		byKey[sp.Key] = sp
+	}
+	updated := 0
+	for _, it := range f.items {
+		sp, ok := byKey[it.Key]
+		if it.TournamentID != tournamentID || !ok {
+			continue
+		}
+		it.Name, it.Description = sp.Name, sp.Description
+		it.RefereeNote = ""
+		if sp.RefereeNote != nil {
+			it.RefereeNote = *sp.RefereeNote
+		}
+		it.Repeatable, it.SortOrder, it.Params = sp.Repeatable, sp.SortOrder, sp.Params
+		// cost 刻意不動。
+		updated++
+	}
+	// 模擬「影響列數對不上」:測試可把 syncShortfall 設成要少算幾列。
+	return updated - f.syncShortfall, nil
+}
+
+func (f *fakeRepo) CountSelections(_ context.Context, tournamentID int64) (int64, error) {
+	var n int64
+	for _, s := range f.selections {
+		for _, it := range f.items {
+			if it.ID == s.ItemID && it.TournamentID == tournamentID {
+				n++ // 含已作廢
+			}
+		}
+	}
+	return n, nil
+}
+
+// fakePools 是 DrawPools 的記憶體版:rules.Config 在正式路徑扮演這個角色。
+type fakePools map[string][]string
+
+func (p fakePools) DrawPool(name string) ([]string, bool) {
+	pool, ok := p[name]
+	return pool, ok
+}
+
+func (f *fakeRepo) DrawPools(_ context.Context, tournamentID int64) (DrawPools, error) {
+	pools, ok := f.pools[tournamentID]
+	if !ok {
+		return fakePools{}, nil // config 沒有池
+	}
+	return pools, nil
+}
+
+func (f *fakeRepo) SetSelectionDraw(_ context.Context, selectionID int64, result string, at time.Time) error {
+	for _, s := range f.selections {
+		if s.ID != selectionID {
+			continue
+		}
+		if s.DrawResult != nil {
+			return fmt.Errorf("selection=%d: %w", selectionID, ErrAlreadyDrawn) // draw_result IS NULL 擋掉
+		}
+		r, t := result, at
+		s.DrawResult, s.DrawnAt = &r, &t
+		return nil
+	}
+	return ErrSelectionNotFound
 }
 
 func (f *fakeRepo) GetBudget(_ context.Context, matchID, playerID int64) (*Budget, error) {
@@ -256,18 +340,22 @@ func (f *fakeRepo) InsertSelection(ctx context.Context, ns NewSelection) (*Selec
 	}
 	f.nextSelectionID++
 	s := &Selection{
-		ID:            f.nextSelectionID,
-		PublicID:      fmt.Sprintf("SEL%04d", f.nextSelectionID),
-		MatchID:       ns.MatchID,
-		MatchPublicID: m.PublicID,
-		PlayerID:      ns.PlayerID,
-		ItemID:        item.ID,
-		ItemRef:       item.Ref,
-		ItemName:      item.Name,
-		Category:      item.Category,
-		Cost:          ns.Cost,
-		TargetNote:    ns.TargetNote,
-		CreatedAt:     time.Unix(1_800_000_000+f.nextSelectionID, 0).UTC(),
+		ID:              f.nextSelectionID,
+		PublicID:        fmt.Sprintf("SEL%04d", f.nextSelectionID),
+		MatchID:         ns.MatchID,
+		MatchPublicID:   m.PublicID,
+		PlayerID:        ns.PlayerID,
+		ItemID:          item.ID,
+		ItemRef:         item.Ref,
+		ItemKey:         item.Key,
+		ItemName:        item.Name,
+		Category:        item.Category,
+		ItemParams:      item.Params,
+		ItemRefereeNote: item.RefereeNote,
+		ItemSortOrder:   item.SortOrder,
+		Cost:            ns.Cost,
+		TargetNote:      ns.TargetNote,
+		CreatedAt:       time.Unix(1_800_000_000+f.nextSelectionID, 0).UTC(),
 	}
 	f.selections = append(f.selections, s)
 	cp := *s

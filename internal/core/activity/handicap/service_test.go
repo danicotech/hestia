@@ -478,6 +478,18 @@ func TestVoidSelection_Rejections(t *testing.T) {
 		}
 	})
 
+	t.Run("沒帶選手身分", func(t *testing.T) {
+		f := newFixture(t, bp.RankKaishan, bp.RankWuwo)
+		sel := f.buy(t, CategoryDefense, "禁跳躍", "")
+		_, err := f.svc.VoidSelection(context.Background(), VoidParams{
+			SelectionPublicID: sel.Selection.PublicID,
+		})
+		if !errors.Is(err, ErrInvalidRequest) {
+			t.Fatalf("期望 ErrInvalidRequest,實際 %v", err)
+		}
+		f.assertSpentInvariant(t)
+	})
+
 	t.Run("重複退", func(t *testing.T) {
 		f := newFixture(t, bp.RankKaishan, bp.RankWuwo)
 		s := f.buy(t, CategoryDefense, "禁跳躍", "")
@@ -501,6 +513,239 @@ func TestVoidSelection_Rejections(t *testing.T) {
 			t.Fatalf("期望 ErrSelectionNotFound,實際 %v", err)
 		}
 	})
+}
+
+// ── 裁判代退 ────────────────────────────────────────────────────
+
+// 代退成功:BP 回到預算,而且退回來的 BP 真的能再花出去。
+//
+// 與 TestVoidSelection_RefundsBP 的斷言逐條對應 —— 代退與自助退唯一的差別
+// 是「誰有資格按」,BP 這一側必須一模一樣,否則兩條路會養出兩套帳。
+func TestRefundSelection_JudgeRefundsBP(t *testing.T) {
+	f := newFixture(t, bp.RankKaishan, bp.RankWuwo) // 24 BP
+	a := f.buy(t, CategoryDefense, "禁用迴避", "")      // 8
+	f.buy(t, CategoryDefense, "禁用解控", "")           // 8
+
+	res, err := f.svc.RefundSelection(context.Background(), a.Selection.PublicID)
+	if err != nil {
+		t.Fatalf("RefundSelection: %v", err)
+	}
+	if res.Budget.Spent != 8 || res.Budget.Remaining() != 16 {
+		t.Fatalf("退點後 spent=%d remaining=%d,期望 8 / 16", res.Budget.Spent, res.Budget.Remaining())
+	}
+	// 呼叫端要靠這三個欄位寫稽核,缺一筆稽核就說不清退了什麼。
+	if res.MatchPublicID != testMatchPub || res.MatchID != testMatchID {
+		t.Fatalf("沒帶回場次: %+v", res)
+	}
+	if res.Selection.PublicID != a.Selection.PublicID || !res.Selection.Voided ||
+		res.Selection.Cost != 8 || res.Selection.ItemName != "禁用迴避" {
+		t.Fatalf("沒帶回被退掉的那一筆: %+v", res.Selection)
+	}
+	f.assertSpentInvariant(t)
+
+	// 退回來的 BP 要真的能再花出去。
+	f.buy(t, CategorySkill, "禁用奇術", "") // 12 BP,退點前只剩 8 BP 買不起
+}
+
+// 代退**不檢查擁有者**:那正是它與 VoidSelection 的差別。
+//
+// 這條測試守的是它最容易被「修正」掉的性質 —— 有人看到沒有身分檢查,
+// 照著 VoidSelection 補一個 PlayerID 參數上去,規則就又執行不了了。
+func TestRefundSelection_DoesNotRequireOwner(t *testing.T) {
+	f := newFixture(t, bp.RankKaishan, bp.RankWuwo)
+	s := f.buy(t, CategorySkill, "禁用奇術", "") // 12 BP,買家是 f.holder(p1)
+
+	// 對照組:對手自己走 VoidSelection 退不掉。
+	if _, err := f.svc.VoidSelection(context.Background(), VoidParams{
+		SelectionPublicID: s.Selection.PublicID, PlayerID: p2ID,
+	}); !errors.Is(err, ErrNotSelectionOwner) {
+		t.Fatalf("非持有者仍該被 VoidSelection 擋下,實際 %v", err)
+	}
+	// 裁判這條路成立,而且退回的是**買家**的預算,不是請求者的。
+	res, err := f.svc.RefundSelection(context.Background(), s.Selection.PublicID)
+	if err != nil {
+		t.Fatalf("RefundSelection: %v", err)
+	}
+	if res.Budget.PlayerID != f.holder || res.Budget.Spent != 0 {
+		t.Fatalf("BP 應退回買家的預算: %+v", res.Budget)
+	}
+	f.assertSpentInvariant(t)
+}
+
+// 目錄裡那條規則的完整走法,這是這支方法存在的唯一理由。
+//
+// 「禁用奇術」的 referee_note:「對手全場無法使用任何奇術,若同時買了
+// 禁用任意奇術,將經裁判確認後返還禁用任意奇術的BP。」
+//
+// 系統不自動偵測這種包含關係(它不做互斥檢查,擋一半比不擋更危險),
+// 所以規則的執行方式就是裁判看到兩項並存時退掉被涵蓋的那一項。
+func TestRefundSelection_TheRuleFromTheCatalogue(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, bp.RankKaishan, bp.RankWuwo)  // 24 BP
+	f.buy(t, CategorySkill, "禁用奇術", "")              // 12 BP:全部奇術都禁
+	any := f.buy(t, CategorySkill, "禁用任意奇術", "踏雪無痕") // 3 BP:已被上面那項涵蓋
+
+	// 裁判看得到兩項並存 —— 封盤前只有他與買家看得到,所以只有他能發現。
+	view, err := f.svc.RefereeMatchHandicaps(ctx, testMatchPub)
+	if err != nil {
+		t.Fatalf("RefereeMatchHandicaps: %v", err)
+	}
+	if len(view.Selections) != 2 {
+		t.Fatalf("裁判該看到兩項並存: %+v", view.Selections)
+	}
+
+	res, err := f.svc.RefundSelection(ctx, any.Selection.PublicID)
+	if err != nil {
+		t.Fatalf("依規則返還失敗: %v", err)
+	}
+	if res.Budget.Spent != 12 || res.Budget.Remaining() != 12 {
+		t.Fatalf("應只剩「禁用奇術」的 12 BP: %+v", res.Budget)
+	}
+	f.assertSpentInvariant(t)
+
+	// 退回來的 3 BP 是選手的,他可以拿去買別的(封盤前)。
+	f.buy(t, CategoryDefense, "禁跳躍", "")
+}
+
+func TestRefundSelection_Rejections(t *testing.T) {
+	t.Run("封盤後拒絕", func(t *testing.T) {
+		f := newFixture(t, bp.RankKaishan, bp.RankWuwo)
+		s := f.buy(t, CategorySkill, "禁用奇術", "") // 12 BP
+		if _, err := f.svc.Lock(context.Background(), testMatchPub); err != nil {
+			t.Fatalf("Lock: %v", err)
+		}
+		_, err := f.svc.RefundSelection(context.Background(), s.Selection.PublicID)
+		if !errors.Is(err, ErrHandicapLocked) {
+			t.Fatalf("封盤後必須拒絕,實際 %v", err)
+		}
+		// 封盤不可逆:裁判也不例外,BP 一分都不能動。
+		b, _ := f.repo.GetBudget(context.Background(), testMatchID, f.holder)
+		if b.Spent != 12 {
+			t.Fatalf("被擋下來卻退了 BP: spent=%d", b.Spent)
+		}
+		f.assertSpentInvariant(t)
+	})
+
+	t.Run("不存在", func(t *testing.T) {
+		f := newFixture(t, bp.RankKaishan, bp.RankWuwo)
+		_, err := f.svc.RefundSelection(context.Background(), "SEL9999")
+		if !errors.Is(err, ErrSelectionNotFound) {
+			t.Fatalf("期望 ErrSelectionNotFound,實際 %v", err)
+		}
+	})
+
+	t.Run("缺 selection_public_id", func(t *testing.T) {
+		f := newFixture(t, bp.RankKaishan, bp.RankWuwo)
+		_, err := f.svc.RefundSelection(context.Background(), "")
+		if !errors.Is(err, ErrInvalidRequest) {
+			t.Fatalf("期望 ErrInvalidRequest,實際 %v", err)
+		}
+	})
+
+	t.Run("重複退不會退兩次", func(t *testing.T) {
+		f := newFixture(t, bp.RankKaishan, bp.RankWuwo)
+		s := f.buy(t, CategorySkill, "禁用奇術", "") // 12 BP
+		if _, err := f.svc.RefundSelection(context.Background(), s.Selection.PublicID); err != nil {
+			t.Fatalf("第一次代退應成功: %v", err)
+		}
+		_, err := f.svc.RefundSelection(context.Background(), s.Selection.PublicID)
+		if !errors.Is(err, ErrSelectionAlreadyVoided) {
+			t.Fatalf("期望 ErrSelectionAlreadyVoided,實際 %v", err)
+		}
+		b, _ := f.repo.GetBudget(context.Background(), testMatchID, f.holder)
+		if b.Spent != 0 {
+			t.Fatalf("spent = %d,只該退一次(12 BP)", b.Spent)
+		}
+		f.assertSpentInvariant(t)
+	})
+
+	t.Run("選手自己退過之後裁判再退", func(t *testing.T) {
+		f := newFixture(t, bp.RankKaishan, bp.RankWuwo)
+		s := f.buy(t, CategorySkill, "禁用奇術", "")
+		if _, err := f.svc.VoidSelection(context.Background(), VoidParams{
+			SelectionPublicID: s.Selection.PublicID, PlayerID: f.holder,
+		}); err != nil {
+			t.Fatalf("自助退應成功: %v", err)
+		}
+		// 兩條路共用同一個 voided 旗標,所以跨路徑的重複退也擋得住。
+		_, err := f.svc.RefundSelection(context.Background(), s.Selection.PublicID)
+		if !errors.Is(err, ErrSelectionAlreadyVoided) {
+			t.Fatalf("期望 ErrSelectionAlreadyVoided,實際 %v", err)
+		}
+		f.assertSpentInvariant(t)
+	})
+}
+
+// 兩個裁判同時按下同一筆的退點:只有一次生效,BP 不會退兩次。
+//
+// fake 用一把鎖模擬 LockMatch 的列鎖,驗的是「規則在序列化前提下正確」。
+func TestRefundSelection_ConcurrentClicks(t *testing.T) {
+	f := newFixture(t, bp.RankKaishan, bp.RankWuwo) // 24 BP
+	s := f.buy(t, CategorySkill, "禁用奇術", "")        // 12 BP
+
+	const attempts = 8
+	var wg sync.WaitGroup
+	results := make([]error, attempts)
+	for i := range attempts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, results[i] = f.svc.RefundSelection(context.Background(), s.Selection.PublicID)
+		}()
+	}
+	wg.Wait()
+
+	ok, already := 0, 0
+	for _, err := range results {
+		switch {
+		case err == nil:
+			ok++
+		case errors.Is(err, ErrSelectionAlreadyVoided):
+			already++
+		default:
+			t.Fatalf("非預期的錯誤: %v", err)
+		}
+	}
+	if ok != 1 || already != attempts-1 {
+		t.Fatalf("成功 %d 次、已退 %d 次,期望 1 / %d", ok, already, attempts-1)
+	}
+	f.assertSpentInvariant(t)
+	if b, _ := f.repo.GetBudget(context.Background(), testMatchID, f.holder); b.Spent != 0 {
+		t.Fatalf("spent = %d,期望 0(只退一次)", b.Spent)
+	}
+}
+
+// 一邊代退一邊封盤:封盤那條線不能被任何一筆退點跨過去。
+func TestRefundSelection_ConcurrentWithLock(t *testing.T) {
+	f := newFixture(t, bp.RankKaishan, bp.RankWuwo)
+	a := f.buy(t, CategoryDefense, "禁用迴避", "") // 8 BP
+	f.buy(t, CategoryDefense, "禁用解控", "")      // 8 BP
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = f.svc.Lock(context.Background(), testMatchPub)
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, err := f.svc.RefundSelection(context.Background(), a.Selection.PublicID)
+		if err != nil && !errors.Is(err, ErrHandicapLocked) {
+			t.Errorf("非預期的錯誤: %v", err)
+		}
+	}()
+	wg.Wait()
+
+	f.assertSpentInvariant(t)
+	m, _ := f.repo.GetMatch(context.Background(), testMatchPub)
+	if m.LockedAt == nil {
+		t.Fatal("封盤應該成功")
+	}
+	// 封盤之後的清單就是最終清單:再退一次一定失敗。
+	if _, err := f.svc.RefundSelection(context.Background(), a.Selection.PublicID); err == nil {
+		t.Fatal("封盤後還退得掉")
+	}
 }
 
 // ── 封盤 ────────────────────────────────────────────────────────
@@ -622,6 +867,114 @@ func TestMatchHandicaps_VisibilityBoundary(t *testing.T) {
 			}
 		})
 	}
+}
+
+// 裁判在封盤前看得到,而同一場同一時刻,匿名與非持有者看不到。
+//
+// 兩件事寫在同一個測試裡是刻意的:它們是一體的兩面。分成兩個測試的話,
+// 有人把揭露限制整個拿掉時,只有其中一個會紅,而另一個會「更綠」——
+// 那正是最需要一起失敗的情況。
+func TestRefereeMatchHandicaps_SeesBeforeLockWhileOthersDoNot(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, bp.RankKaishan, bp.RankWuwo)
+	f.buy(t, CategoryDefense, "禁用迴避", "")
+	f.buy(t, CategorySkill, "禁用任意奇術", "踏雪無痕")
+
+	ref, err := f.svc.RefereeMatchHandicaps(ctx, testMatchPub)
+	if err != nil {
+		t.Fatalf("RefereeMatchHandicaps: %v", err)
+	}
+	if len(ref.Selections) != 2 || ref.Budget == nil {
+		t.Fatalf("裁判在封盤前就該看到全部內容: %+v", ref)
+	}
+	// 裁判要執行的規則寫在項目上,所以指定內容也必須看得到。
+	if ref.Selections[1].TargetNote != "踏雪無痕" {
+		t.Fatalf("指定內容沒有給裁判: %+v", ref.Selections[1])
+	}
+	// 看得到 ≠ 已公開。Revealed 的意思一直是「已封盤」,前端拿它決定
+	// 要不要把內容貼出去,所以這裡絕不能因為是裁判就變成 true。
+	if ref.Revealed {
+		t.Fatal("尚未封盤,Revealed 不該是 true —— 那會讓前端以為可以公開")
+	}
+	if ref.LockedAt != nil {
+		t.Fatal("尚未封盤,不該有封盤時間")
+	}
+
+	// 同一場、同一時刻,選手端那條路一行都沒有變。
+	for _, viewer := range []struct {
+		name string
+		id   int64
+	}{
+		{"匿名觀眾", 0},
+		{"對手", p2ID},
+		{"別場的選手", 999},
+	} {
+		v, err := f.svc.MatchHandicaps(ctx, testMatchPub, viewer.id)
+		if err != nil {
+			t.Fatalf("MatchHandicaps(%s): %v", viewer.name, err)
+		}
+		if len(v.Selections) != 0 || v.Budget != nil {
+			t.Fatalf("%s 在封盤前仍不該看到內容: %+v", viewer.name, v)
+		}
+	}
+
+	// 封盤後裁判看到的與公開檢視一致(此時已經沒有差別可言)。
+	if _, err := f.svc.Lock(ctx, testMatchPub); err != nil {
+		t.Fatalf("Lock: %v", err)
+	}
+	ref, err = f.svc.RefereeMatchHandicaps(ctx, testMatchPub)
+	if err != nil {
+		t.Fatalf("RefereeMatchHandicaps: %v", err)
+	}
+	pub, err := f.svc.MatchHandicaps(ctx, testMatchPub, 0)
+	if err != nil {
+		t.Fatalf("MatchHandicaps: %v", err)
+	}
+	if !ref.Revealed || len(ref.Selections) != len(pub.Selections) {
+		t.Fatalf("封盤後兩份檢視應一致: 裁判 %+v / 公開 %+v", ref, pub)
+	}
+}
+
+// 裁判檢視同樣要處理「本場無讓武」與「已退掉的不列」。
+func TestRefereeMatchHandicaps_ExcludesVoidedAndEmptyMatch(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("退掉的不列", func(t *testing.T) {
+		f := newFixture(t, bp.RankKaishan, bp.RankWuwo)
+		a := f.buy(t, CategoryDefense, "禁用迴避", "")
+		f.buy(t, CategoryDefense, "禁用解控", "")
+		if _, err := f.svc.RefundSelection(ctx, a.Selection.PublicID); err != nil {
+			t.Fatalf("RefundSelection: %v", err)
+		}
+		v, err := f.svc.RefereeMatchHandicaps(ctx, testMatchPub)
+		if err != nil {
+			t.Fatalf("RefereeMatchHandicaps: %v", err)
+		}
+		if len(v.Selections) != 1 || v.Selections[0].ItemName != "禁用解控" {
+			t.Fatalf("退掉的項目不該出現在裁判檢視: %+v", v.Selections)
+		}
+		if v.Budget.Spent != 8 {
+			t.Fatalf("裁判檢視的 spent = %d,期望退點後的 8", v.Budget.Spent)
+		}
+	})
+
+	t.Run("同段對決", func(t *testing.T) {
+		f := newFixture(t, bp.RankFeihua, bp.RankFeihua)
+		v, err := f.svc.RefereeMatchHandicaps(ctx, testMatchPub)
+		if err != nil {
+			t.Fatalf("RefereeMatchHandicaps: %v", err)
+		}
+		if v.HolderPlayerPublicID != "" || v.Budget != nil || len(v.Selections) != 0 {
+			t.Fatalf("同段對決本場無讓武: %+v", v)
+		}
+	})
+
+	t.Run("場次不存在", func(t *testing.T) {
+		f := newFixture(t, bp.RankKaishan, bp.RankWuwo)
+		if _, err := f.svc.RefereeMatchHandicaps(ctx, "沒這場"); !errors.Is(err, activityerr.ErrMatchNotFound) {
+			t.Fatalf("期望 activityerr.ErrMatchNotFound,實際 %v", err)
+		}
+	})
 }
 
 func TestMatchHandicaps_NoHandicapMatch(t *testing.T) {
@@ -892,5 +1245,30 @@ func TestInstallSeedItems(t *testing.T) {
 func TestInstallSeedItems_RejectsMissingTournament(t *testing.T) {
 	if _, err := New(newFakeRepo()).InstallSeedItems(context.Background(), 0); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("期望 ErrInvalidRequest,實際 %v", err)
+	}
+}
+
+// voidAuthority 的零值不是「跳過擁有者檢查」。
+//
+// 這支測試刻意**直接呼叫內部的 voidSelection**,不走 VoidSelection ——
+// 外層那道 PlayerID <= 0 的守衛離它 60 行遠,只測外層的話,把內層拿掉
+// 測試照樣綠,而內層才是裁判代退共用的那一支。授權方向的預設值一旦是
+// 放行,任何取不到身分而回 0 的新呼叫端都會靜默失去檢查。
+func TestVoidSelection_ZeroAuthorityIsNotABypass(t *testing.T) {
+	f := newFixture(t, bp.RankKaishan, bp.RankWuwo)
+	sel := f.buy(t, CategoryDefense, "禁跳躍", "")
+
+	_, err := f.svc.voidSelection(
+		context.Background(), f.repo, sel.Selection.PublicID, voidAuthority{})
+	if !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("零值授權應被當成無效請求擋下,實際 %v", err)
+	}
+	f.assertSpentInvariant(t)
+
+	// 對照組:明確表示是裁判代退時才真的跳過擁有者檢查。
+	if _, err := f.svc.voidSelection(
+		context.Background(), f.repo, sel.Selection.PublicID,
+		voidAuthority{referee: true}); err != nil {
+		t.Fatalf("裁判代退應成功: %v", err)
 	}
 }
